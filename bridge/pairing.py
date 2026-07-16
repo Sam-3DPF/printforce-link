@@ -59,3 +59,15 @@ def ensure_paired(store, dpf_base_url: str, pair_token: Optional[str]) -> Option
         store.set_cloud_token(token)
         logger.info("bridge paired successfully; cloud credential stored locally")
     return token
+
+
+def repair(store, dpf_base_url: str, pair_token: str) -> Optional[str]:
+    """Re-pair after the stored cloud token was rejected (401) — e.g. the operator hit
+    Disconnect in 3DPF (revoking the credential) and re-ran the installer with a fresh
+    pair token. Unlike ensure_paired, this does NOT prefer the stored token (that IS the
+    rejected one): it exchanges the pair token for a new credential and overwrites the
+    store. Returns the new cloud token, or None if the pair token is expired/used/unreachable."""
+    token = exchange_pair_token(dpf_base_url, pair_token)
+    if token:
+        store.set_cloud_token(token)
+    return token

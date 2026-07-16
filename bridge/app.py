@@ -17,13 +17,17 @@ from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
 from .fleet import Fleet
-from .pairing import ensure_paired
+from .pairing import ensure_paired, repair
 from .reconciler import ConfigReconciler
 from .router import Dispatcher, Router
 from .store import PrinterStore
 from .updater import SelfUpdater
 
 logger = logging.getLogger(__name__)
+
+# When the cloud rejects our credential, don't hammer the pair/exchange endpoint every
+# loop — attempt a re-pair at most this often.
+_REPAIR_RETRY_SECONDS = 60.0
 
 
 def _store_path_for(config_path: str) -> str:
@@ -119,6 +123,7 @@ def main(config_path: str = "config.toml") -> None:
                     len(router.pending()))
 
     last_heartbeat = 0.0
+    last_repair_attempt: Optional[float] = None   # throttles re-pairing on a revoked token
     logger.info("Reporting every %ss; heartbeat every %ss; a printer that says nothing "
                 "new for %ss is reported OFFLINE",
                 cfg.state_interval_seconds, cfg.heartbeat_interval_seconds,
@@ -127,6 +132,27 @@ def main(config_path: str = "config.toml") -> None:
         try:
             reports = fleet.snapshot()
             response = dpf.report_state(reports)
+
+            # If the cloud rejected our credential (the operator hit Disconnect, revoking
+            # it, then re-ran the installer with a fresh pair token), re-pair with that
+            # token instead of knocking forever with the dead key — the difference between
+            # a card that reconnects itself and one stuck on "Not set up". Only in pairing
+            # mode (a hand-authored config.toml token is the operator's to fix), and
+            # throttled so a spent/expired token can't spam the exchange endpoint.
+            if dpf.unauthorized and not cfg.cloud_token and pair_token:
+                now = time.monotonic()
+                if last_repair_attempt is None or now - last_repair_attempt >= _REPAIR_RETRY_SECONDS:
+                    last_repair_attempt = now
+                    new_token = repair(store, cfg.dpf_base_url, pair_token)
+                    if new_token:
+                        dpf.set_token(new_token)
+                        logger.info("re-paired after a rejected credential; resuming")
+                    else:
+                        logger.error(
+                            "credential rejected and re-pairing did not complete — the pair "
+                            "code may be expired or already used. In 3DPF, click Disconnect, "
+                            "then Get install command, and re-run the install command.")
+
             desired = response.get("printers") if isinstance(response, dict) else None
             _handle_desired(desired or [])
 

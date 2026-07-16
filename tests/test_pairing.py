@@ -2,7 +2,7 @@
 import httpx
 
 import bridge.pairing as pairing_mod
-from bridge.pairing import ensure_paired, exchange_pair_token
+from bridge.pairing import ensure_paired, exchange_pair_token, repair
 
 
 class FakeResp:
@@ -96,4 +96,26 @@ def test_ensure_paired_does_not_store_on_exchange_failure(monkeypatch):
     monkeypatch.setattr(pairing_mod, "exchange_pair_token", lambda *a, **k: None)
     store = FakeStore(token=None)
     assert ensure_paired(store, "https://x", "PAIR-1") is None
+    assert store.saved == []
+
+
+# ---- repair (re-pair after a revoked credential) -----------------------------------
+
+def test_repair_overwrites_the_revoked_token(monkeypatch):
+    # Unlike ensure_paired, repair does NOT prefer the stored token — that IS the revoked
+    # one. It exchanges the fresh pair token and overwrites the store.
+    monkeypatch.setattr(pairing_mod.httpx, "post",
+                        lambda url, json=None, timeout=None: FakeResp(200, {"data": {"cloud_token": "NEW-CLOUD"}}))
+    store = FakeStore(token="revoked-old")
+    assert repair(store, "https://x", "FRESH-PAIR") == "NEW-CLOUD"
+    assert store.get_cloud_token() == "NEW-CLOUD"
+    assert store.saved == ["NEW-CLOUD"]
+
+
+def test_repair_keeps_the_old_token_when_the_pair_code_is_dead(monkeypatch):
+    monkeypatch.setattr(pairing_mod.httpx, "post",
+                        lambda url, json=None, timeout=None: FakeResp(401))
+    store = FakeStore(token="revoked-old")
+    assert repair(store, "https://x", "expired-or-used") is None
+    assert store.get_cloud_token() == "revoked-old"
     assert store.saved == []

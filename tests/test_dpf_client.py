@@ -180,3 +180,27 @@ def test_report_discovered_posts_printers(monkeypatch):
     assert captured["url"] == "https://app.3dprintforce.com/api/bridge/printers/discovered"
     assert captured["json"] == {"printers": [entry]}
     assert out == {"recorded": 1}
+
+
+def test_401_sets_unauthorized_and_returns_empty(monkeypatch):
+    # A revoked credential (Disconnect) -> 401. The client flags it (so the loop re-pairs)
+    # and still returns {} so the forever loop keeps running.
+    req = dpf_mod.httpx.Request("POST", "https://x/api/bridge/printers/state")
+
+    def fake_post(self, url, json=None, headers=None):
+        return dpf_mod.httpx.Response(401, request=req)
+
+    monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
+    monkeypatch.setattr(dpf_mod.time, "sleep", lambda *_a, **_k: None)
+    client = DpfClient("https://x", "revoked-tok")
+    assert client.unauthorized is False
+    assert client.report_state([]) == {}
+    assert client.unauthorized is True
+
+
+def test_set_token_swaps_header_and_clears_unauthorized():
+    client = DpfClient("https://x", "old")
+    client.unauthorized = True
+    client.set_token("new")
+    assert client._headers["Authorization"] == "Bearer new"
+    assert client.unauthorized is False
