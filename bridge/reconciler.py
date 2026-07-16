@@ -49,6 +49,24 @@ class ConfigReconciler:
 
     def _reconcile(self) -> None:
         config = self._dpf.get_printers_config() or {}
+
+        # Tombstones (U5) FIRST, before the printers loop below: 3DPF deleted these
+        # serials and is telling the bridge to stop connecting to them. Drop from the
+        # live fleet and the durable store now, so that if the SAME serial also shows up
+        # in "printers" this tick (e.g. a re-adopt raced the tombstone's ack and the
+        # backend delivered a stale one — see adopt_bridge_printer clearing the
+        # tombstone), the printer that 3DPF is actively couriering wins: it gets added
+        # back by the loop below instead of being removed after the fact. A serial no
+        # longer in the fleet (already torn down, or never connected) is a no-op —
+        # remove_printer and store.remove are both idempotent by design.
+        removed = []
+        for bambu_id in (config.get("remove") or []):
+            if not bambu_id:
+                continue
+            self._fleet.remove_printer(bambu_id)
+            self._store.remove(bambu_id)
+            removed.append(bambu_id)
+
         printers = config.get("printers") or []
         acks = []
         for p in printers:
@@ -77,5 +95,5 @@ class ConfigReconciler:
             printer_id, config_version = p.get("printer_id"), p.get("config_version")
             if printer_id and config_version:
                 acks.append({"printer_id": printer_id, "config_version": config_version})
-        if acks:
-            self._dpf.ack_printers_config(acks)
+        if acks or removed:
+            self._dpf.ack_printers_config(acks, removed=removed)

@@ -41,21 +41,68 @@ def test_scans_often_during_the_startup_ramp():
     assert len(dpf.reported) == 2  # scanned again on the fast cadence, not the 60s one
 
 
-def test_settles_to_the_slow_interval_after_the_ramp():
+def test_no_autonomous_scan_after_the_ramp_without_a_scan_request():
+    # U7: no more perpetual steady-interval scanning. Once the ramp ends, tick() is a
+    # no-op unless a scan is explicitly requested — even long after the ramp, even
+    # though plenty of time has passed on the old "steady interval" clock.
     dpf = FakeDpf()
     clock = Clock(1000.0)
-    r = DiscoveryReporter(dpf, discover_fn=lambda t: [], interval_seconds=60.0,
-                          fast_interval_seconds=20.0, ramp_seconds=180.0, monotonic=clock)
-    r.tick()                       # first scan at t=1000
+    r = DiscoveryReporter(dpf, discover_fn=lambda t: [], fast_interval_seconds=20.0,
+                          ramp_seconds=180.0, monotonic=clock)
+    r.tick()                       # first scan at t=1000 (ramp start)
+    assert len(dpf.reported) == 1
     clock.t = 1000.0 + 200         # past the 180s ramp window
-    r.tick()
+    r.tick(scan_requested=False)
+    assert len(dpf.reported) == 1  # still quiet
+    clock.t = 1000.0 + 400         # well past — still nothing without a request
+    r.tick(scan_requested=False)
+    assert len(dpf.reported) == 1
+
+
+def test_scan_requested_after_the_ramp_opens_a_bounded_burst():
+    # A scan_requested=True after the ramp opens a burst: scans immediately, keeps
+    # scanning on the fast interval while the burst is open, then goes quiet again
+    # once burst_seconds elapses.
+    dpf = FakeDpf()
+    clock = Clock(1000.0)
+    r = DiscoveryReporter(dpf, discover_fn=lambda t: [], fast_interval_seconds=20.0,
+                          ramp_seconds=180.0, burst_seconds=45.0, monotonic=clock)
+    r.tick()                            # ramp-start scan, t=1000
+    clock.t = 1000.0 + 200               # past the ramp; quiet
+    r.tick(scan_requested=False)
+    assert len(dpf.reported) == 1
+
+    # Operator clicks "Add Printer" -> the next state poll carries scan_requested=True.
+    r.tick(scan_requested=True)          # opens a burst until t=1245
     assert len(dpf.reported) == 2
-    clock.t = 1000.0 + 230         # 30s later: past fast(20) but not slow(60) -> no scan
-    r.tick()
-    assert len(dpf.reported) == 2  # steady state uses the 60s interval
-    clock.t = 1000.0 + 261         # 61s after the last scan -> due again
-    r.tick()
+
+    clock.t = 1000.0 + 221               # 21s later: still inside the burst, past the fast interval
+    r.tick()                             # scan_requested defaults False, burst still open
     assert len(dpf.reported) == 3
+
+    clock.t = 1000.0 + 250               # past the burst deadline (1200 + 45 = 1245)
+    r.tick()
+    assert len(dpf.reported) == 3        # quiet again — the burst closed
+
+
+def test_fresh_scan_request_reopens_an_already_open_burst():
+    dpf = FakeDpf()
+    clock = Clock(1000.0)
+    r = DiscoveryReporter(dpf, discover_fn=lambda t: [], fast_interval_seconds=20.0,
+                          ramp_seconds=180.0, burst_seconds=45.0, monotonic=clock)
+    r.tick()                             # ramp-start scan
+    clock.t = 1000.0 + 200
+    r.tick(scan_requested=True)          # opens a burst, due to close at t=1245
+    assert len(dpf.reported) == 2
+
+    clock.t = 1000.0 + 240                # still inside the first burst
+    r.tick(scan_requested=True)           # a fresh request re-extends it to t=1285
+    assert len(dpf.reported) == 3
+
+    clock.t = 1000.0 + 262                # past the ORIGINAL 1245 deadline, but the reopen
+                                           # pushed it to 1285 -> still active
+    r.tick()
+    assert len(dpf.reported) == 4
 
 
 def test_empty_scan_reports_empty_list():

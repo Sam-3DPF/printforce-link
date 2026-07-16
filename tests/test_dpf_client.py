@@ -161,8 +161,27 @@ def test_ack_printers_config_posts_acks(monkeypatch):
     out = client.ack_printers_config([{"printer_id": "p1", "config_version": "abcd"}])
 
     assert captured["url"] == "https://app.3dprintforce.com/api/bridge/printers/config/ack"
-    assert captured["json"] == {"acks": [{"printer_id": "p1", "config_version": "abcd"}]}
+    # Backward-compatible: an omitted `removed` still posts an explicit empty list, not
+    # a missing key, so an older server (or this one) reading data.get("removed") or []
+    # always gets a well-formed list.
+    assert captured["json"] == {"acks": [{"printer_id": "p1", "config_version": "abcd"}], "removed": []}
     assert out == {"acknowledged": 1, "acknowledged_ids": ["p1"]}
+
+
+def test_ack_printers_config_posts_removed_serials(monkeypatch):
+    captured = {}
+
+    def fake_post(self, url, json=None, headers=None):
+        captured.update(url=url, json=json)
+        return _FakeResp(200, {"data": {"acknowledged": 0, "acknowledged_ids": [],
+                                        "removed_acknowledged": ["S1"]}})
+
+    monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
+    client = DpfClient("https://app.3dprintforce.com", "tok")
+    out = client.ack_printers_config([], removed=["S1"])
+
+    assert captured["json"] == {"acks": [], "removed": ["S1"]}
+    assert out == {"acknowledged": 0, "acknowledged_ids": [], "removed_acknowledged": ["S1"]}
 
 
 def test_report_discovered_posts_printers(monkeypatch):
