@@ -74,11 +74,16 @@ def test_delivered_code_is_stored_added_and_acked():
     assert dpf.acked == [[{"printer_id": "p1", "config_version": "v1"}]]         # 3. acked -> cloud deletes
 
 
-def test_already_in_fleet_is_not_re_added_but_still_stored_and_acked():
-    r, dpf, fleet, store = _reconciler([_entry()], fleet=FakeFleet(serials=["S1"]))
+def test_already_in_fleet_is_rebuilt_with_the_new_code():
+    # Re-adopting with a corrected access code: the cloud delivers the new code for a
+    # printer that is ALREADY in the fleet (it joined with the wrong code and is failing).
+    # The reconciler must tear down that member and re-add it with the new credential so it
+    # reconnects on its own — not leave it stranded on the old code until a restart (R1).
+    r, dpf, fleet, store = _reconciler([_entry(access_code="NEWCODE")], fleet=FakeFleet(serials=["S1"]))
     r.tick()
-    assert fleet.added == []
-    assert ("S1", "CODE", "192.168.1.5") in store.upserts
+    assert ("S1", "NEWCODE", "192.168.1.5") in store.upserts
+    assert fleet.removed == ["S1"]                                             # old member torn down
+    assert [(c.bambu_id, c.ip, c.access_code) for c in fleet.added] == [("S1", "192.168.1.5", "NEWCODE")]
     assert dpf.acked
 
 

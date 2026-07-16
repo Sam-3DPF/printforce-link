@@ -60,8 +60,17 @@ class ConfigReconciler:
             # 1. Durably store the code first — the store is its permanent home, so we
             #    must have written it before ACKing the cloud to delete its copy.
             self._store.upsert(bambu_id, access_code, local_ip)
-            # 2. Add to the running fleet if connectable and not already present.
-            if local_ip and self._fleet.by_id(bambu_id) is None:
+            # 2. Push the code into the running fleet so the printer connects without a
+            #    restart (U2). The cloud only sends a code while it is UNdelivered, so a code
+            #    arriving here for a printer ALREADY in the fleet means the operator
+            #    re-adopted with a corrected access code (the #1 onboarding mistake — the
+            #    first code was mistyped, so the printer joined the fleet OFFLINE). Rebuild
+            #    that member — remove first, since add_printer is a no-op when the serial is
+            #    already present — so it reconnects with the new credential instead of
+            #    stranding on the old code until a manual restart. Needs an address either way.
+            if local_ip:
+                if self._fleet.by_id(bambu_id) is not None:
+                    self._fleet.remove_printer(bambu_id)
                 self._fleet.add_printer(
                     PrinterConfig(bambu_id=bambu_id, ip=local_ip, access_code=access_code))
             # 3. Queue the ACK so the cloud deletes the code.
