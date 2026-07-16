@@ -1,0 +1,63 @@
+name: Release
+
+# Cut a release by pushing a version tag, e.g.:  git tag v0.1.0 && git push origin v0.1.0
+# Builds the --onedir agent on macOS (Apple Silicon + Intel) and Windows, then publishes
+# the archives + SHA256SUMS to a GitHub Release. Asset names match install.sh / install.ps1
+# / bridge/updater.py exactly.
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-14,      target: macos-arm64,   kind: macos }
+          - { os: macos-13,      target: macos-x86_64,  kind: macos }
+          - { os: windows-latest, target: windows-x86_64, kind: windows }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller certifi
+      - name: Build (--onedir)
+        run: >
+          pyinstaller --onedir --noconfirm --name printforce-link
+          --collect-submodules bambulabs_api
+          --collect-data certifi
+          packaging/entry.py
+      - name: Package (macOS)
+        if: matrix.kind == 'macos'
+        run: tar -czf "printforce-link-${{ matrix.target }}.tar.gz" -C dist printforce-link
+      - name: Package (Windows)
+        if: matrix.kind == 'windows'
+        run: Compress-Archive -Path dist/printforce-link -DestinationPath "printforce-link-${{ matrix.target }}.zip"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: printforce-link-${{ matrix.target }}.*
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect archives + checksums
+        run: |
+          mkdir release
+          find artifacts -type f -name 'printforce-link-*' -exec cp {} release/ \;
+          (cd release && sha256sum printforce-link-* > SHA256SUMS && cat SHA256SUMS)
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: release/*

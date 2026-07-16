@@ -1,0 +1,21 @@
+# Real config holds access codes + the cloud token — never commit it.
+# Glob covers config.toml, config.toml.new, config.toml.bak, etc.
+config.toml*
+
+# Local launchd/systemd unit written for this machine (has absolute paths).
+*.plist
+
+# Print-host runtime artifacts: TLS key/cert, the spool dir, the durable queue.
+certs/
+spool/
+queue.json
+
+# The bridge-managed printer store (holds access codes) + its atomic-write temp files.
+printers.json
+.printers-*.tmp
+
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pytest_cache/

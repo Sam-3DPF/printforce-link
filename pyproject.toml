@@ -1,0 +1,9 @@
+[project]
+name = "bambu-bridge"
+version = "0.1.0"
+description = "Local agent connecting 3D PrintForce to Bambu printers over the shop LAN"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

@@ -1,0 +1,7 @@
+# Bambu Bridge — local agent dependencies (Python 3.10+)
+bambulabs-api>=2.6.0     # MIT; MQTT + FTPS control of Bambu printers over LAN
+httpx>=0.27              # outbound HTTPS client to the 3DPF bridge API
+tomli>=2.0; python_version < "3.11"   # config parsing (tomllib is stdlib on 3.11+)
+
+# dev
+pytest>=7.4

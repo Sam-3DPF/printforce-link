@@ -1,0 +1,48 @@
+# Copy to config.toml and fill in. config.toml is gitignored (holds secrets).
+
+# The 3DPF backend base URL and this farm's bridge CLOUD token
+# (Integrations -> Bambu Bridge -> issue token in the app).
+dpf_base_url = "https://app.3dprintforce.com"
+cloud_token = "REPLACE_WITH_CLOUD_TOKEN"   # secret — never commit config.toml
+
+# How often to report state / heartbeat (seconds).
+state_interval_seconds = 15
+heartbeat_interval_seconds = 30
+
+# How many polls of SILENCE before a printer is reported OFFLINE.
+# A printer that is unplugged mid-print doesn't error — the library keeps handing the
+# bridge its last MQTT payload — so silence is the only thing left to detect it by.
+# Default 3 (with the 15s interval above: 45s). Raise it only if a healthy *idle*
+# printer ever flaps OFFLINE; never raise it so far that a dead printer keeps
+# reporting IDLE, because IDLE is what authorizes a print to be sent to it.
+offline_after_stale_polls = 3
+
+# One [[printers]] block per Bambu printer.
+# bambu_id = the printer's serial number (also how 3DPF joins reports to the
+#            printer record — set the same serial on the printer in 3DPF).
+# access_code = the printer's LAN access code (Settings -> LAN Only). SECRET.
+
+[[printers]]
+name = "P1S #1"
+bambu_id = "00M00A000000000"
+ip = "192.168.1.50"
+access_code = "REPLACE_ME"
+
+[[printers]]
+name = "P1S #2"
+bambu_id = "00M00A000000001"
+ip = "192.168.1.51"
+access_code = "REPLACE_ME"
+
+# OPTIONAL — the OctoPrint print-host OrcaSlicer uploads sliced files to.
+# Omit this whole block to run observability-only (no inbound port).
+# Generate the cert with:  python -m bridge.gencert  (or --host <lan-ip>)
+# [printhost]
+# upload_key = "REPLACE_WITH_A_LONG_RANDOM_STRING"  # local secret; never sent to 3DPF
+# cert_file  = "certs/printhost.crt"
+# key_file   = "certs/printhost.key"
+# host       = "127.0.0.1"   # 127.0.0.1 if you slice on this machine; else its LAN IP
+# port       = 8899
+# spool_dir  = "spool"       # where uploaded .3mf files are stored
+# queue_path = "queue.json"  # durable job queue (survives a bridge restart)
+# max_upload_mb = 200
