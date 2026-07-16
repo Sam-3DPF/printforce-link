@@ -30,6 +30,7 @@ main() {
   [ -n "$PAIR_TOKEN" ] || die "No pairing code. Copy the whole command from 3D Print Force (Integrations -> PrintForce Link -> Get install command)."
 
   local arch; arch="$(uname -m)"                 # arm64 (Apple Silicon) or x86_64 (Intel)
+  [ "$arch" = "arm64" ] || die "PrintForce Link currently supports Apple Silicon Macs (M1/M2/M3/M4) only. Intel Mac support is coming soon — reach out to 3D Print Force if you need it."
   local asset="printforce-link-macos-${arch}.tar.gz"
   local base="https://github.com/${REPO}/releases/latest/download"
 

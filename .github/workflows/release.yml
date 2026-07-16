@@ -1,9 +1,14 @@
 name: Release
 
 # Cut a release by pushing a version tag, e.g.:  git tag v0.1.0 && git push origin v0.1.0
-# Builds the --onedir agent on macOS (Apple Silicon + Intel) and Windows, then publishes
-# the archives + SHA256SUMS to a GitHub Release. Asset names match install.sh / install.ps1
+# Builds the --onedir agent on macOS (Apple Silicon) and Windows, then publishes the
+# archives + SHA256SUMS to a GitHub Release. Asset names match install.sh / install.ps1
 # / bridge/updater.py exactly.
+#
+# Intel Macs (macos-13) are intentionally omitted: GitHub is deprecating the free Intel
+# runners and they can sit queued for hours, hanging the whole release. install.sh guards
+# x86_64 with a clear message. Re-add a macos-13 matrix entry (or a self-hosted runner)
+# when Intel support is actually needed.
 on:
   push:
     tags: ['v*']
@@ -15,7 +20,6 @@ jobs:
       matrix:
         include:
           - { os: macos-14,      target: macos-arm64,   kind: macos }
-          - { os: macos-13,      target: macos-x86_64,  kind: macos }
           - { os: windows-latest, target: windows-x86_64, kind: windows }
     runs-on: ${{ matrix.os }}
     steps:
@@ -30,6 +34,8 @@ jobs:
       - name: Build (--onedir)
         run: >
           pyinstaller --onedir --noconfirm --name printforce-link
+          --paths .
+          --collect-submodules bridge
           --collect-submodules bambulabs_api
           --collect-data certifi
           packaging/entry.py
