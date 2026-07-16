@@ -36,7 +36,11 @@ main() {
 
   say "Downloading PrintForce Link for $arch..."
   local tmp; tmp="$(mktemp -d)"
-  trap 'rm -rf "$tmp"' EXIT
+  # `tmp` is local to main(), but the EXIT trap fires after main() returns — where the
+  # local is out of scope. Under `set -u` a bare "$tmp" then errors "unbound variable"
+  # at exit (harmless, but it printed a scary line after a successful install). ${tmp:-}
+  # tolerates the unset case.
+  trap 'rm -rf "${tmp:-}"' EXIT
   curl -fSL "$base/$asset"    -o "$tmp/$asset"      || die "Download failed — check your internet connection and try again."
   curl -fSL "$base/SHA256SUMS" -o "$tmp/SHA256SUMS" || die "Download failed — check your internet connection and try again."
 
