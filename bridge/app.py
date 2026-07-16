@@ -154,6 +154,11 @@ def main(config_path: str = "config.toml") -> None:
                             "then Get install command, and re-run the install command.")
 
             desired = response.get("printers") if isinstance(response, dict) else None
+            # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
+            # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
+            # the bridge scans once at startup, then goes quiet, then reopens exactly one
+            # bounded burst per request instead of scanning forever.
+            scan_requested = bool(response.get("scan_requested")) if isinstance(response, dict) else False
             _handle_desired(desired or [])
 
             # Drain queued uploads onto idle, color-matched printers, matching on THIS
@@ -177,8 +182,9 @@ def main(config_path: str = "config.toml") -> None:
             reconciler.tick()
 
             # Report the printers seen on the LAN so the onboarding wizard can list them
-            # (U11). Throttled; code-free.
-            discovery_reporter.tick()
+            # (U11). Scans once at startup then goes quiet; scan_requested reopens one
+            # bounded on-demand burst (U7). Throttled; code-free.
+            discovery_reporter.tick(scan_requested=scan_requested)
 
             # Self-heal any printer that dropped off the network — re-discover it by
             # serial and reconnect at its new IP if DHCP moved it (U1). Throttled and only

@@ -97,12 +97,17 @@ class DpfClient:
         never logged."""
         return self._send("GET", "/api/bridge/printers/config")
 
-    def ack_printers_config(self, acks: List[Dict]) -> Dict:
-        """Confirm the delivered codes are durably stored so the cloud deletes them (U4).
+    def ack_printers_config(self, acks: List[Dict], removed: Optional[List[str]] = None) -> Dict:
+        """Confirm the delivered codes are durably stored so the cloud deletes them (U4),
+        and/or confirm tombstoned serials have been dropped from the fleet + store (U5).
 
         `acks`: [{"printer_id", "config_version"}, ...] echoed from get_printers_config.
+        `removed`: [bambu_id, ...] serials the reconciler just removed — omitted/empty is
+        the common case (most reconciles have nothing to remove), so it defaults to None
+        and is sent as an empty list rather than requiring every caller to pass one.
         Returns {"acknowledged": N, "acknowledged_ids": [...]}."""
-        return self._post("/api/bridge/printers/config/ack", {"acks": acks})
+        return self._post("/api/bridge/printers/config/ack",
+                          {"acks": acks, "removed": removed or []})
 
     def report_discovered(self, printers: List[Dict]) -> Dict:
         """Report the LAN printers the bridge currently sees, for the onboarding wizard (U11).

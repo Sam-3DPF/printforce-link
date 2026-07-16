@@ -7,13 +7,15 @@ class FakeDpf:
         self._config = config
         self.pulls = 0
         self.acked = []
+        self.acked_removed = []
 
     def get_printers_config(self):
         self.pulls += 1
         return self._config
 
-    def ack_printers_config(self, acks):
+    def ack_printers_config(self, acks, removed=None):
         self.acked.append(acks)
+        self.acked_removed.append(removed or [])
         return {"acknowledged": len(acks)}
 
 
@@ -38,9 +40,13 @@ class FakeFleet:
 class FakeStore:
     def __init__(self):
         self.upserts = []
+        self.removed = []
 
     def upsert(self, bambu_id, access_code, local_ip=None, name=""):
         self.upserts.append((bambu_id, access_code, local_ip))
+
+    def remove(self, bambu_id):
+        self.removed.append(bambu_id)
 
 
 class Clock:
@@ -58,8 +64,11 @@ def _entry(**over):
     return e
 
 
-def _reconciler(printers, fleet=None, store=None, clock=None, interval=60.0):
-    dpf = FakeDpf({"printers": printers})
+def _reconciler(printers, fleet=None, store=None, clock=None, interval=60.0, remove=None):
+    config = {"printers": printers}
+    if remove is not None:
+        config["remove"] = remove
+    dpf = FakeDpf(config)
     fleet = fleet or FakeFleet()
     store = store or FakeStore()
     r = ConfigReconciler(dpf, fleet, store, interval_seconds=interval, monotonic=clock or Clock())
@@ -127,3 +136,31 @@ def test_empty_config_is_noop():
     r, dpf, fleet, store = _reconciler([])
     r.tick()
     assert store.upserts == [] and fleet.added == [] and dpf.acked == []
+
+
+def test_remove_list_drops_from_fleet_and_store_and_is_acked(): # U5
+    r, dpf, fleet, store = _reconciler([], fleet=FakeFleet(serials=["S1", "S2"]), remove=["S1"])
+    r.tick()
+    assert fleet.removed == ["S1"]
+    assert store.removed == ["S1"]
+    # Acked even though there were no code acks this tick — the ack call itself is
+    # shared, not gated on acks being non-empty.
+    assert dpf.acked == [[]]
+    assert dpf.acked_removed == [["S1"]]
+
+
+def test_remove_of_serial_not_in_fleet_is_a_noop_no_raise(): # U5
+    r, dpf, fleet, store = _reconciler([], fleet=FakeFleet(serials=[]), remove=["GHOST"])
+    r.tick()                                    # must not raise
+    assert store.removed == ["GHOST"]            # store.remove is a no-op for an unknown serial
+    assert dpf.acked_removed == [["GHOST"]]      # still confirmed — the tombstone is cleared either way
+
+
+def test_remove_list_alongside_a_delivered_code_acks_both(): # U5
+    r, dpf, fleet, store = _reconciler([_entry()], fleet=FakeFleet(serials=["S2"]), remove=["S2"])
+    r.tick()
+    assert ("S1", "CODE", "192.168.1.5") in store.upserts
+    assert fleet.removed == ["S2"]
+    assert store.removed == ["S2"]
+    assert dpf.acked == [[{"printer_id": "p1", "config_version": "v1"}]]
+    assert dpf.acked_removed == [["S2"]]
