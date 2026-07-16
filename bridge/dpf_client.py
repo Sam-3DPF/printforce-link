@@ -29,12 +29,23 @@ class DpfClient:
             logger.warning("dpf_base_url is not https:// — the bearer token would be sent in cleartext")
         self._headers = {"Authorization": f"Bearer {cloud_token}"}
         self._retries = retries
+        # Set when the cloud rejects our token (401/403) — i.e. the credential was
+        # revoked (the operator hit Disconnect). The main loop watches this and re-pairs;
+        # set_token clears it. It is a flag, not an exception, so the forever loop's
+        # per-iteration try/except never has to special-case auth.
+        self.unauthorized = False
         # Persistent client reuses the keep-alive connection across the forever
         # report/heartbeat loop instead of a fresh TCP+TLS handshake per call.
         self._client = httpx.Client(timeout=timeout)
 
     def close(self) -> None:
         self._client.close()
+
+    def set_token(self, cloud_token: str) -> None:
+        """Swap in a freshly re-paired cloud token after the old one was revoked, and
+        clear the unauthorized flag so the loop resumes normal reporting."""
+        self._headers["Authorization"] = f"Bearer {cloud_token}"
+        self.unauthorized = False
 
     def report_state(self, reports: List[Dict]) -> Dict:
         """POST a batch of printer-state reports; returns the desired-state body."""
@@ -148,6 +159,10 @@ class DpfClient:
                         logger.warning("3DPF %s returned a non-JSON body", path)
                         return {}
             except httpx.HTTPStatusError as e:
+                if e.response.status_code in (401, 403):
+                    # Credential revoked (Disconnect) — flag it so the loop re-pairs
+                    # instead of knocking forever with a dead token.
+                    self.unauthorized = True
                 logger.error("3DPF %s rejected: %s", path, e.response.status_code)
                 return {}
             except httpx.RequestError as e:
