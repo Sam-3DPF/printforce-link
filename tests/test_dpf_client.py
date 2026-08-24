@@ -223,3 +223,72 @@ def test_set_token_swaps_header_and_clears_unauthorized():
     client.set_token("new")
     assert client._headers["Authorization"] == "Bearer new"
     assert client.unauthorized is False
+
+
+def test_enqueue_sliced_file_posts_multipart(monkeypatch):
+    captured = {}
+
+    def fake_post(self, url, headers=None, files=None, json=None, timeout=None):
+        captured.update(url=url, files=files, headers=headers, timeout=timeout)
+        return _FakeResp(200, {"data": {"id": "item-1"}})
+
+    monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
+    client = DpfClient("https://app.3dprintforce.com", "tok")
+    out = client.enqueue_sliced_file(b"3mf-bytes", "batch-a.3mf")
+
+    assert captured["url"] == "https://app.3dprintforce.com/api/bridge/sliced-queue/enqueue"
+    assert captured["files"]["file"][0] == "batch-a.3mf"
+    assert captured["files"]["file"][1] == b"3mf-bytes"
+    assert captured["headers"]["Authorization"] == "Bearer tok"
+    assert out == {"id": "item-1"}
+
+
+def test_enqueue_failed_stub_posts_reason(monkeypatch):
+    captured = {}
+
+    def fake_post(self, url, json=None, headers=None):
+        captured.update(url=url, json=json)
+        return _FakeResp(200, {"data": {"ok": True}})
+
+    monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
+    client = DpfClient("https://app.3dprintforce.com", "tok")
+    out = client.enqueue_failed_stub("batch-a.3mf", "could not park")
+
+    assert captured["url"] == "https://app.3dprintforce.com/api/bridge/sliced-queue/stub"
+    assert captured["json"] == {"filename": "batch-a.3mf", "reason": "could not park"}
+    assert out == {"ok": True}
+
+
+def test_download_url_writes_dest(tmp_path, monkeypatch):
+    dest = str(tmp_path / "file.3mf")
+
+    class _Stream:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def raise_for_status(self):
+            pass
+
+        def iter_bytes(self, size):
+            yield b"abc"
+            yield b"def"
+
+    def fake_stream(self, method, url, timeout=None):
+        assert method == "GET"
+        assert url == "https://example/signed.3mf"
+        return _Stream()
+
+    monkeypatch.setattr(dpf_mod.httpx.Client, "stream", fake_stream)
+    client = DpfClient("https://app.3dprintforce.com", "tok")
+    assert client.download_url("https://example/signed.3mf", dest) is True
+    with open(dest, "rb") as handle:
+        assert handle.read() == b"abcdef"
+
+
+def test_download_url_empty_is_false():
+    client = DpfClient("https://app.3dprintforce.com", "tok")
+    assert client.download_url("", "/tmp/x") is False
+

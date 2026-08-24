@@ -47,7 +47,7 @@ def _merge_printer_configs(from_config: List[PrinterConfig],
     return list(from_config) + [c for c in from_store if c.bambu_id not in seen]
 
 
-def _start_printhost(cfg: Config) -> Optional[Router]:
+def _start_printhost(cfg: Config, dpf: Optional["DpfClient"] = None) -> Optional[Router]:
     """Start the OctoPrint print-host in a daemon thread if it's configured.
 
     Returns the shared Router (so the dispatch loop can drain it in U9), or None
@@ -60,11 +60,21 @@ def _start_printhost(cfg: Config) -> Optional[Router]:
 
     ph = cfg.printhost
     router = Router(ph.queue_path)
+    def _forward(file_bytes: bytes, filename: str):
+        if dpf is None:
+            return None
+        row = dpf.enqueue_sliced_file(file_bytes, filename)
+        if row:
+            return row
+        dpf.enqueue_failed_stub(filename, "PrintForce Link could not park this file in 3DPF.")
+        return None
+
     service = PrintHostService(
         upload_key=ph.upload_key,
         spool_dir=ph.spool_dir,
         router=router,
         max_bytes=ph.max_upload_bytes,
+        cloud_forward=_forward if dpf is not None else None,
     )
     # Bind + load the cert HERE, in the main thread: a bad cert path or a port
     # already in use raises now and crashes startup loudly, instead of dying
@@ -113,9 +123,9 @@ def main(config_path: str = "config.toml") -> None:
     logger.info("PrintForce Link %s — %d printer(s) at startup (%d from config.toml, %d from the store)",
                 __version__, len(printer_configs), len(cfg.printers), len(store.configs()))
 
-    # Print-host accepts OrcaSlicer uploads and fills this queue; the Dispatcher drains
-    # it onto idle, color-matched printers each loop (U9).
-    router = _start_printhost(cfg)
+    # Print-host accepts OrcaSlicer uploads and forwards them into the cloud
+    # Sliced Queue. Local auto-dispatch is off; start is a cloud send command.
+    router = _start_printhost(cfg, dpf)
     dispatcher = None
     if router is not None:
         dispatcher = Dispatcher(router, fleet, dpf)
@@ -124,6 +134,9 @@ def main(config_path: str = "config.toml") -> None:
 
     last_heartbeat = 0.0
     last_repair_attempt: Optional[float] = None   # throttles re-pairing on a revoked token
+    started_sends = set()
+    spool_dir = cfg.printhost.spool_dir if cfg.printhost else "/tmp/printforce-spool"
+    os.makedirs(spool_dir, exist_ok=True)
     logger.info("Reporting every %ss; heartbeat every %ss; a printer that says nothing "
                 "new for %ss is reported OFFLINE",
                 cfg.state_interval_seconds, cfg.heartbeat_interval_seconds,
@@ -160,6 +173,9 @@ def main(config_path: str = "config.toml") -> None:
             # bounded burst per request instead of scanning forever.
             scan_requested = bool(response.get("scan_requested")) if isinstance(response, dict) else False
             _handle_desired(desired or [])
+            _handle_cloud_sends(
+                desired or [], fleet, dpf, spool_dir, started_sends, router=router,
+            )
 
             # Drain queued uploads onto idle, color-matched printers, matching on THIS
             # pass's fresh reports (the KTD3 dispatch-time re-validation). U9.
@@ -208,13 +224,89 @@ def main(config_path: str = "config.toml") -> None:
 
 
 def _handle_desired(desired: List[Dict]) -> None:
-    """Act on the authoritative desired-state 3DPF returns.
-
-    This is the hook for the later dispatch + clear-plate phases (route the next
-    job when a printer becomes IDLE, etc.). For now we only log it.
-    """
+    """Act on the authoritative desired-state 3DPF returns."""
     for d in desired:
         logger.debug("desired-state: %s -> %s", d.get("bambu_id"), d.get("desired_status"))
+
+
+def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
+                       started_sends=None, router=None) -> None:
+    """Start a print only when the cloud Sliced Queue says so.
+
+    A send that already physically started is only re-reported — never started twice
+    while the cloud row is still SENDING (report 5xx / next poll / Link restart).
+    """
+    import os
+    if started_sends is None:
+        started_sends = set()
+    live = set()
+    seen_serials = {
+        str(row.get("bambu_id"))
+        for row in desired
+        if isinstance(row, dict) and row.get("bambu_id")
+    }
+    for row in desired:
+        if not isinstance(row, dict):
+            continue
+        send = row.get("send")
+        if not isinstance(send, dict):
+            continue
+        bambu_id = row.get("bambu_id")
+        batch_id = send.get("batch_id")
+        file_url = send.get("file_url")
+        plate_index = int(send.get("plate_index") or 1)
+        if not bambu_id or not batch_id:
+            continue
+        key = (str(batch_id), str(bambu_id))
+        live.add(key)
+        dest = os.path.join(spool_dir, f"{batch_id}.3mf")
+        started_path = dest + ".started"
+        if key in started_sends or os.path.exists(started_path):
+            started_sends.add(key)
+            dpf.report_dispatched(batch_id, bambu_id)
+            continue
+        if str(row.get("desired_status") or "IDLE") != "IDLE":
+            continue
+        if not os.path.exists(dest):
+            tmp = dest + ".part"
+            try:
+                if os.path.exists(tmp):
+                    os.unlink(tmp)
+                if not dpf.download_url(file_url, tmp):
+                    if os.path.exists(tmp):
+                        os.unlink(tmp)
+                    logger.warning("could not download send file for batch %s", batch_id)
+                    continue
+                os.replace(tmp, dest)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                logger.warning("could not download send file for batch %s", batch_id)
+                continue
+        started = fleet.dispatch(bambu_id, dest, [], plate_index)
+        if started:
+            started_sends.add(key)
+            try:
+                with open(started_path, "w"):
+                    pass
+            except OSError:
+                pass
+            if router is not None:
+                router.record_assignment(str(bambu_id), str(batch_id), plate_index)
+            dpf.report_dispatched(batch_id, bambu_id)
+        else:
+            logger.warning("printer %s did not start batch %s", bambu_id, batch_id)
+    for key in list(started_sends):
+        _batch_id, bambu_id = key
+        if bambu_id in seen_serials and key not in live:
+            started_sends.discard(key)
+            leftover = os.path.join(spool_dir, f"{_batch_id}.3mf.started")
+            try:
+                os.unlink(leftover)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

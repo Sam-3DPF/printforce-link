@@ -36,8 +36,10 @@ Then, back in 3D PrintForce, your printers appear as they're found on the networ
 ## What it does
 
 - **Live status + AMS colors** for every Bambu printer, reported to 3D PrintForce.
-- **Auto-routing** of sliced files (via an OctoPrint-compatible print-host) to an idle
-  printer whose loaded colors match the job.
+- **Park, then start.** Orca / OctoPrint **Print** only parks the sliced file in 3DPF.
+  The shop machine starts a printer only when the cloud Sliced Queue sends (download
+  to a temp file, then `fleet.dispatch` once). Color / family / bed / nozzle matching
+  lives in 3DPF; Link just executes the send.
 - **Completion + clear-plate** hand-off back to 3D PrintForce.
 - **Stays connected.** Printers are tracked by serial, not IP, so a DHCP lease change or a
   reboot self-heals with no action from you.
