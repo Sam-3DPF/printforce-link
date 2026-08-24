@@ -120,182 +120,40 @@ def _router_with_job(tmp_path, correlation_key="batch-a", status=QUEUED, stored=
     return r
 
 
-def test_dispatches_single_color_to_idle_matching_printer(tmp_path):
+def test_drain_does_not_auto_dispatch_a_queued_job(tmp_path):
+    # Cloud Sliced Queue owns start. Local color auto-match is off (KTD6).
     r = _router_with_job(tmp_path)
     dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}})
     fleet = _FakeFleet()
     Dispatcher(r, fleet, dpf).drain([
         _snap("P1", "IDLE", [(1, "FF6A13FF"), (2, "1A1A1AFF")]),
     ])
-    # tray holding #FF6A13 is slot 1 -> global index 0
-    assert fleet.calls == [("P1", "/spool/a.3mf", [0], 1)]
-    assert dpf.dispatched == [("B1", "P1")]
-    assert r.pending() == []  # removed from the queue on dispatch
-
-
-def test_routes_to_printer_that_has_all_required_colors(tmp_path):
-    r = _router_with_job(tmp_path)
-    # pink + black required; printer B has only pink -> must skip B and pick A.
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF69B4", "#000000"]}})
-    fleet = _FakeFleet()
-    Dispatcher(r, fleet, dpf).drain([
-        _snap("B", "IDLE", [(1, "FF69B4FF"), (2, "FFFFFFFF")]),
-        _snap("A", "IDLE", [(1, "FF69B4FF"), (2, "000000FF"), (3, "FFFFFFFF"), (4, "808080FF")]),
-    ])
-    assert fleet.calls[0][0] == "A"
-    # explicit mapping: pink@slot1->0, black@slot2->1
-    assert fleet.calls[0][2] == [0, 1]
-
-
-def test_no_matching_printer_leaves_job_queued(tmp_path):
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#00FF00"]}})
-    fleet = _FakeFleet()
-    Dispatcher(r, fleet, dpf).drain([_snap("P1", "IDLE", [(1, "FF0000FF")])])  # only red
     assert fleet.calls == []
     assert dpf.dispatched == []
+    assert dpf.resolve_calls == []
     assert len(r.pending()) == 1
+    assert r.pending()[0].status == QUEUED
 
 
-def test_skips_non_idle_printer_even_with_matching_color(tmp_path):
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#00FF00"]}})
-    fleet = _FakeFleet()
-    # A finished-but-uncleared printer holds the color but is NEEDS_CLEARING, not IDLE
-    # (U13 gates dispatch on IDLE) — so it must be skipped.
-    Dispatcher(r, fleet, dpf).drain([_snap("P1", "NEEDS_CLEARING", [(1, "00FF00FF")])])
-    assert fleet.calls == []
-    assert len(r.pending()) == 1
-
-
-def test_dispatches_when_printer_later_reloads_matching_color(tmp_path):
-    # KTD3: matching is against each pass's FRESH snapshot, so a job re-tries and
-    # dispatches only once the printer actually reports the required color.
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#00FF00"]}})
-    fleet = _FakeFleet()
-    d = Dispatcher(r, fleet, dpf)
-
-    d.drain([_snap("P1", "IDLE", [(1, "FF0000FF")])])   # red loaded — no match
-    assert fleet.calls == []
-    assert len(r.pending()) == 1
-
-    d.drain([_snap("P1", "IDLE", [(1, "00FF00FF")])])   # green now loaded — dispatches
-    assert fleet.calls[0][0] == "P1"
-    assert r.pending() == []
-
-
-def test_failed_start_leaves_job_queued_and_unreported(tmp_path):
+def test_desired_idle_does_not_auto_dispatch_locally(tmp_path):
     r = _router_with_job(tmp_path)
     dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}})
-    fleet = _FakeFleet(result=False)  # printer refused the start
-    Dispatcher(r, fleet, dpf).drain([_snap("P1", "IDLE", [(1, "FF6A13FF")])])
-    assert len(r.pending()) == 1   # not removed — re-tried next pass
-    assert dpf.dispatched == []    # never told the cloud it's printing
-
-
-def test_transport_exception_leaves_job_queued_and_does_not_crash(tmp_path):
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}})
-    fleet = _FakeFleet(raises=True)  # FTPS/MQTT transport error
-    Dispatcher(r, fleet, dpf).drain([_snap("P1", "IDLE", [(1, "FF6A13FF")])])  # must not raise
-    assert len(r.pending()) == 1
-    assert dpf.dispatched == []
-
-
-def test_dispatched_job_not_reloaded_after_restart(tmp_path):
-    path = str(tmp_path / "queue.json")
-    r = Router(path)
-    r.enqueue(Job.new("/spool/a.3mf", "batch-a", True, QUEUED, now=1.0))
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}})
-    Dispatcher(r, _FakeFleet(), dpf).drain([_snap("P1", "IDLE", [(1, "FF6A13FF")])])
-    # The removal persisted: a fresh Router (bridge restart) does not re-dispatch it.
-    assert Router(path).pending() == []
-
-
-def test_resolution_is_cached_after_first_resolve(tmp_path):
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#00FF00"]}})
     fleet = _FakeFleet()
-    d = Dispatcher(r, fleet, dpf)
-
-    d.drain([_snap("P1", "IDLE", [(1, "FF0000FF")])])   # resolves, caches, no color match
-    assert dpf.resolve_calls == ["batch-a"]
-    assert r.pending()[0].batch_id == "B1"              # cached on the job + persisted
-
-    d.drain([_snap("P1", "IDLE", [(1, "FF0000FF")])])   # cached — no second resolve call
-    assert dpf.resolve_calls == ["batch-a"]
-
-
-def test_unresolved_batch_stays_queued_and_uncached(tmp_path):
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({})  # resolve 404s -> {}
-    fleet = _FakeFleet()
-    Dispatcher(r, fleet, dpf).drain([_snap("P1", "IDLE", [(1, "FF6A13FF")])])
+    Dispatcher(r, fleet, dpf).drain(
+        [_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])],
+        desired=[{"bambu_id": "P1", "desired_status": "IDLE"}],
+    )
     assert fleet.calls == []
     assert len(r.pending()) == 1
-    assert r.pending()[0].batch_id is None  # nothing cached, re-tries next pass
 
 
 def test_unresolved_status_job_is_never_auto_dispatched(tmp_path):
-    # A file with no correlatable batch is HELD (UNRESOLVED) for human triage — the
-    # dispatcher never routes it, whatever colors an idle printer holds.
     r = _router_with_job(tmp_path, correlation_key=None, status=UNRESOLVED, stored="/spool/x.3mf")
     dpf = _FakeDpf({})
     fleet = _FakeFleet()
     Dispatcher(r, fleet, dpf).drain([_snap("P1", "IDLE", [(1, "FF6A13FF"), (2, "000000FF")])])
     assert fleet.calls == []
     assert len(r.pending()) == 1
-
-
-def test_one_job_per_printer_per_pass(tmp_path):
-    r = Router(str(tmp_path / "queue.json"))
-    r.enqueue(Job.new("/spool/a.3mf", "batch-a", True, QUEUED, now=1.0))
-    r.enqueue(Job.new("/spool/b.3mf", "batch-b", True, QUEUED, now=2.0))
-    dpf = _FakeDpf({
-        "batch-a": {"batch_id": "BA", "required_colors": ["#00FF00"]},
-        "batch-b": {"batch_id": "BB", "required_colors": ["#00FF00"]},
-    })
-    fleet = _FakeFleet()
-    # One idle green printer, two green jobs -> only one dispatches this pass.
-    Dispatcher(r, fleet, dpf).drain([_snap("P1", "IDLE", [(1, "00FF00FF")])])
-    assert len(fleet.calls) == 1
-    assert len(r.pending()) == 1
-
-
-# --- U9: explicit AMS mapping (R11) -----------------------------------------
-
-def test_ams_mapping_follows_required_color_order_not_slot_order(tmp_path):
-    # The mapping is indexed by the sliced file's filament (required-color) order, and
-    # each entry is the AMS tray holding that color — NOT the printer's slot order.
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#000000", "#FF69B4"]}})
-    fleet = _FakeFleet()
-    # black required first, but pink sits in slot 1 and black in slot 2.
-    Dispatcher(r, fleet, dpf).drain([_snap("P1", "IDLE", [(1, "FF69B4FF"), (2, "000000FF")])])
-    assert fleet.calls[0][2] == [1, 0]  # black -> tray1(slot2), pink -> tray0(slot1)
-
-
-def test_ams_mapping_uses_first_slot_when_a_color_repeats(tmp_path):
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#00FF00"]}})
-    fleet = _FakeFleet()
-    # green loaded in BOTH slot 2 and slot 4 -> first (slot 2 -> tray 1) wins, deterministic.
-    Dispatcher(r, fleet, dpf).drain([
-        _snap("P1", "IDLE", [(1, "FF0000FF"), (2, "00FF00FF"), (3, "FFFFFFFF"), (4, "00FF00FF")]),
-    ])
-    assert fleet.calls[0][2] == [1]
-
-
-def test_empty_required_colors_matches_any_idle_printer(tmp_path):
-    # A batch whose materials carry no parseable color resolves to an empty required set;
-    # it can run on any idle printer, with an empty mapping (Bambu auto-maps).
-    r = _router_with_job(tmp_path)
-    dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": []}})
-    fleet = _FakeFleet()
-    Dispatcher(r, fleet, dpf).drain([_snap("P1", "IDLE", [(1, "FF0000FF")])])
-    assert fleet.calls[0][0] == "P1"
-    assert fleet.calls[0][2] == []
 
 
 # --- U9: durable dispatch report (a failed report is retried, never stranded) ---
@@ -319,41 +177,43 @@ class _FailingThenOkDpf(_FakeDpf):
 def test_failed_report_keeps_job_dispatched_then_retries_until_acked(tmp_path):
     path = str(tmp_path / "queue.json")
     r = Router(path)
-    r.enqueue(Job.new("/spool/a.3mf", "batch-a", True, QUEUED, now=1.0))
+    job = r.enqueue(Job.new("/spool/a.3mf", "batch-a", True, QUEUED, now=1.0))
+    r.mark_resolved(job.id, "B1", ["#FF6A13"])
+    r.mark_dispatched(job.id, "P1")
     dpf = _FailingThenOkDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}},
                             fail_reports=1)
     fleet = _FakeFleet()
     d = Dispatcher(r, fleet, dpf)
-    snaps = [_snap("P1", "IDLE", [(1, "FF6A13FF")])]
+    snaps = [_snap("P1", "PRINTING", [(1, "FF6A13FF")])]
 
-    # Pass 1: physical start succeeds, but the report fails -> the job stays DISPATCHED
-    # (printing, report owed), NOT removed and NOT re-matchable to a printer.
+    # Pass 1: physical start already happened; the owed report fails -> stays DISPATCHED.
     d.drain(snaps)
-    assert len(fleet.calls) == 1
+    assert fleet.calls == []
     held = r.pending()
     assert len(held) == 1
     assert held[0].status == DISPATCHED
     assert held[0].dispatched_to == "P1"
     assert dpf.dispatched == [("B1", "P1")]
-    # DISPATCHED state is persisted, so a restart won't re-dispatch the running print.
     assert Router(path).pending()[0].status == DISPATCHED
 
-    # Pass 2: no second physical dispatch; the owed report is retried and now acks -> removed.
+    # Pass 2: no physical dispatch; the owed report is retried and now acks -> removed.
     d.drain(snaps)
-    assert len(fleet.calls) == 1  # NOT re-dispatched physically
-    assert dpf.dispatched == [("B1", "P1"), ("B1", "P1")]  # re-reported
-    assert r.pending() == []  # cleared once 3DPF acked
+    assert fleet.calls == []
+    assert dpf.dispatched == [("B1", "P1"), ("B1", "P1")]
+    assert r.pending() == []
 
 
 # --- U11: completion / failure detection + durable report --------------------
 
 def _dispatch_one(tmp_path, dpf=None):
-    """Dispatch a single job to printer P1 and return (router, dpf) with the assignment
-    recorded — the starting point for completion tests."""
+    """Record a cloud-started print on P1. Local drain no longer starts jobs."""
     r = _router_with_job(tmp_path)
+    job = r.pending()[0]
+    r.mark_resolved(job.id, "B1", ["#FF6A13"])
+    r.mark_dispatched(job.id, "P1")
+    r.record_assignment("P1", "B1")
     dpf = dpf or _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}})
-    Dispatcher(r, _FakeFleet(), dpf).drain([_snap("P1", "IDLE", [(1, "FF6A13FF")])])
-    assert r.assignments_snapshot()["P1"]["batch_id"] == "B1"  # assignment recorded
+    assert r.assignments_snapshot()["P1"]["batch_id"] == "B1"
     return r, dpf
 
 
@@ -423,10 +283,12 @@ def test_failed_completion_report_is_retried_until_acked(tmp_path):
 def test_assignment_and_latch_survive_a_restart(tmp_path):
     path = str(tmp_path / "queue.json")
     r = Router(path)
-    r.enqueue(Job.new("/spool/a.3mf", "batch-a", True, QUEUED, now=1.0))
+    job = r.enqueue(Job.new("/spool/a.3mf", "batch-a", True, QUEUED, now=1.0))
+    r.mark_resolved(job.id, "B1", ["#FF6A13"])
+    r.mark_dispatched(job.id, "P1")
+    r.record_assignment("P1", "B1")
     dpf = _CompleteFailsOnceDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}},
                                 fail_completes=1)
-    Dispatcher(r, _FakeFleet(), dpf).drain([_snap("P1", "IDLE", [(1, "FF6A13FF")])])
     # Print finishes, but the completion report fails this pass -> latched, persisted.
     Dispatcher(r, _FakeFleet(), dpf).drain([_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])])
     assert r.assignments_snapshot()["P1"]["terminal"] == "complete"
@@ -441,21 +303,16 @@ def test_assignment_and_latch_survive_a_restart(tmp_path):
 
 # --- U13: clear-plate resume -------------------------------------------------
 
-def test_desired_idle_resumes_dispatch_to_a_needs_clearing_printer(tmp_path):
+def test_desired_idle_does_not_resume_local_auto_dispatch(tmp_path):
     r = _router_with_job(tmp_path)
     dpf = _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}})
     fleet = _FakeFleet()
     d = Dispatcher(r, fleet, dpf)
-    # A finished-but-uncleared printer that holds the color: NOT dispatchable yet.
     finished = [_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])]
     d.drain(finished)
+    d.drain(finished, desired=[{"bambu_id": "P1", "desired_status": "IDLE"}])
     assert fleet.calls == []
     assert len(r.pending()) == 1
-
-    # Operator marks it cleared -> 3DPF returns desired_status IDLE -> now dispatchable,
-    # matched on the colors its snapshot still reports.
-    d.drain(finished, desired=[{"bambu_id": "P1", "desired_status": "IDLE"}])
-    assert fleet.calls[0][0] == "P1"
 
 
 def test_printer_owing_a_completion_report_is_not_re_dispatched(tmp_path):

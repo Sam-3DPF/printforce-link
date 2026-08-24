@@ -1,0 +1,114 @@
+"""Cloud send commands start a printer once, then only retry the dispatched report."""
+from bridge.app import _handle_cloud_sends
+
+
+class _FakeDpf:
+    def __init__(self, download_ok=True):
+        self.download_ok = download_ok
+        self.downloads = []
+        self.dispatched = []
+
+    def download_url(self, url, dest):
+        self.downloads.append((url, dest))
+        if self.download_ok:
+            with open(dest, "wb") as handle:
+                handle.write(b"3mf")
+        return self.download_ok
+
+    def report_dispatched(self, batch_id, bambu_id):
+        self.dispatched.append((batch_id, bambu_id))
+        return {"batch_id": batch_id}
+
+
+class _FakeFleet:
+    def __init__(self):
+        self.calls = []
+
+    def dispatch(self, bambu_id, dest, mapping, plate_index=1):
+        self.calls.append((bambu_id, dest, list(mapping), plate_index))
+        return True
+
+
+def _desired():
+    return [{
+        "bambu_id": "P1",
+        "desired_status": "IDLE",
+        "send": {
+            "batch_id": "B1",
+            "file_url": "https://example/signed.3mf",
+            "plate_index": 2,
+        },
+    }]
+
+
+def test_cloud_send_starts_once_then_only_re_reports(tmp_path):
+    fleet = _FakeFleet()
+    dpf = _FakeDpf()
+    started = set()
+    desired = _desired()
+
+    _handle_cloud_sends(desired, fleet, dpf, str(tmp_path), started)
+    _handle_cloud_sends(desired, fleet, dpf, str(tmp_path), started)
+
+    assert len(fleet.calls) == 1
+    assert fleet.calls[0][0] == "P1"
+    assert fleet.calls[0][3] == 2
+    assert dpf.dispatched == [("B1", "P1"), ("B1", "P1")]
+    assert started == {("B1", "P1")}
+
+    _handle_cloud_sends(
+        [{"bambu_id": "P1", "desired_status": "PRINTING"}],
+        fleet, dpf, str(tmp_path), started,
+    )
+    assert started == set()
+    assert len(fleet.calls) == 1
+
+
+def test_failed_download_does_not_start(tmp_path):
+    fleet = _FakeFleet()
+    dpf = _FakeDpf(download_ok=False)
+    started = set()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started)
+    assert fleet.calls == []
+    assert dpf.dispatched == []
+    assert started == set()
+    leftover = list(tmp_path.iterdir())
+    assert leftover == []
+
+
+def test_cloud_send_skips_dispatch_when_printer_not_idle(tmp_path):
+    fleet = _FakeFleet()
+    dpf = _FakeDpf()
+    started = set()
+    desired = _desired()
+    desired[0]["desired_status"] = "PRINTING"
+    _handle_cloud_sends(desired, fleet, dpf, str(tmp_path), started)
+    assert fleet.calls == []
+    assert started == set()
+    assert dpf.dispatched == []
+
+
+def test_restart_with_started_marker_only_re_reports(tmp_path):
+    fleet = _FakeFleet()
+    dpf = _FakeDpf()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set())
+    assert len(fleet.calls) == 1
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set())
+    assert len(fleet.calls) == 1
+    assert dpf.dispatched == [("B1", "P1"), ("B1", "P1")]
+
+
+class _FakeRouter:
+    def __init__(self):
+        self.assignments = []
+
+    def record_assignment(self, bambu_id, batch_id, plate_number=None):
+        self.assignments.append((bambu_id, batch_id, plate_number))
+
+
+def test_cloud_send_records_completion_assignment(tmp_path):
+    fleet = _FakeFleet()
+    dpf = _FakeDpf()
+    router = _FakeRouter()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set(), router=router)
+    assert router.assignments == [("P1", "B1", 2)]

@@ -303,17 +303,10 @@ class Dispatcher:
             return  # nothing to dispatch onto; leave the queue untouched
         # Normalize each idle printer's color set ONCE per pass — not once per queued job
         # inside _match, which repeats the same work N times over the same M printers.
-        idle_colors = {bid: self._color_set(snap) for bid, snap in idle.items()}
-        claimed: set = set()  # a printer takes at most one job per pass
-        for job in self._router.pending():
-            if job.status != QUEUED:
-                continue  # UNRESOLVED held for triage; DISPATCHED handled above
-            try:
-                self._try_dispatch(job, idle, idle_colors, claimed)
-            except Exception:
-                # One bad job must not stop the rest of the queue draining, nor kill the
-                # bridge loop. Log with a traceback and leave the job queued.
-                logger.exception("dispatch of job %s failed; leaving it queued", job.id)
+        # Local color-only auto-dispatch is off once the cloud Sliced Queue
+        # exists (KTD6). Drain only retries owed DISPATCHED reports and
+        # completion reports. Start is a cloud send command.
+        return
 
     def _try_dispatch(self, job: Job, idle: Dict[str, Dict],
                       idle_colors: Dict[str, set], claimed: set) -> None:

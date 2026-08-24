@@ -109,6 +109,45 @@ class DpfClient:
         return self._post("/api/bridge/printers/config/ack",
                           {"acks": acks, "removed": removed or []})
 
+    def enqueue_sliced_file(self, file_bytes: bytes, filename: str) -> Dict:
+        """Door B: park a sliced 3MF in the cloud Sliced Queue. Does not start a printer."""
+        url = self._base + "/api/bridge/sliced-queue/enqueue"
+        try:
+            resp = self._client.post(
+                url,
+                headers=self._headers,
+                files={"file": (filename, file_bytes, "application/octet-stream")},
+                timeout=600.0,
+            )
+            if resp.status_code >= 400:
+                logger.error("3DPF sliced-queue enqueue rejected: %s", resp.status_code)
+                return {}
+            return self._unwrap(resp.json())
+        except Exception as e:
+            logger.warning("3DPF sliced-queue enqueue failed: %s", type(e).__name__)
+            return {}
+
+    def enqueue_failed_stub(self, filename: str, reason: str) -> Dict:
+        return self._post(
+            "/api/bridge/sliced-queue/stub",
+            {"filename": filename, "reason": reason},
+        )
+
+    def download_url(self, url: str, dest_path: str) -> bool:
+        """Download Door A bytes (signed URL) into the local spool."""
+        if not url:
+            return False
+        try:
+            with self._client.stream("GET", url, timeout=600.0) as resp:
+                resp.raise_for_status()
+                with open(dest_path, "wb") as handle:
+                    for chunk in resp.iter_bytes(1024 * 256):
+                        handle.write(chunk)
+            return True
+        except Exception as e:
+            logger.warning("download of send file failed: %s", type(e).__name__)
+            return False
+
     def report_discovered(self, printers: List[Dict]) -> Dict:
         """Report the LAN printers the bridge currently sees, for the onboarding wizard (U11).
         `printers`: [{"bambu_id", "ip", "model", "name"}, ...] — no access code. Best-effort:

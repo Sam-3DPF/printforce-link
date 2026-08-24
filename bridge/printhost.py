@@ -176,11 +176,14 @@ class PrintHostService:
     """Transport-independent handling of the OctoPrint print-host requests."""
 
     def __init__(self, upload_key: str, spool_dir: str, router: Router,
-                 max_bytes: int = DEFAULT_MAX_BYTES):
+                 max_bytes: int = DEFAULT_MAX_BYTES, cloud_forward=None):
         self.upload_key = upload_key or ""
         self.spool_dir = spool_dir
         self.router = router
         self.max_bytes = max_bytes
+        # Optional Door B: (file_bytes, filename) -> cloud row or None.
+        # When it returns a row the local job is a spool pointer only.
+        self.cloud_forward = cloud_forward
         os.makedirs(self.spool_dir, exist_ok=True)
 
     def check_key(self, headers) -> bool:
@@ -231,11 +234,42 @@ class PrintHostService:
             f.write(file_bytes)
 
         correlation_key, status = resolve_correlation(file_bytes, safe_name)
+        # print=true means "park in 3DPF", never start the machine (A-2).
         print_flag = _truthy(form_fields.get("print", ""))
+
+        cloud_row = None
+        if self.cloud_forward is not None:
+            try:
+                cloud_row = self.cloud_forward(file_bytes, safe_name)
+            except Exception:
+                logger.exception("cloud enqueue of %s failed", safe_name)
+                cloud_row = None
+
+        if cloud_row:
+            # Cloud owns the queue row. Drop the local copy so the spool does
+            # not grow; start happens from a cloud send command.
+            try:
+                os.unlink(stored_path)
+            except OSError:
+                pass
+            return 201, {
+                "done": True,
+                "files": {
+                    "local": {
+                        "name": safe_name,
+                        "origin": "local",
+                        "refs": {"resource": f"/api/files/local/{safe_name}"},
+                    }
+                },
+                "queued_in_3dpf": True,
+                "item_id": cloud_row.get("id"),
+                "print": print_flag,
+            }
+
         job = self.router.enqueue(Job.new(
             stored_path=stored_path,
             correlation_key=correlation_key,
-            print_flag=print_flag,
+            print_flag=False,
             status=status,
         ))
 
@@ -252,6 +286,7 @@ class PrintHostService:
             # Non-OctoPrint extras, harmless to Orca, useful for the bridge's own logs.
             "job_id": job.id,
             "status": status,
+            "print": False,
         }
 
 

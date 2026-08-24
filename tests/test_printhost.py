@@ -24,13 +24,14 @@ UPLOAD_KEY = "UPLOADSECRETKEY123"
 BATCH_NAME = "batch-2026-02-20-JyBIcozw-{plate_num}.3mf"
 
 
-def _service(tmp_path):
+def _service(tmp_path, cloud_forward=None):
     router = Router(str(tmp_path / "queue.json"))
     return PrintHostService(
         upload_key=UPLOAD_KEY,
         spool_dir=str(tmp_path / "spool"),
         router=router,
         max_bytes=1024 * 1024,
+        cloud_forward=cloud_forward,
     )
 
 
@@ -133,13 +134,16 @@ def test_upload_falls_back_to_filename_when_no_metadata(tmp_path):
     assert job.status == QUEUED
 
 
-def test_upload_honors_print_flag(tmp_path):
+def test_upload_print_true_does_not_start_the_machine(tmp_path):
     svc = _service(tmp_path)
     headers, body = _multipart("batch-2026-02-20-JyBIcozw-1.3mf",
                                _threemf_with_plater_name(BATCH_NAME),
                                extra_fields={"print": "true"})
-    svc.handle_upload(headers, body)
-    assert svc.router.pending()[0].print_flag is True
+    status, payload = svc.handle_upload(headers, body)
+    assert status == 201
+    assert payload["print"] is False
+    # Orca Print parks the file. Local auto-start stays off (A-2).
+    assert svc.router.pending()[0].print_flag is False
 
 
 # --- security: auth + traversal + size --------------------------------------
@@ -286,3 +290,24 @@ def test_oversized_metadata_entry_skipped_falls_back_to_filename(tmp_path):
     # Fell back to the filename rather than OOMing on the bomb.
     assert job.correlation_key == "batch-2026-02-20-JyBIcozw-1.3mf"
     assert job.status == QUEUED
+
+
+def test_cloud_forward_success_does_not_enqueue_local_job(tmp_path):
+    forwarded = []
+
+    def _forward(file_bytes, filename):
+        forwarded.append((filename, file_bytes))
+        return {"id": "item-1"}
+
+    svc = _service(tmp_path, cloud_forward=_forward)
+    headers, body = _multipart(
+        "batch-2026-02-20-JyBIcozw-1.3mf",
+        _threemf_with_plater_name(BATCH_NAME),
+        extra_fields={"print": "true"},
+    )
+    status, payload = svc.handle_upload(headers, body)
+    assert status == 201
+    assert payload["queued_in_3dpf"] is True
+    assert payload["print"] is True
+    assert forwarded and forwarded[0][0] == "batch-2026-02-20-JyBIcozw-1.3mf"
+    assert svc.router.pending() == []
