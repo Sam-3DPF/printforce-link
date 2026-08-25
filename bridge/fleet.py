@@ -3,7 +3,7 @@ state report the bridge POSTs to 3DPF."""
 
 import logging
 import time
-from typing import List, Dict
+from typing import List, Dict, Optional
 
 from .config import PrinterConfig
 from .discover import DiscoveredPrinter, discover
@@ -61,15 +61,22 @@ class Fleet:
         live connection object (not just a snapshot) to FTPS-upload + MQTT-start."""
         return next((p for p in self._printers if p.bambu_id == bambu_id), None)
 
-    def dispatch(self, bambu_id: str, file_path: str, ams_mapping, plate_number: int = 1) -> bool:
+    def dispatch(self, bambu_id: str, file_path: str, ams_mapping, plate_number: int = 1,
+                 remote_name: Optional[str] = None) -> bool:
         """Upload + start `file_path` on the named printer. False if that printer isn't in
         the fleet; otherwise the printer's start result. Raises on a transport error so
-        the router re-queues rather than dropping the job."""
+        the router re-queues rather than dropping the job.
+
+        `remote_name` is what the printer shows as the current job. Omit it to use the
+        local basename (the cloud-send spool is `{batch_id}.3mf` and must not leak).
+        """
         printer = self.by_id(bambu_id)
         if printer is None:
             logger.error("dispatch requested for unknown printer %s", bambu_id)
             return False
-        return printer.upload_and_start(file_path, ams_mapping, plate_number)
+        return printer.upload_and_start(
+            file_path, ams_mapping, plate_number, remote_name=remote_name,
+        )
 
     def snapshot(self) -> List[Dict]:
         """One state report per printer — the bridge's wire contract with 3DPF:

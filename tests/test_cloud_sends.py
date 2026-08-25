@@ -24,8 +24,8 @@ class _FakeFleet:
     def __init__(self):
         self.calls = []
 
-    def dispatch(self, bambu_id, dest, mapping, plate_index=1):
-        self.calls.append((bambu_id, dest, list(mapping), plate_index))
+    def dispatch(self, bambu_id, dest, mapping, plate_index=1, remote_name=None):
+        self.calls.append((bambu_id, dest, list(mapping), plate_index, remote_name))
         return True
 
 
@@ -37,6 +37,9 @@ def _desired():
             "batch_id": "B1",
             "file_url": "https://example/signed.3mf",
             "plate_index": 2,
+            "filename": "batch-2026-08-25-2eK6CY5I-1.gcode.3mf",
+            "required_filament_hexes": ["#D3B7A7", "#F99963"],
+            "ams_mapping": [0, 2],
         },
     }]
 
@@ -52,7 +55,9 @@ def test_cloud_send_starts_once_then_only_re_reports(tmp_path):
 
     assert len(fleet.calls) == 1
     assert fleet.calls[0][0] == "P1"
+    assert fleet.calls[0][2] == [0, 2]
     assert fleet.calls[0][3] == 2
+    assert fleet.calls[0][4] == "batch-2026-08-25-2eK6CY5I-1.gcode.3mf"
     assert dpf.dispatched == [("B1", "P1"), ("B1", "P1")]
     assert started == {("B1", "P1")}
 
@@ -112,3 +117,37 @@ def test_cloud_send_records_completion_assignment(tmp_path):
     router = _FakeRouter()
     _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set(), router=router)
     assert router.assignments == [("P1", "B1", 2)]
+
+
+class _SnapPrinter:
+    def __init__(self, slots):
+        self._slots = slots
+
+    def snapshot(self):
+        return {"slots": self._slots}
+
+
+class _LiveFleet(_FakeFleet):
+    def by_id(self, bambu_id):
+        return _SnapPrinter([
+            {"slot_number": 1, "color_hex": "#D3B7A7"},
+            {"slot_number": 2, "color_hex": "#BB3D43"},
+            {"slot_number": 3, "color_hex": "#F99963"},
+            {"slot_number": 4, "color_hex": "#9B9EA0"},
+        ])
+
+
+def test_cloud_send_computes_ams_mapping_from_live_slots(tmp_path):
+    fleet = _LiveFleet()
+    desired = _desired()
+    desired[0]["send"]["ams_mapping"] = []
+    _handle_cloud_sends(desired, fleet, _FakeDpf(), str(tmp_path), set())
+    assert fleet.calls[0][2] == [0, 2]
+
+
+def test_cloud_send_refuses_color_file_without_ams_mapping(tmp_path):
+    fleet = _FakeFleet()
+    desired = _desired()
+    desired[0]["send"]["ams_mapping"] = []
+    _handle_cloud_sends(desired, fleet, _FakeDpf(), str(tmp_path), set())
+    assert fleet.calls == []
