@@ -181,6 +181,7 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "hms_severity": None,
         "hms_code": None,
         "hms_count": 0,
+        "print_error": None,
         "print_duration_seconds": None,
         "print_duration_source": None,
     }
@@ -203,6 +204,22 @@ def test_remaining_time_absent_or_nonsense_is_null_not_zero():
 def test_nozzle_diameter_string_is_coerced_to_a_number():
     assert parse_telemetry({"print": {"nozzle_diameter": "0.4"}})["nozzle_diameter"] == 0.4
     assert parse_telemetry({"print": {"nozzle_diameter": "junk"}})["nozzle_diameter"] is None
+
+
+def test_cancel_failed_snapshot_is_idle_not_error():
+    snapshot = _printer([{
+        "print": {"gcode_state": "FAILED", "print_error": 50348044},
+    }]).snapshot()
+    assert snapshot["status"] == "IDLE"
+    assert snapshot["print_error"] == "50348044"
+
+
+def test_real_failed_snapshot_stays_error():
+    snapshot = _printer([{
+        "print": {"gcode_state": "FAILED", "print_error": 12345},
+    }]).snapshot()
+    assert snapshot["status"] == "ERROR"
+    assert snapshot["print_error"] == "12345"
 
 
 def test_stage_says_why_a_print_paused():
@@ -378,12 +395,12 @@ def test_ams_delta_clears_a_tray_that_became_empty():
             {"id": "0", "tray": [
                 {"id": "0", "tray_color": "FF6A13FF", "tray_type": "PLA"},
                 {"id": "1", "tray_color": "00AE42FF", "tray_type": "PLA"},
-            ]}]}}},
+            ]}]}},
         {"print": {"gcode_state": "IDLE", "ams": {"ams": [
             {"id": "0", "tray": [
                 {"id": "0", "tray_color": "FF6A13FF", "tray_type": "PLA"},
                 {"id": "1"},                     # the spool was pulled out
-            ]}]}}},
+            ]}]}},
     ])
     printer.snapshot()
     assert printer.snapshot()["slots"] == [
