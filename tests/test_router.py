@@ -336,6 +336,41 @@ def test_printer_owing_a_completion_report_is_not_re_dispatched(tmp_path):
     assert r.assignments_snapshot()["P1"]["terminal"] == "complete"  # still owed
 
 
+def test_cancel_failed_print_error_does_not_report_failed(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    snap = _snap("P1", "ERROR", [(1, "FF6A13FF")])
+    snap["print_error"] = "50348044"
+    d.drain([snap])
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_cancel_failed_hms_does_not_report_failed(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    snap = _snap("P1", "ERROR", [(1, "FF6A13FF")])
+    snap["hms_code"] = "0300_400C_0000_0000"
+    d.drain([snap])
+    assert dpf.failed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_stop_then_later_finish_does_not_report_complete(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    d.drain(
+        [_snap("P1", "ERROR", [(1, "FF6A13FF")])],
+        desired=[{"bambu_id": "P1", "control": {"id": "c-stop", "action": "stop"}}],
+    )
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+    d.drain([_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])])
+    assert dpf.completed == []
+
+
 def test_desired_idle_with_no_queued_match_does_not_dispatch(tmp_path):
     r = Router(str(tmp_path / "queue.json"))  # empty queue
     dpf = _FakeDpf({})
