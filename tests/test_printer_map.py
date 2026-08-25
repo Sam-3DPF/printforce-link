@@ -1,4 +1,4 @@
-from bridge.printer import map_status
+from bridge.printer import is_cancel_failed, map_status
 
 
 def test_map_status_known_states():
@@ -29,3 +29,19 @@ def test_map_status_unknown_and_blank_default_to_offline_never_idle():
     assert map_status(None) == "OFFLINE"
     assert map_status("WEIRD_STATE") == "OFFLINE"
     assert map_status("UNKNOWN") == "OFFLINE"    # the library's own fallback member
+
+
+def test_map_status_cancel_failed_is_idle_not_error():
+    assert map_status("FAILED", print_error="50348044") == "IDLE"
+    assert map_status("FAILED", hms_code="0300_400C") == "IDLE"
+    assert map_status("FAILED", hms_code="0300_400C_0000_0000") == "IDLE"
+    assert map_status("FAILED", hms_code="0500_400E") == "IDLE"
+    assert map_status("FAILED", print_error="12345") == "ERROR"
+    assert map_status("FAILED") == "ERROR"
+    assert map_status("RUNNING", print_error="50348044") == "PRINTING"
+
+
+def test_is_cancel_failed_reads_print_error_and_hms():
+    assert is_cancel_failed(print_error="50348044")
+    assert is_cancel_failed(hms_code="0300_400C")
+    assert not is_cancel_failed(print_error="999")
