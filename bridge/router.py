@@ -25,8 +25,20 @@ from dataclasses import asdict, dataclass
 from typing import Dict, List, Optional, Tuple
 
 from .ams import normalize_hex
+from .printer import is_cancel_failed
 
 logger = logging.getLogger(__name__)
+
+
+def is_cancel_failed_snapshot(snap: Optional[Dict]) -> bool:
+    """True when a drain snapshot is a user-cancel, not a real fail."""
+    if not isinstance(snap, dict):
+        return False
+    return is_cancel_failed(
+        print_error=snap.get("print_error"),
+        hms_code=snap.get("hms_code"),
+        hms=snap.get("hms"),
+    )
 
 # A job we could derive a batch key for and can hand to routing (U9).
 QUEUED = "queued"
@@ -273,7 +285,7 @@ class Dispatcher:
 
         # Then detect finished/failed prints and report them (U11) — also independent of
         # idle printers, and durable: a latched completion is retried until 3DPF acks.
-        self._report_completions(snapshots)
+        self._report_completions(snapshots, desired or [])
 
         # Printers the operator has marked cleared (U13): 3DPF returns desired_status IDLE
         # for a finished printer whose plate was cleared. Its gcode_state is still FINISH
@@ -304,8 +316,8 @@ class Dispatcher:
         # Normalize each idle printer's color set ONCE per pass — not once per queued job
         # inside _match, which repeats the same work N times over the same M printers.
         # Local color-only auto-dispatch is off once the cloud Sliced Queue
-        # exists (KTD6). Drain only retries owed DISPATCHED reports and
-        # completion reports. Start is a cloud send command.
+        # exists (don't auto-start from the local queue). Drain only retries owed
+        # DISPATCHED reports and completion reports. Start is a cloud send command.
         return
 
     def _try_dispatch(self, job: Job, idle: Dict[str, Dict],
@@ -344,11 +356,25 @@ class Dispatcher:
         logger.info("dispatched job %s -> printer %s (batch %s)", job.id, bambu_id, batch_id)
         self._send_report(job.id, batch_id, bambu_id)
 
-    def _report_completions(self, snapshots: List[Dict]) -> None:
+    def _report_completions(self, snapshots: List[Dict],
+                            desired: Optional[List[Dict]] = None) -> None:
         """Edge-detect each assigned printer finishing/failing from THIS pass's fresh
         snapshot, then report it (retrying until acked). A finished print maps to
         NEEDS_CLEARING and a failed one to ERROR (printer.py's status map); anything else
-        (still PRINTING, OFFLINE) is not yet terminal and waits."""
+        (still PRINTING, OFFLINE) is not yet terminal and waits.
+
+        A user-cancel or a live stop is not a fail and not a finish. Drop the
+        assignment so a later wire FINISH cannot report_complete a send that
+        return-to-queue already released.
+        """
+        stop_serials = {
+            row.get("bambu_id")
+            for row in (desired or [])
+            if isinstance(row, dict)
+            and isinstance(row.get("control"), dict)
+            and row["control"].get("action") == "stop"
+            and row.get("bambu_id")
+        }
         snap_by_id = {
             s.get("bambu_id"): s
             for s in snapshots
@@ -356,14 +382,25 @@ class Dispatcher:
         }
         for bambu_id, assignment in self._router.assignments_snapshot().items():
             try:
-                self._detect_and_report_completion(bambu_id, assignment, snap_by_id.get(bambu_id))
+                self._detect_and_report_completion(
+                    bambu_id, assignment, snap_by_id.get(bambu_id),
+                    stop_in_flight=bambu_id in stop_serials,
+                )
             except Exception:
                 logger.exception("completion handling for printer %s failed; will retry", bambu_id)
 
     def _detect_and_report_completion(self, bambu_id: str, assignment: Dict,
-                                      snap: Optional[Dict]) -> None:
+                                      snap: Optional[Dict],
+                                      stop_in_flight: bool = False) -> None:
         terminal = assignment.get("terminal")
         if terminal is None:
+            if stop_in_flight or is_cancel_failed_snapshot(snap):
+                self._router.clear_assignment(bambu_id)
+                logger.info(
+                    "printer %s: stop or cancel-failed; not reporting failed or complete",
+                    bambu_id,
+                )
+                return
             status = snap.get("status") if isinstance(snap, dict) else None
             if status == "NEEDS_CLEARING":
                 terminal = "complete"
