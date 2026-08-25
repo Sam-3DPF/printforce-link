@@ -316,8 +316,8 @@ class Dispatcher:
         # Normalize each idle printer's color set ONCE per pass — not once per queued job
         # inside _match, which repeats the same work N times over the same M printers.
         # Local color-only auto-dispatch is off once the cloud Sliced Queue
-        # exists (don't auto-start from the local queue). Drain only retries owed
-        # DISPATCHED reports and completion reports. Start is a cloud send command.
+        # exists (KTD6). Drain only retries owed DISPATCHED reports and
+        # completion reports. Start is a cloud send command.
         return
 
     def _try_dispatch(self, job: Job, idle: Dict[str, Dict],
