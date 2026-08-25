@@ -23,6 +23,31 @@ main() {
   warn() { printf '\033[1;33m!\033[0m %s\n' "$*"; }
   die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
+  # A running job must be stopped before we replace its binary. Doing it the
+  # other way around leaves launchd holding a dead job, and the next
+  # `bootstrap` fails with "Bootstrap failed: 5: Input/output error".
+  stop_agent() {
+    launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+    if [ -f "$PLIST" ]; then
+      launchctl unload "$PLIST" 2>/dev/null || true
+    fi
+    sleep 1
+  }
+
+  # Prefer bootstrap for a fresh job. On reinstall launchd often still has the
+  # label registered (error 5) — restart in place, then fall back to `load`.
+  start_agent() {
+    launchctl enable "gui/$(id -u)/${LABEL}" 2>/dev/null || true
+    if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then
+      return 0
+    fi
+    if launchctl kickstart -k "gui/$(id -u)/${LABEL}" 2>/dev/null; then
+      return 0
+    fi
+    launchctl load "$PLIST" 2>/dev/null && return 0
+    die "Could not start the agent. Do not run this as root. Paste this in Terminal and send us what it prints: launchctl print gui/$(id -u)/${LABEL}"
+  }
+
   [ "$(uname -s)" = "Darwin" ] || die "This installer is for macOS. On Windows, use the PowerShell command instead."
   command -v curl   >/dev/null || die "curl is required (it ships with macOS)."
   command -v tar    >/dev/null || die "tar is required (it ships with macOS)."
@@ -49,6 +74,7 @@ main() {
     || die "The download didn't verify. Please run the command again."
 
   say "Installing..."
+  stop_agent
   mkdir -p "$ROOT"
   rm -rf "$ROOT/printforce-link"
   tar -xzf "$tmp/$asset" -C "$ROOT"                # -> $ROOT/printforce-link/
@@ -83,8 +109,7 @@ main() {
 PLIST
   chmod 600 "$PLIST"                               # the pair code (one-time, then inert) lives here
 
-  launchctl bootout   "gui/$(id -u)/${LABEL}" 2>/dev/null || true
-  launchctl bootstrap "gui/$(id -u)" "$PLIST"      || die "Could not start the agent. Try again, or see the troubleshooting steps in 3D Print Force."
+  start_agent
 
   say "Done! PrintForce Link is installed and connecting."
   say "Go back to 3D Print Force — the PrintForce Link card turns green, then you can add your printers."
