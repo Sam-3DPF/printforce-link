@@ -267,6 +267,14 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             continue
         if str(row.get("desired_status") or "IDLE") != "IDLE":
             continue
+        required = _required_filament_hexes(send)
+        ams_mapping = _resolve_cloud_ams_mapping(send, fleet, bambu_id)
+        if required and not ams_mapping:
+            logger.warning(
+                "cloud send %s: no AMS mapping for %s; not starting",
+                batch_id, required,
+            )
+            continue
         if not os.path.exists(dest):
             tmp = dest + ".part"
             try:
@@ -285,7 +293,10 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     pass
                 logger.warning("could not download send file for batch %s", batch_id)
                 continue
-        started = fleet.dispatch(bambu_id, dest, [], plate_index)
+        started = fleet.dispatch(
+            bambu_id, dest, ams_mapping, plate_index,
+            remote_name=_cloud_remote_name(send),
+        )
         if started:
             started_sends.add(key)
             try:
@@ -307,6 +318,64 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 os.unlink(leftover)
             except OSError:
                 pass
+
+
+def _required_filament_hexes(send: dict) -> list:
+    raw = send.get("required_filament_hexes") or []
+    if not isinstance(raw, list):
+        return []
+    return [hex_color for hex_color in raw if isinstance(hex_color, str) and hex_color]
+
+
+def _cloud_remote_name(send: dict):
+    raw = send.get("filename")
+    if not isinstance(raw, str):
+        return None
+    from .printhost import sanitize_upload_filename
+    return sanitize_upload_filename(raw)
+
+
+def _int_trays(value):
+    if not isinstance(value, list) or not value:
+        return None
+    trays = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+            return None
+        trays.append(item)
+    return trays
+
+
+def _live_snapshot(fleet, bambu_id: str):
+    by_id = getattr(fleet, "by_id", None)
+    if not callable(by_id):
+        return None
+    printer = by_id(bambu_id)
+    if printer is None or not hasattr(printer, "snapshot"):
+        return None
+    try:
+        snap = printer.snapshot()
+    except Exception:
+        return None
+    return snap if isinstance(snap, dict) else None
+
+
+def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> list:
+    """Live AMS first (same rule as local dispatch), then the cloud payload.
+
+    An empty mapping for a color-tagged file is HMS 0700_7000_0002_0008 — the
+    caller must refuse to start rather than send `use_ams=True` with `[]`.
+    """
+    required = _required_filament_hexes(send)
+    live = _live_snapshot(fleet, bambu_id)
+    if required and live is not None:
+        computed = Dispatcher._ams_mapping(required, live)
+        if len(computed) == len(required):
+            return computed
+    provided = _int_trays(send.get("ams_mapping"))
+    if provided is not None and (not required or len(provided) == len(required)):
+        return provided
+    return []
 
 
 if __name__ == "__main__":
