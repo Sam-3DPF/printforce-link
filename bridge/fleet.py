@@ -78,13 +78,35 @@ class Fleet:
             file_path, ams_mapping, plate_number, remote_name=remote_name,
         )
 
+    def upload(self, bambu_id: str, file_path: str,
+               remote_name: Optional[str] = None) -> Optional[str]:
+        """FTPS-upload only. None if that printer is not in the fleet."""
+        printer = self.by_id(bambu_id)
+        if printer is None:
+            logger.error("upload requested for unknown printer %s", bambu_id)
+            return None
+        return printer.upload_file(file_path, remote_name=remote_name)
+
+    def start_print(self, bambu_id: str, remote_name: str, ams_mapping,
+                    plate_number: int = 1) -> bool:
+        """MQTT-start a file already on the printer."""
+        printer = self.by_id(bambu_id)
+        if printer is None:
+            logger.error("start_print requested for unknown printer %s", bambu_id)
+            return False
+        return printer.start_print(remote_name, ams_mapping, plate_number)
+
     def snapshot(self) -> List[Dict]:
         """One state report per printer — the bridge's wire contract with 3DPF:
 
             [{
                 "bambu_id": str,
                 "status": IDLE | PRINTING | PAUSED | NEEDS_CLEARING | ERROR | OFFLINE,
-                "slots": [{slot_number, color_hex, filament_type}],  # empty slots too
+                # Empty slots included. **None means "no AMS information"** — the
+                # printer has reported no unit list yet — and is NOT the same claim as
+                # [], which says the AMS is empty and makes the cloud delete the slot
+                # rows. See `ams.parse_ams`.
+                "slots": [{slot_number, color_hex, filament_type}] | None,
 
                 # telemetry, FLAT on the report (this is what the cloud's
                 # ingest_printer_state reads — not a nested object):
@@ -92,7 +114,7 @@ class Fleet:
                 "nozzle_temper", "nozzle_target_temper", "bed_temper",
                 "bed_target_temper", "chamber_temper", "gcode_file", "subtask_name",
                 "nozzle_diameter", "stage", "tray_exist_bits",
-                "hms_severity", "hms_code", "hms_count",
+                "hms_severity", "hms_code", "hms_count", "print_error",
 
                 "print_duration_seconds": int | None,
                 "print_duration_source": "bridge" | "printer" | None,
