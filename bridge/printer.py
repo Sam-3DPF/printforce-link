@@ -105,3 +105,100 @@ def is_cancel_failed(print_error=None, hms_code=None, hms=None) -> bool:
         if normalized in _CANCEL_HMS_CODES or any(code in normalized for code in _CANCEL_HMS_CODES):
             return True
     return False
+
+
+def map_status(gcode_state: Optional[str], *, print_error=None,
+               hms_code=None, hms=None) -> str:
+    """Map a Bambu gcode_state to a 3DPF printer status.
+
+    Unknown and blank states map to **OFFLINE, never IDLE**. IDLE is the sole
+    authorization for dispatch, so it has to be positively asserted by the printer: a
+    fail-open default would dispatch a job onto a busy printer, deduct its filament,
+    and stamp the batch PRINTING for a print that never starts. The window is real,
+    not theoretical — `mqtt_dump()` returns {} until the first MQTT push lands, so on
+    every bridge start there is an interval in which each printer, *including one
+    mid-print*, has no gcode_state at all.
+
+    A cancel-failed print (`50348044` / HMS `0300_400C`) maps to IDLE, not ERROR,
+    so the next Start is not blocked. FAILED without a cancel code stays ERROR.
+    Only remap ERROR — a leftover cancel code on RUNNING must not hide a live print.
+    """
+    mapped = _STATE_MAP.get((gcode_state or "").strip().upper(), "OFFLINE")
+    if mapped == "ERROR" and is_cancel_failed(
+        print_error=print_error, hms_code=hms_code, hms=hms,
+    ):
+        return "IDLE"
+    return mapped
+
+
+def decode_hms(hms) -> Dict:
+    """Reduce Bambu's `hms` array to the worst active alarm plus a count.
+
+    Each entry is {"attr": int, "code": int}; severity is `code >> 16` (1 fatal,
+    2 serious, 3 common, 4 info). The detail page needs to know *is something wrong,
+    how bad, and how many* — not the whole array — so that is all we report.
+
+    `hms_code` is the 4-group hex code Bambu publishes its error index under (the two
+    halves of `attr`, then the two halves of `code`), so the UI can name the fault.
+    """
+    alarms = []
+    for entry in hms or []:
+        if not isinstance(entry, dict):
+            continue
+        attr = as_int(entry.get("attr"), None)
+        code = as_int(entry.get("code"), None)
+        if attr is None or code is None:
+            continue
+        alarms.append((code >> 16, attr, code))
+
+    if not alarms:
+        return {"hms_severity": None, "hms_code": None, "hms_count": 0}
+
+    # Rank by the severity NUMBER (lower is worse), not by its name. `severity` is the
+    # top 16 bits of an arbitrary int, so a value outside 1-4 is entirely possible and
+    # must sort last rather than crash the poll.
+    severity, attr, code = min(
+        alarms, key=lambda a: a[0] if a[0] in _HMS_SEVERITY else _HMS_UNKNOWN_RANK)
+    return {
+        "hms_severity": _HMS_SEVERITY.get(severity, "UNKNOWN"),
+        "hms_code": (f"{(attr >> 16) & 0xFFFF:04X}_{attr & 0xFFFF:04X}_"
+                     f"{(code >> 16) & 0xFFFF:04X}_{code & 0xFFFF:04X}"),
+        "hms_count": len(alarms),
+    }
+
+
+def parse_telemetry(status: dict) -> Dict:
+    """Extract the live telemetry the printer already reports.
+
+    Every field is optional. Feed this the *merged* payload (see
+    `merge_status_payload`), never a raw one: Bambu reports are partial deltas, so any
+    key can be missing from any single push.
+    """
+    print_obj = (status or {}).get("print") if isinstance(status, dict) else None
+    if not isinstance(print_obj, dict):
+        print_obj = {}
+
+    telemetry = {
+        "progress_percent": as_int(print_obj.get("mc_percent"), None),
+        "layer_num": as_int(print_obj.get("layer_num"), None),
+        "total_layer_num": as_int(print_obj.get("total_layer_num"), None),
+        "remaining_seconds": _minutes_to_seconds(print_obj.get("mc_remaining_time")),
+        "nozzle_temper": as_float(print_obj.get("nozzle_temper"), None),
+        "nozzle_target_temper": as_float(print_obj.get("nozzle_target_temper"), None),
+        "bed_temper": as_float(print_obj.get("bed_temper"), None),
+        "bed_target_temper": as_float(print_obj.get("bed_target_temper"), None),
+        "chamber_temper": as_float(print_obj.get("chamber_temper"), None),
+        "gcode_file": clean_str(print_obj.get("gcode_file")),
+        "subtask_name": clean_str(print_obj.get("subtask_name")),  # the human-friendly job name
+        "nozzle_diameter": as_float(print_obj.get("nozzle_diameter"), None),
+        # The print stage. It is the only field that says *why* a print paused
+        # (6 = filament runout, 16 = user, 35 = nozzle clog) — gcode_state only ever
+        # says PAUSE. Bambu's "no stage" sentinel is -1, normalised to None here.
+        "stage": _valid_stage(print_obj.get("stg_cur")),
+        "tray_exist_bits": parse_tray_exist_bits(status),
+        # print.print_error is 0 when nothing is wrong. Persist the non-zero code so
+        # ingest can tell a user-cancel (50348044) from a real fail.
+        "print_error": _print_error_str(print_obj.get("print_error")),
+    }
+    telemetry.update(decode_hms(print_obj.get("hms")))
+    return telemetry
