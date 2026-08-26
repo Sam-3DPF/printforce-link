@@ -1,5 +1,6 @@
 """One-shot pause / resume / stop on desired-state (U3)."""
 from bridge.app import _handle_desired
+from bridge.fleet import Fleet
 from bridge.printer import BambuPrinter
 from bridge.config import PrinterConfig
 
@@ -100,6 +101,28 @@ def test_unknown_desired_keys_do_not_crash(tmp_path):
         _ControlFleet(printer), set(), str(tmp_path),
     )
     assert printer.calls == ["pause_print"]
+
+
+def test_false_control_result_is_retried_without_applied_state(tmp_path):
+    class _FalsePrinter(_FakePrinter):
+        def pause_print(self):
+            self.calls.append("pause_print")
+            return False
+
+    printer = _FalsePrinter()
+    cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
+    fleet = Fleet(
+        [cfg],
+        printer_factory=lambda _cfg, stale_after_seconds=None: printer,
+        discover_fn=lambda _timeout: [],
+    )
+    applied = set()
+
+    _handle_desired(_desired("pause"), fleet, applied, str(tmp_path))
+
+    assert printer.calls == ["pause_print"]
+    assert applied == set()
+    assert not (tmp_path / "control-c1.applied").exists()
 
 
 def test_resume_from_stage_on_real_printer_wrapper():
