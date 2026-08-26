@@ -226,10 +226,15 @@ def _row_has_stop(row: dict) -> bool:
     return control is not None and control["action"] == "stop"
 
 
-def _desired_has_stop(desired: List[Dict], bambu_id: str) -> bool:
+def _desired_allows_send(desired: List[Dict], bambu_id: str, batch_id: str) -> bool:
+    """True only when a fresh desired-state still authorizes this exact send."""
     for row in desired:
-        if isinstance(row, dict) and str(row.get("bambu_id") or "") == str(bambu_id):
-            return _row_has_stop(row)
+        if not isinstance(row, dict) or str(row.get("bambu_id") or "") != str(bambu_id):
+            continue
+        if _row_has_stop(row):
+            return False
+        send = row.get("send")
+        return isinstance(send, dict) and str(send.get("batch_id") or "") == str(batch_id)
     return False
 
 
@@ -368,9 +373,12 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             uploaded = fleet.upload(bambu_id, dest, remote_name=remote_name)
             latest = dpf.heartbeat() if hasattr(dpf, "heartbeat") else {}
             latest_rows = latest.get("printers") if isinstance(latest, dict) else None
-            if _desired_has_stop(latest_rows or [], bambu_id):
-                logger.info("stop issued after upload; skipping start_print for %s",
-                            batch_id)
+            if not _desired_allows_send(latest_rows or [], bambu_id, batch_id):
+                logger.warning(
+                    "cloud send %s: fresh desired-state no longer authorizes start; "
+                    "leaving the uploaded file idle",
+                    batch_id,
+                )
                 continue
             started = fleet.start_print(
                 bambu_id, uploaded or remote_name or os.path.basename(dest),

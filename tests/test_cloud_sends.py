@@ -20,7 +20,7 @@ class _FakeDpf:
         return {"batch_id": batch_id}
 
     def heartbeat(self):
-        return {"printers": []}
+        return {"printers": _desired()}
 
 
 class _FakeFleet:
@@ -191,6 +191,21 @@ class _StopAfterUploadDpf(_FakeDpf):
 def test_cloud_send_skips_start_when_stop_arrives_after_upload(tmp_path):
     fleet = _FakeFleet()
     _handle_cloud_sends(_desired(), fleet, _StopAfterUploadDpf(), str(tmp_path), set())
+    assert len(fleet.uploads) == 1
+    assert fleet.starts == []
+    assert fleet.calls == []
+
+
+class _MissingDesiredAfterUploadDpf(_FakeDpf):
+    def heartbeat(self):
+        return {}
+
+
+def test_cloud_send_fails_closed_when_desired_refresh_fails_after_upload(tmp_path):
+    fleet = _FakeFleet()
+    _handle_cloud_sends(
+        _desired(), fleet, _MissingDesiredAfterUploadDpf(), str(tmp_path), set(),
+    )
     assert len(fleet.uploads) == 1
     assert fleet.starts == []
     assert fleet.calls == []

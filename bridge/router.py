@@ -394,14 +394,20 @@ class Dispatcher:
                                       stop_in_flight: bool = False) -> None:
         terminal = assignment.get("terminal")
         if terminal is None:
-            if stop_in_flight or is_cancel_failed_snapshot(snap):
+            status = snap.get("status") if isinstance(snap, dict) else None
+            # Cancel codes can linger in Bambu's merged MQTT payload after a new
+            # print starts. They are terminal evidence only while the normalized
+            # snapshot is IDLE/ERROR; never drop a live PRINTING assignment.
+            cancel_terminal = (
+                status in ("IDLE", "ERROR") and is_cancel_failed_snapshot(snap)
+            )
+            if stop_in_flight or cancel_terminal:
                 self._router.clear_assignment(bambu_id)
                 logger.info(
                     "printer %s: stop or cancel-failed; not reporting failed or complete",
                     bambu_id,
                 )
                 return
-            status = snap.get("status") if isinstance(snap, dict) else None
             if status == "NEEDS_CLEARING":
                 terminal = "complete"
             elif status == "ERROR":

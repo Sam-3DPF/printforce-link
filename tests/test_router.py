@@ -98,8 +98,8 @@ class _FakeFleet:
         self._raises = raises
         self.calls = []                      # (bambu_id, file_path, ams_mapping, plate)
 
-    def dispatch(self, bambu_id, file_path, ams_mapping, plate_number=1):
-        self.calls.append((bambu_id, file_path, list(ams_mapping), plate_number))
+    def dispatch(self, bambu_id, file_path, ams_mapping, plate_number=1, remote_name=None):
+        self.calls.append((bambu_id, file_path, list(ams_mapping), plate_number, remote_name))
         if self._raises:
             raise RuntimeError("ftps boom")
         return self._result
@@ -355,6 +355,28 @@ def test_cancel_failed_hms_does_not_report_failed(tmp_path):
     d.drain([snap])
     assert dpf.failed == []
     assert "P1" not in r.assignments_snapshot()
+
+
+def test_cancel_failed_idle_snapshot_clears_assignment_without_failure(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    snap = _snap("P1", "IDLE", [(1, "FF6A13FF")])
+    snap["print_error"] = "50348044"
+    d.drain([snap])
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_sticky_cancel_code_does_not_clear_live_printing_assignment(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    snap = _snap("P1", "PRINTING", [(1, "FF6A13FF")])
+    snap["print_error"] = "50348044"
+    d.drain([snap])
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" in r.assignments_snapshot()
 
 
 def test_stop_then_later_finish_does_not_report_complete(tmp_path):
