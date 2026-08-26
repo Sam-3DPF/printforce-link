@@ -181,6 +181,7 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "hms_severity": None,
         "hms_code": None,
         "hms_count": 0,
+        "print_error": None,
         "print_duration_seconds": None,
         "print_duration_source": None,
     }
@@ -203,6 +204,22 @@ def test_remaining_time_absent_or_nonsense_is_null_not_zero():
 def test_nozzle_diameter_string_is_coerced_to_a_number():
     assert parse_telemetry({"print": {"nozzle_diameter": "0.4"}})["nozzle_diameter"] == 0.4
     assert parse_telemetry({"print": {"nozzle_diameter": "junk"}})["nozzle_diameter"] is None
+
+
+def test_cancel_failed_snapshot_is_idle_not_error():
+    snapshot = _printer([{
+        "print": {"gcode_state": "FAILED", "print_error": 50348044},
+    }]).snapshot()
+    assert snapshot["status"] == "IDLE"
+    assert snapshot["print_error"] == "50348044"
+
+
+def test_real_failed_snapshot_stays_error():
+    snapshot = _printer([{
+        "print": {"gcode_state": "FAILED", "print_error": 12345},
+    }]).snapshot()
+    assert snapshot["status"] == "ERROR"
+    assert snapshot["print_error"] == "12345"
 
 
 def test_stage_says_why_a_print_paused():
@@ -367,6 +384,35 @@ def test_delta_without_an_ams_key_keeps_the_last_known_trays():
     assert printer.snapshot()["slots"] == [
         {"slot_number": 1, "color_hex": "FF6A13FF", "filament_type": "PLA"},
     ]
+
+
+def test_a_printer_that_has_never_reported_ams_says_none_not_no_trays():
+    """**The slot-wipe regression.** The sibling test above covers a printer whose `ams`
+    was seen once and then omitted from a delta — the merge keeps it. This is the window
+    BEFORE that: connected, already RUNNING, and the first full push (the only one
+    carrying `ams`) has not landed. Bambu sends one full status then deltas, and
+    `mqtt_dump()` accumulates only one level deep, so this state is routine, not exotic.
+
+    Reporting `slots: []` here told the cloud the AMS was empty, and because the printer
+    is PRINTING rather than OFFLINE it walked straight past the OFFLINE-only guard in
+    `_reconcile_slots` and DELETED every slot row. Four of the dev farm's seven AMS
+    printers were sitting at zero slots from exactly this — no colors in the fleet view,
+    and unroutable, since dispatch matches a batch's colors against what a printer
+    reports holding.
+    """
+    printer = _printer([{"print": {"gcode_state": "RUNNING", "nozzle_temper": 220.0}}])
+    snapshot = printer.snapshot()
+
+    assert snapshot["status"] == "PRINTING"      # live, so the OFFLINE guard cannot help
+    assert snapshot["slots"] is None             # "no information", NOT "no trays"
+
+
+def test_a_printer_reporting_zero_ams_units_still_says_no_trays():
+    """The other side of the same coin: an unplugged AMS is a real, authoritative report
+    that there are no trays, and it must still reconcile the stale rows away. None must
+    not swallow this case — see `_reconcile_slots`'s staleness argument."""
+    printer = _printer([{"print": {"gcode_state": "RUNNING", "ams": {"ams": []}}}])
+    assert printer.snapshot()["slots"] == []
 
 
 def test_ams_delta_clears_a_tray_that_became_empty():

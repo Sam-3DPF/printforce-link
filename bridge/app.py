@@ -12,22 +12,16 @@ import threading
 import time
 from typing import List, Dict, Optional
 
-from . import __version__
 from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
 from .fleet import Fleet
-from .pairing import ensure_paired, repair
+from .pairing import ensure_paired
 from .reconciler import ConfigReconciler
 from .router import Dispatcher, Router
 from .store import PrinterStore
-from .updater import SelfUpdater
 
 logger = logging.getLogger(__name__)
-
-# When the cloud rejects our credential, don't hammer the pair/exchange endpoint every
-# loop — attempt a re-pair at most this often.
-_REPAIR_RETRY_SECONDS = 60.0
 
 
 def _store_path_for(config_path: str) -> str:
@@ -106,7 +100,7 @@ def main(config_path: str = "config.toml") -> None:
     if not cloud_token:
         logger.error(
             "no cloud credential: config.toml has none and pairing did not complete. "
-            "Re-issue a pair token in 3DPF (Integrations -> PrintForce Link) and re-run the "
+            "Re-issue a pair token in 3DPF (Integrations -> Bambu Bridge) and re-run the "
             "install command, or set cloud_token in config.toml.")
         return
 
@@ -119,9 +113,8 @@ def main(config_path: str = "config.toml") -> None:
     dpf = DpfClient(cfg.dpf_base_url, cloud_token)
     reconciler = ConfigReconciler(dpf, fleet, store)
     discovery_reporter = DiscoveryReporter(dpf)
-    updater = SelfUpdater(__version__)
-    logger.info("PrintForce Link %s — %d printer(s) at startup (%d from config.toml, %d from the store)",
-                __version__, len(printer_configs), len(cfg.printers), len(store.configs()))
+    logger.info("%d printer(s) at startup (%d from config.toml, %d from the local store)",
+                len(printer_configs), len(cfg.printers), len(store.configs()))
 
     # Print-host accepts OrcaSlicer uploads and forwards them into the cloud
     # Sliced Queue. Local auto-dispatch is off; start is a cloud send command.
@@ -133,8 +126,8 @@ def main(config_path: str = "config.toml") -> None:
                     len(router.pending()))
 
     last_heartbeat = 0.0
-    last_repair_attempt: Optional[float] = None   # throttles re-pairing on a revoked token
     started_sends = set()
+    applied_controls = set()
     spool_dir = cfg.printhost.spool_dir if cfg.printhost else "/tmp/printforce-spool"
     os.makedirs(spool_dir, exist_ok=True)
     logger.info("Reporting every %ss; heartbeat every %ss; a printer that says nothing "
@@ -145,36 +138,15 @@ def main(config_path: str = "config.toml") -> None:
         try:
             reports = fleet.snapshot()
             response = dpf.report_state(reports)
-
-            # If the cloud rejected our credential (the operator hit Disconnect, revoking
-            # it, then re-ran the installer with a fresh pair token), re-pair with that
-            # token instead of knocking forever with the dead key — the difference between
-            # a card that reconnects itself and one stuck on "Not set up". Only in pairing
-            # mode (a hand-authored config.toml token is the operator's to fix), and
-            # throttled so a spent/expired token can't spam the exchange endpoint.
-            if dpf.unauthorized and not cfg.cloud_token and pair_token:
-                now = time.monotonic()
-                if last_repair_attempt is None or now - last_repair_attempt >= _REPAIR_RETRY_SECONDS:
-                    last_repair_attempt = now
-                    new_token = repair(store, cfg.dpf_base_url, pair_token)
-                    if new_token:
-                        dpf.set_token(new_token)
-                        logger.info("re-paired after a rejected credential; resuming")
-                    else:
-                        logger.error(
-                            "credential rejected and re-pairing did not complete — the pair "
-                            "code may be expired or already used. In 3DPF, click Disconnect, "
-                            "then Get install command, and re-run the install command.")
-
             desired = response.get("printers") if isinstance(response, dict) else None
             # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
             # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
             # the bridge scans once at startup, then goes quiet, then reopens exactly one
             # bounded burst per request instead of scanning forever.
             scan_requested = bool(response.get("scan_requested")) if isinstance(response, dict) else False
-            _handle_desired(desired or [])
-            _handle_cloud_sends(
-                desired or [], fleet, dpf, spool_dir, started_sends, router=router,
+            _apply_desired(
+                desired or [], fleet, dpf, spool_dir, started_sends, applied_controls,
+                router=router,
             )
 
             # Drain queued uploads onto idle, color-matched printers, matching on THIS
@@ -207,13 +179,16 @@ def main(config_path: str = "config.toml") -> None:
             # when something is actually offline, so a healthy farm pays nothing.
             fleet.reconcile_connections()
 
-            # Keep the agent current from GitHub Releases (U9). Throttled; a packaged build
-            # swaps itself in and restarts, a source checkout is a no-op.
-            updater.tick()
-
             now = time.monotonic()
             if now - last_heartbeat >= cfg.heartbeat_interval_seconds:
-                dpf.heartbeat()
+                heartbeat = dpf.heartbeat()
+                heartbeat_desired = (
+                    heartbeat.get("printers") if isinstance(heartbeat, dict) else None
+                )
+                _apply_desired(
+                    heartbeat_desired or [], fleet, dpf, spool_dir, started_sends,
+                    applied_controls, router=router,
+                )
                 last_heartbeat = now
         except Exception:
             # Never let one bad iteration kill the long-running reporter — nothing
@@ -223,10 +198,106 @@ def main(config_path: str = "config.toml") -> None:
         time.sleep(cfg.state_interval_seconds)
 
 
-def _handle_desired(desired: List[Dict]) -> None:
-    """Act on the authoritative desired-state 3DPF returns."""
-    for d in desired:
-        logger.debug("desired-state: %s -> %s", d.get("bambu_id"), d.get("desired_status"))
+_CONTROL_ACTIONS = frozenset({"pause", "resume", "stop"})
+
+
+def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
+                   started_sends, applied_controls, router=None) -> None:
+    """Apply control then cloud sends from one desired-state payload."""
+    _handle_desired(desired, fleet, applied_controls, spool_dir, router=router)
+    _handle_cloud_sends(
+        desired, fleet, dpf, spool_dir, started_sends, router=router,
+    )
+
+
+def _control_from_row(row: dict):
+    control = row.get("control")
+    if not isinstance(control, dict):
+        return None
+    action = control.get("action")
+    control_id = control.get("id")
+    if action not in _CONTROL_ACTIONS or not control_id:
+        return None
+    return {"id": str(control_id), "action": action}
+
+
+def _row_has_stop(row: dict) -> bool:
+    control = _control_from_row(row)
+    return control is not None and control["action"] == "stop"
+
+
+def _desired_allows_send(desired: List[Dict], bambu_id: str, batch_id: str) -> bool:
+    """True only when a fresh desired-state still authorizes this exact send."""
+    for row in desired:
+        if not isinstance(row, dict) or str(row.get("bambu_id") or "") != str(bambu_id):
+            continue
+        if _row_has_stop(row):
+            return False
+        send = row.get("send")
+        return isinstance(send, dict) and str(send.get("batch_id") or "") == str(batch_id)
+    return False
+
+
+def _handle_desired(desired: List[Dict], fleet=None, applied_controls=None,
+                    spool_dir: Optional[str] = None, router=None) -> None:
+    """Act on the authoritative desired-state 3DPF returns.
+
+    `control` is one-shot: the same id is published once, then remembered like
+    `started_sends`. Unknown keys are ignored so an old agent does not crash.
+    """
+    if applied_controls is None:
+        applied_controls = set()
+    for row in desired:
+        if not isinstance(row, dict):
+            continue
+        logger.debug("desired-state: %s -> %s", row.get("bambu_id"), row.get("desired_status"))
+        if fleet is None:
+            continue
+        control = _control_from_row(row)
+        bambu_id = row.get("bambu_id")
+        if control is None or not bambu_id:
+            continue
+        _apply_control(fleet, str(bambu_id), control, applied_controls, spool_dir, router)
+
+
+def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
+                   spool_dir: Optional[str], router) -> None:
+    control_id = control["id"]
+    marker = (
+        os.path.join(spool_dir, f"control-{control_id}.applied")
+        if spool_dir else None
+    )
+    if control_id in applied_controls or (marker and os.path.exists(marker)):
+        applied_controls.add(control_id)
+        return
+    printer = fleet.by_id(bambu_id) if hasattr(fleet, "by_id") else None
+    if printer is None:
+        logger.warning("control %s for unknown printer %s", control["action"], bambu_id)
+        return
+    action = control["action"]
+    try:
+        if action == "pause":
+            printer.pause_print()
+        elif action == "resume":
+            if hasattr(printer, "resume_from_stage"):
+                printer.resume_from_stage()
+            else:
+                printer.resume_print()
+        elif action == "stop":
+            printer.stop_print()
+            if router is not None and hasattr(router, "clear_assignment"):
+                router.clear_assignment(bambu_id)
+    except Exception:
+        logger.exception("printer %s: %s failed; will retry this control.id",
+                         bambu_id, action)
+        return
+    applied_controls.add(control_id)
+    if marker:
+        try:
+            with open(marker, "w"):
+                pass
+        except OSError:
+            pass
 
 
 def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
@@ -265,6 +336,9 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             started_sends.add(key)
             dpf.report_dispatched(batch_id, bambu_id)
             continue
+        if _row_has_stop(row):
+            logger.info("cloud send %s: live stop; not starting", batch_id)
+            continue
         if str(row.get("desired_status") or "IDLE") != "IDLE":
             continue
         required = _required_filament_hexes(send)
@@ -293,10 +367,28 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     pass
                 logger.warning("could not download send file for batch %s", batch_id)
                 continue
-        started = fleet.dispatch(
-            bambu_id, dest, ams_mapping, plate_index,
-            remote_name=_cloud_remote_name(send),
-        )
+        remote_name = _cloud_remote_name(send)
+        uploaded = None
+        if hasattr(fleet, "upload") and hasattr(fleet, "start_print"):
+            uploaded = fleet.upload(bambu_id, dest, remote_name=remote_name)
+            latest = dpf.heartbeat() if hasattr(dpf, "heartbeat") else {}
+            latest_rows = latest.get("printers") if isinstance(latest, dict) else None
+            if not _desired_allows_send(latest_rows or [], bambu_id, batch_id):
+                logger.warning(
+                    "cloud send %s: fresh desired-state no longer authorizes start; "
+                    "leaving the uploaded file idle",
+                    batch_id,
+                )
+                continue
+            started = fleet.start_print(
+                bambu_id, uploaded or remote_name or os.path.basename(dest),
+                ams_mapping, plate_index,
+            )
+        else:
+            started = fleet.dispatch(
+                bambu_id, dest, ams_mapping, plate_index,
+                remote_name=remote_name,
+            )
         if started:
             started_sends.add(key)
             try:

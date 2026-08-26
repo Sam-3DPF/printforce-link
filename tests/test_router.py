@@ -98,8 +98,8 @@ class _FakeFleet:
         self._raises = raises
         self.calls = []                      # (bambu_id, file_path, ams_mapping, plate)
 
-    def dispatch(self, bambu_id, file_path, ams_mapping, plate_number=1):
-        self.calls.append((bambu_id, file_path, list(ams_mapping), plate_number))
+    def dispatch(self, bambu_id, file_path, ams_mapping, plate_number=1, remote_name=None):
+        self.calls.append((bambu_id, file_path, list(ams_mapping), plate_number, remote_name))
         if self._raises:
             raise RuntimeError("ftps boom")
         return self._result
@@ -334,6 +334,63 @@ def test_printer_owing_a_completion_report_is_not_re_dispatched(tmp_path):
     d.drain(finished, desired=[{"bambu_id": "P1", "desired_status": "IDLE"}])
     assert len(d._fleet.calls) == fleet_calls_before   # NOT re-dispatched while owed
     assert r.assignments_snapshot()["P1"]["terminal"] == "complete"  # still owed
+
+
+def test_cancel_failed_print_error_does_not_report_failed(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    snap = _snap("P1", "ERROR", [(1, "FF6A13FF")])
+    snap["print_error"] = "50348044"
+    d.drain([snap])
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_cancel_failed_hms_does_not_report_failed(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    snap = _snap("P1", "ERROR", [(1, "FF6A13FF")])
+    snap["hms_code"] = "0300_400C_0000_0000"
+    d.drain([snap])
+    assert dpf.failed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_cancel_failed_idle_snapshot_clears_assignment_without_failure(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    snap = _snap("P1", "IDLE", [(1, "FF6A13FF")])
+    snap["print_error"] = "50348044"
+    d.drain([snap])
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_sticky_cancel_code_does_not_clear_live_printing_assignment(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    snap = _snap("P1", "PRINTING", [(1, "FF6A13FF")])
+    snap["print_error"] = "50348044"
+    d.drain([snap])
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" in r.assignments_snapshot()
+
+
+def test_stop_then_later_finish_does_not_report_complete(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    d.drain(
+        [_snap("P1", "ERROR", [(1, "FF6A13FF")])],
+        desired=[{"bambu_id": "P1", "control": {"id": "c-stop", "action": "stop"}}],
+    )
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+    d.drain([_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])])
+    assert dpf.completed == []
 
 
 def test_desired_idle_with_no_queued_match_does_not_dispatch(tmp_path):

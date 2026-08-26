@@ -70,13 +70,51 @@ def normalize_hex(value: Optional[str]) -> Optional[str]:
     return "#" + h
 
 
-def parse_ams(status: dict) -> List[Dict]:
+def parse_ams(status: dict) -> Optional[List[Dict]]:
     """Return [{'slot_number', 'color_hex', 'filament_type'}] for every tray the
     printer reports — loaded *and* empty. An empty tray comes back with a null
-    color and a null type. Malformed input yields an empty list rather than raising.
+    color and a null type. Malformed input yields **None** rather than raising.
+
+    **None and [] are different answers, and the difference is destructive.**
+
+    `[]` means the printer told us about its AMS units and there are none — an AMS
+    that has been unplugged. The cloud treats that as authoritative and DELETES the
+    printer's slot rows (`bridge_state_service._reconcile_slots`), which is correct:
+    the spools are genuinely gone, and anything stored on the row goes with them.
+
+    `None` means the payload carries no AMS unit list at all, so we know nothing about
+    this printer's trays right now. That is NOT the same claim, and returning `[]` for
+    it is what let a healthy printer's slots be wiped:
+
+      Bambu pushes a full status once and then sends deltas. `mqtt_dump()` accumulates
+      only one level deep, so between connecting and the first full push a printer's
+      merged payload legitimately has no `print.ams` key while `gcode_state` is already
+      RUNNING. The bridge reported `slots: []` with status PRINTING, that sailed past
+      the cloud's OFFLINE-only guard, and every slot row for a live, printing machine
+      was deleted. Four of seven AMS printers on the dev farm sat with zero slots from
+      this — invisible in the fleet view, and unroutable, since the dispatcher matches a
+      batch's required colors against the slots a printer reports (`router._color_set`).
+
+    Today the deleted row only costs the reported color, which the next real AMS report
+    rebuilds. The reason this is a data-loss bug and not a display one is U10: the manual
+    filament override is specified to live on this row (`override_material_id`,
+    `override_set_at`, `override_of_reported_hex`), and it exists precisely for slots
+    whose RFID is dark — the population nothing can detect or restore. Shipping U10 onto
+    a row that a routine reconnect can delete would make that loss permanent.
+
+    Returning None makes the report say "no information", which the cloud already
+    handles: a `slots` value that is not a list skips both the upsert and the
+    reconcile, leaving the rows alone until a real AMS report arrives.
+
+    The discriminator is the unit LIST, not the container: `print.ams` exists to hold
+    both the unit array and the AMS-wide bitmasks, so a container carrying only
+    `tray_exist_bits` still tells us nothing about which trays are loaded.
     """
+    units = _ams_container(status).get("ams")
+    if not isinstance(units, list):
+        return None
     slots: List[Dict] = []
-    for unit in _ams_container(status).get("ams") or []:
+    for unit in units:
         if not isinstance(unit, dict):
             continue
         unit_index = as_int(unit.get("id"), default=0)

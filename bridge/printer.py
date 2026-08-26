@@ -50,6 +50,16 @@ _PRINT_ENDED = frozenset({"FINISH", "FAILED"})
 # unknown prior state is not evidence of an idle machine.
 _PRINT_START_EVIDENCE = frozenset({"IDLE", "FINISH", "FAILED"})
 
+# User-cancel on a P1S often lands as FAILED plus one of these, not IDLE. Mapped to
+# IDLE so the next Start is not blocked and the router does not report_failed.
+# 50348044 is print.print_error; 0300_400C / 0500_400E are HMS index codes.
+_CANCEL_PRINT_ERRORS = frozenset({"50348044", "0300400C"})
+_CANCEL_HMS_CODES = frozenset({"0300400C", "0500400E"})
+
+# stg_cur values that need retry_filament_action before resume_print (KTD6).
+# 6 = runout, 17/20 = load, 21 = unload / AMS, 24 = AMS lost, 35 = clog.
+_FILAMENT_RETRY_STAGES = frozenset({6, 17, 20, 21, 24, 35})
+
 # A print runs for hours, occasionally days — never months. Anything past this is a
 # corrupt timestamp, not a print.
 _MAX_PLAUSIBLE_PRINT_SECONDS = 30 * 24 * 60 * 60
@@ -66,7 +76,39 @@ _DURATION_DISAGREEMENT_SECONDS = 120
 _DEFAULT_STALE_AFTER_SECONDS = 45
 
 
-def map_status(gcode_state: Optional[str]) -> str:
+def _norm_error_code(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip().upper().replace("0X", "").replace("_", "").replace("-", "")
+
+
+def is_cancel_failed(print_error=None, hms_code=None, hms=None) -> bool:
+    """True when the printer is sitting on a user-cancel, not a real fail."""
+    pe = _norm_error_code(print_error)
+    if pe in _CANCEL_PRINT_ERRORS:
+        return True
+    candidates = []
+    if hms_code is not None:
+        candidates.append(hms_code)
+    if isinstance(hms, str):
+        candidates.append(hms)
+    elif isinstance(hms, list):
+        for item in hms:
+            if isinstance(item, dict):
+                candidates.append(item.get("code"))
+            else:
+                candidates.append(item)
+    for raw in candidates:
+        normalized = _norm_error_code(raw)
+        if not normalized:
+            continue
+        if normalized in _CANCEL_HMS_CODES or any(code in normalized for code in _CANCEL_HMS_CODES):
+            return True
+    return False
+
+
+def map_status(gcode_state: Optional[str], *, print_error=None,
+               hms_code=None, hms=None) -> str:
     """Map a Bambu gcode_state to a 3DPF printer status.
 
     Unknown and blank states map to **OFFLINE, never IDLE**. IDLE is the sole
@@ -76,8 +118,17 @@ def map_status(gcode_state: Optional[str]) -> str:
     not theoretical — `mqtt_dump()` returns {} until the first MQTT push lands, so on
     every bridge start there is an interval in which each printer, *including one
     mid-print*, has no gcode_state at all.
+
+    A cancel-failed print (`50348044` / HMS `0300_400C`) maps to IDLE, not ERROR,
+    so the next Start is not blocked. FAILED without a cancel code stays ERROR.
+    Only remap ERROR — a leftover cancel code on RUNNING must not hide a live print.
     """
-    return _STATE_MAP.get((gcode_state or "").strip().upper(), "OFFLINE")
+    mapped = _STATE_MAP.get((gcode_state or "").strip().upper(), "OFFLINE")
+    if mapped == "ERROR" and is_cancel_failed(
+        print_error=print_error, hms_code=hms_code, hms=hms,
+    ):
+        return "IDLE"
+    return mapped
 
 
 def decode_hms(hms) -> Dict:
@@ -145,6 +196,9 @@ def parse_telemetry(status: dict) -> Dict:
         # says PAUSE. Bambu's "no stage" sentinel is -1, normalised to None here.
         "stage": _valid_stage(print_obj.get("stg_cur")),
         "tray_exist_bits": parse_tray_exist_bits(status),
+        # print.print_error is 0 when nothing is wrong. Persist the non-zero code so
+        # ingest can tell a user-cancel (50348044) from a real fail.
+        "print_error": _print_error_str(print_obj.get("print_error")),
     }
     telemetry.update(decode_hms(print_obj.get("hms")))
     return telemetry
@@ -435,18 +489,67 @@ class BambuPrinter:
         re-queues the job rather than losing it; returns the printer's start result
         otherwise.
         """
+        name = self.upload_file(file_path, remote_name=remote_name)
+        return self.start_print(name, ams_mapping, plate_number)
+
+    def upload_file(self, file_path: str, remote_name: Optional[str] = None) -> str:
+        """FTPS-upload only. Split from start so a live stop can abort after the push."""
         if self._client is None:
             raise RuntimeError("printer not connected")
         name = remote_name or os.path.basename(file_path)
         # upload_file closes the handle itself (its `finally: file.close()`).
         fh = open(file_path, "rb")
         self._client.upload_file(fh, name)
+        logger.info("printer %s: uploaded %s", self.bambu_id, name)
+        return name
+
+    def start_print(self, remote_name: str, ams_mapping, plate_number: int = 1) -> bool:
+        """MQTT-start a file already on the printer. A True return is not an ack."""
+        if self._client is None:
+            raise RuntimeError("printer not connected")
         started = self._client.start_print(
-            name, plate_number, use_ams=True, ams_mapping=list(ams_mapping),
+            remote_name, plate_number, use_ams=True, ams_mapping=list(ams_mapping),
         )
         logger.info("printer %s: started %s (plate %s, ams_mapping=%s) -> %s",
-                    self.bambu_id, name, plate_number, list(ams_mapping), started)
+                    self.bambu_id, remote_name, plate_number, list(ams_mapping), started)
         return bool(started)
+
+    def pause_print(self) -> bool:
+        """Publish pause. True is not an ack — confirm via the next gcode_state."""
+        return self._mqtt_command("pause_print")
+
+    def resume_print(self) -> bool:
+        """Publish resume. True is not an ack — confirm via the next gcode_state."""
+        return self._mqtt_command("resume_print")
+
+    def stop_print(self) -> bool:
+        """Publish stop. True is not an ack — confirm via the next gcode_state."""
+        return self._mqtt_command("stop_print")
+
+    def retry_filament_action(self) -> bool:
+        """Retry a halted AMS / load / runout action, then the caller resumes."""
+        return self._mqtt_command("retry_filament_action")
+
+    def resume_from_stage(self, stage: Optional[int] = None) -> bool:
+        """Cloud sent `resume`. Pick MQTT from live stg_cur (KTD6)."""
+        if stage is None:
+            try:
+                stage = self.snapshot().get("stage")
+            except Exception:
+                stage = None
+        if stage in _FILAMENT_RETRY_STAGES:
+            self.retry_filament_action()
+        return self.resume_print()
+
+    def _mqtt_command(self, method_name: str) -> bool:
+        if self._client is None:
+            raise RuntimeError("printer not connected")
+        method = getattr(self._client, method_name, None)
+        if not callable(method):
+            raise RuntimeError(f"printer client has no {method_name}()")
+        result = method()
+        logger.info("printer %s: %s -> %s", self.bambu_id, method_name, result)
+        return bool(result)
 
     def snapshot(self) -> Dict:
         """One state report for this printer (never raises):
@@ -454,7 +557,7 @@ class BambuPrinter:
             {
               "bambu_id": str,
               "status": IDLE | PRINTING | PAUSED | NEEDS_CLEARING | ERROR | OFFLINE,
-              "slots": [{slot_number, color_hex, filament_type}],  # empty slots too
+              "slots": [{slot_number, color_hex, filament_type}] | None,  # see below
               <the telemetry fields, flat>,                        # see parse_telemetry
               "print_duration_seconds": int | None,                # observed, not estimated
               "print_duration_source": "bridge" | "printer" | None,
@@ -465,6 +568,11 @@ class BambuPrinter:
         (`{bambu_id, status, slots, plus the telemetry fields}`). `status` and `slots`
         keep their existing shape, so an older ingest keeps working and the new fields
         are purely additive; unknown keys are ignored on the far side.
+
+        **`slots` is None while this printer has reported no AMS unit list**, which is
+        its normal state from connecting until the first full Bambu push lands. `[]`
+        would claim the AMS is empty and make the cloud delete every slot row for a
+        live printer; None says "no information" and leaves them alone. See `parse_ams`.
 
         **The cache is bounded by liveness, and that is a safety property.** A printer
         that dies after connecting does not make anything raise: `mqtt_dump()` is a read
@@ -582,11 +690,21 @@ class BambuPrinter:
             print_obj = {}
         gcode_state = print_obj.get("gcode_state")
         self._stopwatch.observe(gcode_state, print_obj)
+        telemetry = parse_telemetry(payload)
         return {
             "bambu_id": self.bambu_id,
-            "status": map_status(gcode_state if isinstance(gcode_state, str) else None),
+            "status": map_status(
+                gcode_state if isinstance(gcode_state, str) else None,
+                print_error=telemetry.get("print_error"),
+                hms_code=telemetry.get("hms_code"),
+                hms=print_obj.get("hms"),
+            ),
+            # None — not [] — while this printer's payload carries no AMS unit list,
+            # which is its normal state between connecting and the first full push. The
+            # cloud DELETES slot rows to match a reported list, so an `[]` here wipes the
+            # trays of a live machine that simply has not been asked yet. See `parse_ams`.
             "slots": parse_ams(payload),
-            **parse_telemetry(payload),   # flat, not nested — see snapshot()
+            **telemetry,   # flat, not nested — see snapshot()
             "print_duration_seconds": self._stopwatch.duration_seconds,
             "print_duration_source": self._stopwatch.source,
         }
@@ -685,6 +803,13 @@ def _valid_epoch(value) -> Optional[int]:
     if epoch is None or epoch < _MIN_PLAUSIBLE_EPOCH:
         return None
     return epoch
+
+
+def _print_error_str(value) -> Optional[str]:
+    """`print_error` is 0 when nothing is wrong. That is an absence, not a code."""
+    if value in (None, "", 0, "0"):
+        return None
+    return str(value)
 
 
 def _valid_stage(value) -> Optional[int]:

@@ -19,10 +19,26 @@ class _FakeDpf:
         self.dispatched.append((batch_id, bambu_id))
         return {"batch_id": batch_id}
 
+    def heartbeat(self):
+        return {"printers": _desired()}
+
 
 class _FakeFleet:
     def __init__(self):
         self.calls = []
+        self.uploads = []
+        self.starts = []
+        self._last_dest = None
+
+    def upload(self, bambu_id, dest, remote_name=None):
+        self.uploads.append((bambu_id, dest, remote_name))
+        self._last_dest = dest
+        return remote_name or "file.3mf"
+
+    def start_print(self, bambu_id, remote_name, mapping, plate_index=1):
+        self.starts.append((bambu_id, remote_name, list(mapping), plate_index))
+        self.calls.append((bambu_id, self._last_dest, list(mapping), plate_index, remote_name))
+        return True
 
     def dispatch(self, bambu_id, dest, mapping, plate_index=1, remote_name=None):
         self.calls.append((bambu_id, dest, list(mapping), plate_index, remote_name))
@@ -150,4 +166,46 @@ def test_cloud_send_refuses_color_file_without_ams_mapping(tmp_path):
     desired = _desired()
     desired[0]["send"]["ams_mapping"] = []
     _handle_cloud_sends(desired, fleet, _FakeDpf(), str(tmp_path), set())
+    assert fleet.calls == []
+
+
+def test_cloud_send_skips_when_stop_is_live(tmp_path):
+    fleet = _FakeFleet()
+    desired = _desired()
+    desired[0]["control"] = {"id": "c-stop", "action": "stop"}
+    _handle_cloud_sends(desired, fleet, _FakeDpf(), str(tmp_path), set())
+    assert fleet.uploads == []
+    assert fleet.starts == []
+    assert fleet.calls == []
+
+
+class _StopAfterUploadDpf(_FakeDpf):
+    def heartbeat(self):
+        return {"printers": [{
+            "bambu_id": "P1",
+            "desired_status": "IDLE",
+            "control": {"id": "c-stop", "action": "stop"},
+        }]}
+
+
+def test_cloud_send_skips_start_when_stop_arrives_after_upload(tmp_path):
+    fleet = _FakeFleet()
+    _handle_cloud_sends(_desired(), fleet, _StopAfterUploadDpf(), str(tmp_path), set())
+    assert len(fleet.uploads) == 1
+    assert fleet.starts == []
+    assert fleet.calls == []
+
+
+class _MissingDesiredAfterUploadDpf(_FakeDpf):
+    def heartbeat(self):
+        return {}
+
+
+def test_cloud_send_fails_closed_when_desired_refresh_fails_after_upload(tmp_path):
+    fleet = _FakeFleet()
+    _handle_cloud_sends(
+        _desired(), fleet, _MissingDesiredAfterUploadDpf(), str(tmp_path), set(),
+    )
+    assert len(fleet.uploads) == 1
+    assert fleet.starts == []
     assert fleet.calls == []

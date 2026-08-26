@@ -95,14 +95,36 @@ def test_parse_ams_blank_type_keeps_the_reported_color():
     ]
 
 
-def test_parse_ams_malformed_returns_empty():
-    assert parse_ams({}) == []
-    assert parse_ams(None) == []
-    assert parse_ams({"print": {}}) == []
-    assert parse_ams({"print": "not-a-dict"}) == []
-    assert parse_ams({"print": {"ams": "not-a-dict"}}) == []
-    # a tray we cannot place has no slot number to report under, so it is skipped
-    assert parse_ams({"print": {"ams": {"ams": [{"id": "0", "tray": [{"id": "x", "tray_type": "PLA"}]}]}}}) == []
+def test_parse_ams_no_unit_list_is_none_not_empty():
+    """**The distinction that stops a live printer's slots being deleted.**
+
+    None means "this payload tells me nothing about the trays"; [] means "the printer
+    says it has no AMS units". The cloud deletes slot rows to match a reported list, so
+    conflating the two wipes the trays — and the dark-RFID overrides stored on those
+    rows — of a printer that simply has not sent its first full push yet.
+    """
+    assert parse_ams({}) is None
+    assert parse_ams(None) is None
+    assert parse_ams({"print": {}}) is None
+    assert parse_ams({"print": "not-a-dict"}) is None
+    assert parse_ams({"print": {"ams": "not-a-dict"}}) is None
+    # The container exists to hold the bitmasks too, so one carrying only
+    # `tray_exist_bits` still says nothing about which trays are loaded.
+    assert parse_ams({"print": {"ams": {"tray_exist_bits": "f"}}}) is None
+
+
+def test_parse_ams_reports_empty_when_the_printer_has_no_ams_units():
+    """An unplugged AMS — a real, authoritative "there are no trays", which SHOULD
+    reconcile the slot rows away. This is the case None must not swallow."""
+    assert parse_ams({"print": {"ams": {"ams": []}}}) == []
+
+
+def test_parse_ams_unplaceable_tray_is_skipped_but_still_a_report():
+    """A tray we cannot place has no slot number to report under, so it is skipped —
+    but the printer did report its unit list, so this is [] (a real answer), not None."""
+    assert parse_ams(
+        {"print": {"ams": {"ams": [{"id": "0", "tray": [{"id": "x", "tray_type": "PLA"}]}]}}}
+    ) == []
 
 
 def test_parse_tray_exist_bits():
