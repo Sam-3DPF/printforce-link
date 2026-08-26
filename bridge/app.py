@@ -91,9 +91,11 @@ def main(config_path: str = "config.toml") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(config_path)
     logger.info("Loaded %s", cfg)  # __repr__ redacts secrets
+    update_restart_lock = threading.Lock()
     updater = SelfUpdater(
         __version__,
         state_path=default_state_path(config_path),
+        restart_lock=update_restart_lock,
     )
 
     store = PrinterStore(_store_path_for(config_path))
@@ -141,6 +143,9 @@ def main(config_path: str = "config.toml") -> None:
                 cfg.state_interval_seconds, cfg.heartbeat_interval_seconds,
                 cfg.stale_after_seconds)
     while True:
+        # The updater downloads concurrently, but its final swap/restart must wait until
+        # this iteration has finished every irreversible printer action and durable marker.
+        update_restart_lock.acquire()
         try:
             reports = fleet.snapshot()
             response = dpf.report_state(reports, link=updater.metadata())
@@ -212,6 +217,8 @@ def main(config_path: str = "config.toml") -> None:
             # Never let one bad iteration kill the long-running reporter — nothing
             # supervises/restarts it. Log and keep polling.
             logger.exception("bridge loop iteration failed; continuing")
+        finally:
+            update_restart_lock.release()
 
         time.sleep(cfg.state_interval_seconds)
 

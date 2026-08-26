@@ -27,6 +27,7 @@ _DEFAULT_INTERVAL_SECONDS = 6 * 3600   # check a few times a day
 _REQUEST_RETRY_SECONDS = 5 * 60
 _STATE_FILE = "update-state.json"
 _HEALTH_FILE = "update-healthy"
+_FAILED_VERSION_FILE = "failed-update-version"
 
 STATUS_CHECKING = "checking"
 STATUS_CURRENT = "current"
@@ -50,6 +51,14 @@ def _parse_version(tag: str) -> Tuple[int, ...]:
     return tuple(parts) or (0,)
 
 
+def _version_string(tag: str) -> Optional[str]:
+    cleaned = (tag or "").strip().lstrip("vV")
+    pieces = cleaned.split(".")
+    if len(pieces) != 3 or not all(piece.isdigit() for piece in pieces):
+        return None
+    return cleaned
+
+
 def is_newer(candidate: str, current: str) -> bool:
     """True if release tag `candidate` is a newer version than `current`."""
     return _parse_version(candidate) > _parse_version(current)
@@ -62,6 +71,16 @@ def _http_get_json(url: str) -> dict:
     })
     with urllib.request.urlopen(req, timeout=15) as resp:
         return json.load(resp)
+
+
+def _download_file(url: str, destination: str, timeout_seconds: float = 60) -> None:
+    """Download with a bounded socket timeout; never wedge the updater thread forever."""
+    request = urllib.request.Request(
+        url, headers={"User-Agent": "printforce-link-updater"}
+    )
+    with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+        with open(destination, "wb") as handle:
+            shutil.copyfileobj(response, handle)
 
 
 def latest_release_tag(fetch=None) -> Optional[str]:
@@ -108,6 +127,8 @@ def _windows_swap_script(
     backup: str,
     temp_dir: str,
     health_file: str,
+    failed_version_file: str,
+    candidate_version: str,
     pid: int,
 ) -> str:
     """Write the detached Windows helper that swaps after this process releases its files."""
@@ -119,6 +140,8 @@ $Staged = '{staged.replace("'", "''")}'
 $Backup = '{backup.replace("'", "''")}'
 $TempDir = '{temp_dir.replace("'", "''")}'
 $HealthFile = '{health_file.replace("'", "''")}'
+$FailedVersionFile = '{failed_version_file.replace("'", "''")}'
+$CandidateVersion = '{candidate_version.replace("'", "''")}'
 try {{
   Wait-Process -Id {pid} -ErrorAction SilentlyContinue
   if (Test-Path $Backup) {{ Remove-Item $Backup -Recurse -Force }}
@@ -140,11 +163,13 @@ try {{
   if ($Healthy) {{
     Remove-Item $Backup -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item $HealthFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $FailedVersionFile -Force -ErrorAction SilentlyContinue
   }} else {{
     Stop-ScheduledTask -TaskName "PrintForceLink" -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
     if (Test-Path $Current) {{ Remove-Item $Current -Recurse -Force }}
     if (Test-Path $Backup) {{ Move-Item $Backup $Current }}
+    Set-Content -Path $FailedVersionFile -Value $CandidateVersion -Encoding UTF8
     Start-ScheduledTask -TaskName "PrintForceLink"
   }}
 }} catch {{
@@ -167,6 +192,8 @@ def _macos_swap_script(
     backup: str,
     temp_dir: str,
     health_file: str,
+    failed_version_file: str,
+    candidate_version: str,
     pid: int,
 ) -> str:
     """Write a detached macOS watchdog that swaps, health-checks, and rolls back."""
@@ -179,6 +206,8 @@ STAGED={json.dumps(staged)}
 BACKUP={json.dumps(backup)}
 TEMP_DIR={json.dumps(temp_dir)}
 HEALTH_FILE={json.dumps(health_file)}
+FAILED_VERSION_FILE={json.dumps(failed_version_file)}
+CANDIDATE_VERSION={json.dumps(candidate_version)}
 PID={pid}
 LABEL="gui/$(id -u)/com.3dprintforce.printforce-link"
 while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done
@@ -201,11 +230,13 @@ done
 if [ "$HEALTHY" -eq 1 ]; then
   rm -rf "$BACKUP"
   rm -f "$HEALTH_FILE"
+  rm -f "$FAILED_VERSION_FILE"
 else
   launchctl kill SIGTERM "$LABEL" >/dev/null 2>&1 || true
   sleep 2
   rm -rf "$CURRENT"
   [ -d "$BACKUP" ] && mv "$BACKUP" "$CURRENT"
+  printf '%s\n' "$CANDIDATE_VERSION" > "$FAILED_VERSION_FILE"
   launchctl kickstart -k "$LABEL" >/dev/null 2>&1 || true
 fi
 rm -rf "$TEMP_DIR"
@@ -249,9 +280,9 @@ def _apply_update(tag: str) -> str:
     handed_off = False
     try:
         archive = os.path.join(tmp, asset)
-        urllib.request.urlretrieve(f"{base}/{asset}", archive)
+        _download_file(f"{base}/{asset}", archive)
         sums = os.path.join(tmp, "SHA256SUMS")
-        urllib.request.urlretrieve(f"{base}/SHA256SUMS", sums)
+        _download_file(f"{base}/SHA256SUMS", sums)
         if not _checksum_ok(archive, asset, sums):
             logger.warning("self-update: checksum mismatch for %s — keeping current version", asset)
             return APPLY_FAILED
@@ -271,6 +302,8 @@ def _apply_update(tag: str) -> str:
 
         backup = onedir + ".old"
         health_file = os.path.join(root, _HEALTH_FILE)
+        failed_version_file = os.path.join(root, _FAILED_VERSION_FILE)
+        candidate_version = tag.lstrip("vV")
         if sys.platform == "win32":
             script = _windows_swap_script(
                 root=root,
@@ -279,6 +312,8 @@ def _apply_update(tag: str) -> str:
                 backup=backup,
                 temp_dir=tmp,
                 health_file=health_file,
+                failed_version_file=failed_version_file,
+                candidate_version=candidate_version,
                 pid=os.getpid(),
             )
             flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
@@ -303,6 +338,8 @@ def _apply_update(tag: str) -> str:
             backup=backup,
             temp_dir=tmp,
             health_file=health_file,
+            failed_version_file=failed_version_file,
+            candidate_version=candidate_version,
             pid=os.getpid(),
         )
         subprocess.Popen(
@@ -334,7 +371,7 @@ class SelfUpdater:
     def __init__(self, current_version: str,
                  interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
                  latest_tag_fn=None, apply_fn=None, monotonic=time.monotonic,
-                 state_path: Optional[str] = None):
+                 state_path: Optional[str] = None, restart_lock=None):
         self._current = current_version
         self._interval = interval_seconds
         self._latest_tag = latest_tag_fn or latest_release_tag
@@ -342,7 +379,13 @@ class SelfUpdater:
         self._monotonic = monotonic
         self._last = None
         self._check_lock = threading.Lock()
+        self._restart_lock = restart_lock or threading.Lock()
         self._state_path = state_path
+        self._failed_version_path = (
+            os.path.join(os.path.dirname(state_path), _FAILED_VERSION_FILE)
+            if state_path else None
+        )
+        self._failed_version = self._read_failed_version()
         state = self._read_state()
         self._enabled = state.get("auto_update_enabled", True) is not False
         self._latest = state.get("latest_version")
@@ -350,12 +393,28 @@ class SelfUpdater:
         self._error = state.get("update_error")
         self._request_id = state.get("update_request_id")
         self._pending_request_id = state.get("pending_update_request_id")
-        if self._status == STATUS_INSTALLING and self._latest and not is_newer(
+        if self._failed_version and self._latest == self._failed_version:
+            self._status = STATUS_ERROR
+            self._error = (
+                f"v{self._failed_version} failed its startup health check. "
+                "Waiting for a newer release."
+            )
+            self._persist()
+        elif self._status == STATUS_INSTALLING and self._latest and not is_newer(
             self._latest, self._current
         ):
             self._status = STATUS_CURRENT
             self._error = None
             self._persist()
+
+    def _read_failed_version(self) -> Optional[str]:
+        if not self._failed_version_path:
+            return None
+        try:
+            with open(self._failed_version_path, encoding="utf-8") as handle:
+                return _version_string(handle.read())
+        except OSError:
+            return None
 
     def _read_state(self) -> dict:
         if not self._state_path:
@@ -429,6 +488,24 @@ class SelfUpdater:
                 self._persist()
                 return
             self._latest = tag.lstrip("vV")
+            if self._failed_version == self._latest:
+                self._status = STATUS_ERROR
+                self._error = (
+                    f"v{self._latest} failed its startup health check. "
+                    "Waiting for a newer release."
+                )
+                if self._pending_request_id:
+                    self._request_id = self._pending_request_id
+                    self._pending_request_id = None
+                self._persist()
+                return
+            if self._failed_version and self._failed_version != self._latest:
+                self._failed_version = None
+                if self._failed_version_path:
+                    try:
+                        os.unlink(self._failed_version_path)
+                    except OSError:
+                        pass
             if not is_newer(tag, self._current):
                 self._status = STATUS_CURRENT
                 self._error = None
@@ -448,7 +525,8 @@ class SelfUpdater:
                 self._request_id = self._pending_request_id
                 self._pending_request_id = None
             self._persist()
-            result = self._apply(tag)
+            with self._restart_lock:
+                result = self._apply(tag)
             if result == APPLY_FAILED:
                 self._status = STATUS_ERROR
                 self._error = f"Could not install {tag}. Link will retry later."

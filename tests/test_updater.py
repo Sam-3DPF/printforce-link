@@ -1,5 +1,6 @@
 """Self-updater version logic, cloud controls, and durable operator preference."""
 import json
+import io
 import shutil
 import threading
 import time
@@ -12,6 +13,7 @@ from bridge.updater import (
     STATUS_AVAILABLE,
     STATUS_CURRENT,
     STATUS_ERROR,
+    _download_file,
     _macos_swap_script,
     _swap_macos,
     _windows_swap_script,
@@ -258,6 +260,8 @@ def test_windows_helper_uses_move_and_health_rollback(tmp_path):
         backup=r"C:\Link\printforce-link.old",
         temp_dir=r"C:\Temp",
         health_file=r"C:\Link\update-healthy",
+        failed_version_file=r"C:\Link\failed-update-version",
+        candidate_version="0.2.0",
         pid=123,
     )
     content = open(script, encoding="utf-8").read()
@@ -267,6 +271,7 @@ def test_windows_helper_uses_move_and_health_rollback(tmp_path):
     assert "if ($Healthy)" in content
     assert "Stop-ScheduledTask" in content
     assert "Move-Item $Backup $Current" in content
+    assert "Set-Content -Path $FailedVersionFile" in content
 
 
 def test_macos_helper_rolls_back_without_health_marker(tmp_path):
@@ -277,6 +282,8 @@ def test_macos_helper_rolls_back_without_health_marker(tmp_path):
         backup="/Link/printforce-link.old",
         temp_dir="/tmp/update",
         health_file="/Link/update-healthy",
+        failed_version_file="/Link/failed-update-version",
+        candidate_version="0.2.0",
         pid=123,
     )
     content = open(script, encoding="utf-8").read()
@@ -284,3 +291,69 @@ def test_macos_helper_rolls_back_without_health_marker(tmp_path):
     assert 'launchctl kill SIGTERM "$LABEL"' in content
     assert 'mv "$BACKUP" "$CURRENT"' in content
     assert 'if [ -f "$HEALTH_FILE" ]' in content
+    assert '"$CANDIDATE_VERSION" > "$FAILED_VERSION_FILE"' in content
+
+
+def test_failed_release_is_quarantined_until_a_newer_version(tmp_path):
+    state_path = tmp_path / "update-state.json"
+    state_path.write_text(json.dumps({
+        "latest_version": "0.2.0",
+        "update_status": "installing",
+    }))
+    (tmp_path / "failed-update-version").write_text("0.2.0\n")
+    applied = []
+    updater = SelfUpdater(
+        "0.1.0",
+        latest_tag_fn=lambda: "v0.2.0",
+        apply_fn=applied.append,
+        monotonic=Clock(),
+        state_path=str(state_path),
+    )
+
+    updater.tick()
+
+    assert applied == []
+    assert updater.metadata()["update_status"] == STATUS_ERROR
+    assert "failed its startup health check" in updater.metadata()["update_error"]
+
+
+def test_restart_waits_for_main_loop_safe_point():
+    restart_lock = threading.Lock()
+    applied = threading.Event()
+    updater = SelfUpdater(
+        "0.1.0",
+        latest_tag_fn=lambda: "v0.2.0",
+        apply_fn=lambda _tag: applied.set(),
+        monotonic=Clock(),
+        restart_lock=restart_lock,
+    )
+
+    restart_lock.acquire()
+    updater.tick_async()
+    time.sleep(0.05)
+    assert not applied.is_set()
+    restart_lock.release()
+    assert applied.wait(timeout=1)
+
+
+def test_download_has_a_bounded_timeout(tmp_path, monkeypatch):
+    seen = {}
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    def fake_open(request, timeout):
+        seen["timeout"] = timeout
+        return Response(b"release")
+
+    monkeypatch.setattr("bridge.updater.urllib.request.urlopen", fake_open)
+    destination = tmp_path / "asset"
+
+    _download_file("https://example.invalid/asset", str(destination))
+
+    assert seen["timeout"] == 60
+    assert destination.read_bytes() == b"release"
