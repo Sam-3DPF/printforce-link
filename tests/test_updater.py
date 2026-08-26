@@ -272,6 +272,7 @@ def test_windows_helper_uses_move_and_health_rollback(tmp_path):
     assert "Stop-ScheduledTask" in content
     assert "Move-Item $Backup $Current" in content
     assert "Set-Content -Path $FailedVersionFile" in content
+    assert "-Encoding ASCII" in content
 
 
 def test_macos_helper_rolls_back_without_health_marker(tmp_path):
@@ -300,7 +301,9 @@ def test_failed_release_is_quarantined_until_a_newer_version(tmp_path):
         "latest_version": "0.2.0",
         "update_status": "installing",
     }))
-    (tmp_path / "failed-update-version").write_text("0.2.0\n")
+    (tmp_path / "failed-update-version").write_bytes(
+        b"\xef\xbb\xbf0.2.0\r\n"
+    )
     applied = []
     updater = SelfUpdater(
         "0.1.0",
@@ -317,13 +320,18 @@ def test_failed_release_is_quarantined_until_a_newer_version(tmp_path):
     assert "failed its startup health check" in updater.metadata()["update_error"]
 
 
-def test_restart_waits_for_main_loop_safe_point():
+def test_restart_waits_for_main_loop_safe_point(monkeypatch):
     restart_lock = threading.Lock()
     applied = threading.Event()
+
+    def fake_apply(_tag, restart_lock=None):
+        with restart_lock:
+            applied.set()
+
+    monkeypatch.setattr("bridge.updater._apply_update", fake_apply)
     updater = SelfUpdater(
         "0.1.0",
         latest_tag_fn=lambda: "v0.2.0",
-        apply_fn=lambda _tag: applied.set(),
         monotonic=Clock(),
         restart_lock=restart_lock,
     )

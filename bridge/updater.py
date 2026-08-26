@@ -52,7 +52,7 @@ def _parse_version(tag: str) -> Tuple[int, ...]:
 
 
 def _version_string(tag: str) -> Optional[str]:
-    cleaned = (tag or "").strip().lstrip("vV")
+    cleaned = (tag or "").lstrip("\ufeff").strip().lstrip("vV")
     pieces = cleaned.split(".")
     if len(pieces) != 3 or not all(piece.isdigit() for piece in pieces):
         return None
@@ -169,7 +169,7 @@ try {{
     Start-Sleep -Seconds 2
     if (Test-Path $Current) {{ Remove-Item $Current -Recurse -Force }}
     if (Test-Path $Backup) {{ Move-Item $Backup $Current }}
-    Set-Content -Path $FailedVersionFile -Value $CandidateVersion -Encoding UTF8
+    Set-Content -Path $FailedVersionFile -Value $CandidateVersion -Encoding ASCII
     Start-ScheduledTask -TaskName "PrintForceLink"
   }}
 }} catch {{
@@ -260,7 +260,7 @@ def _swap_macos(current: str, staged: str, backup: str) -> None:
         raise
 
 
-def _apply_update(tag: str) -> str:
+def _apply_update(tag: str, restart_lock=None) -> str:
     """Download, verify, stage, and install ``tag``.
 
     macOS can rename the running ``--onedir`` tree, so it swaps in-process and exits for
@@ -272,6 +272,7 @@ def _apply_update(tag: str) -> str:
         logger.info("self-update available (%s) but skipped: not a packaged install "
                     "(update the source with `git pull`)", tag)
         return APPLY_SKIPPED
+    restart_lock = restart_lock or threading.Lock()
     onedir = os.path.dirname(sys.executable)            # <root>/printforce-link
     root = os.path.dirname(onedir)
     asset = _release_asset_name()
@@ -319,17 +320,18 @@ def _apply_update(tag: str) -> str:
             flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
                 subprocess, "CREATE_NEW_PROCESS_GROUP", 0
             )
-            subprocess.Popen(
-                [
-                    "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-                    "-File", script,
-                ],
-                close_fds=True,
-                creationflags=flags,
-            )
-            handed_off = True
-            logger.info("self-update: staged %s; handing off to Windows updater", tag)
-            os._exit(75)
+            with restart_lock:
+                subprocess.Popen(
+                    [
+                        "powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+                        "-File", script,
+                    ],
+                    close_fds=True,
+                    creationflags=flags,
+                )
+                handed_off = True
+                logger.info("self-update: staged %s; handing off to Windows updater", tag)
+                os._exit(75)
 
         script = _macos_swap_script(
             root=root,
@@ -342,14 +344,15 @@ def _apply_update(tag: str) -> str:
             candidate_version=candidate_version,
             pid=os.getpid(),
         )
-        subprocess.Popen(
-            ["/bin/bash", script],
-            close_fds=True,
-            start_new_session=True,
-        )
-        handed_off = True
-        logger.info("self-update: staged %s; handing off to macOS updater", tag)
-        os._exit(75)
+        with restart_lock:
+            subprocess.Popen(
+                ["/bin/bash", script],
+                close_fds=True,
+                start_new_session=True,
+            )
+            handed_off = True
+            logger.info("self-update: staged %s; handing off to macOS updater", tag)
+            os._exit(75)
     except Exception:
         logger.exception("self-update: install failed; keeping current version")
         return APPLY_FAILED
@@ -375,11 +378,13 @@ class SelfUpdater:
         self._current = current_version
         self._interval = interval_seconds
         self._latest_tag = latest_tag_fn or latest_release_tag
-        self._apply = apply_fn or _apply_update
         self._monotonic = monotonic
         self._last = None
         self._check_lock = threading.Lock()
         self._restart_lock = restart_lock or threading.Lock()
+        self._apply = apply_fn or (
+            lambda tag: _apply_update(tag, restart_lock=self._restart_lock)
+        )
         self._state_path = state_path
         self._failed_version_path = (
             os.path.join(os.path.dirname(state_path), _FAILED_VERSION_FILE)
@@ -525,8 +530,7 @@ class SelfUpdater:
                 self._request_id = self._pending_request_id
                 self._pending_request_id = None
             self._persist()
-            with self._restart_lock:
-                result = self._apply(tag)
+            result = self._apply(tag)
             if result == APPLY_FAILED:
                 self._status = STATUS_ERROR
                 self._error = f"Could not install {tag}. Link will retry later."
