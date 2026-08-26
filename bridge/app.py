@@ -13,6 +13,7 @@ import time
 from typing import List, Dict, Optional
 
 from . import __version__
+from .ams import normalize_hex
 from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
@@ -24,6 +25,18 @@ from .store import PrinterStore
 from .updater import SelfUpdater, default_state_path
 
 logger = logging.getLogger(__name__)
+AMS_MAPPING_FORMAT = "filament-id-v1"
+MAX_LOGICAL_FILAMENT_ID = 256
+MAX_BAMBU_AMS_TRAY_INDEX = 15
+_FILAMENT_FAMILIES = ("PETG", "PLA", "ABS", "ASA", "TPU", "PA", "PC", "PVA", "HIPS")
+
+
+def _filament_family(value) -> Optional[str]:
+    raw = value.strip().upper() if isinstance(value, str) else ""
+    for family in _FILAMENT_FAMILIES:
+        if family in raw:
+            return family
+    return None
 
 
 def _store_path_for(config_path: str) -> str:
@@ -253,14 +266,21 @@ def _row_has_stop(row: dict) -> bool:
 
 def _desired_allows_send(desired: List[Dict], bambu_id: str, batch_id: str) -> bool:
     """True only when a fresh desired-state still authorizes this exact send."""
+    return _authorized_send(desired, bambu_id, batch_id) is not None
+
+
+def _authorized_send(desired: List[Dict], bambu_id: str, batch_id: str) -> Optional[dict]:
+    """Return the fresh exact send command, or None when authorization changed."""
     for row in desired:
         if not isinstance(row, dict) or str(row.get("bambu_id") or "") != str(bambu_id):
             continue
-        if _row_has_stop(row):
-            return False
+        if _row_has_stop(row) or str(row.get("desired_status") or "IDLE") != "IDLE":
+            return None
         send = row.get("send")
-        return isinstance(send, dict) and str(send.get("batch_id") or "") == str(batch_id)
-    return False
+        if isinstance(send, dict) and str(send.get("batch_id") or "") == str(batch_id):
+            return send
+        return None
+    return None
 
 
 def _handle_desired(desired: List[Dict], fleet=None, applied_controls=None,
@@ -374,12 +394,11 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             continue
         if str(row.get("desired_status") or "IDLE") != "IDLE":
             continue
-        required = _required_filament_hexes(send)
         ams_mapping = _resolve_cloud_ams_mapping(send, fleet, bambu_id)
-        if required and not ams_mapping:
+        if ams_mapping is None:
             logger.warning(
-                "cloud send %s: no AMS mapping for %s; not starting",
-                batch_id, required,
+                "cloud send %s: invalid or incomplete AMS mapping; not starting",
+                batch_id,
             )
             continue
         if not os.path.exists(dest):
@@ -406,9 +425,18 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             uploaded = fleet.upload(bambu_id, dest, remote_name=remote_name)
             latest = dpf.heartbeat() if hasattr(dpf, "heartbeat") else {}
             latest_rows = latest.get("printers") if isinstance(latest, dict) else None
-            if not _desired_allows_send(latest_rows or [], bambu_id, batch_id):
+            fresh_send = _authorized_send(latest_rows or [], bambu_id, batch_id)
+            if fresh_send is None:
                 logger.warning(
                     "cloud send %s: fresh desired-state no longer authorizes start; "
+                    "leaving the uploaded file idle",
+                    batch_id,
+                )
+                continue
+            ams_mapping = _resolve_cloud_ams_mapping(fresh_send, fleet, bambu_id)
+            if ams_mapping is None:
+                logger.warning(
+                    "cloud send %s: live AMS changed after upload; "
                     "leaving the uploaded file idle",
                     batch_id,
                 )
@@ -445,13 +473,6 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 pass
 
 
-def _required_filament_hexes(send: dict) -> list:
-    raw = send.get("required_filament_hexes") or []
-    if not isinstance(raw, list):
-        return []
-    return [hex_color for hex_color in raw if isinstance(hex_color, str) and hex_color]
-
-
 def _cloud_remote_name(send: dict):
     raw = send.get("filename")
     if not isinstance(raw, str):
@@ -460,47 +481,128 @@ def _cloud_remote_name(send: dict):
     return sanitize_upload_filename(raw)
 
 
-def _int_trays(value):
-    if not isinstance(value, list) or not value:
+def _required_filaments(send: dict):
+    if send.get("ams_mapping_format") != AMS_MAPPING_FORMAT:
         return None
-    trays = []
-    for item in value:
-        if isinstance(item, bool) or not isinstance(item, int) or item < 0:
+    raw = send.get("required_filaments")
+    if not isinstance(raw, list) or not raw:
+        return None
+    required = []
+    seen_ids = set()
+    for filament in raw:
+        if not isinstance(filament, dict):
             return None
-        trays.append(item)
-    return trays
+        filament_id = filament.get("filament_id")
+        color = normalize_hex(filament.get("hex"))
+        family = _filament_family(filament.get("family"))
+        if (
+            isinstance(filament_id, bool)
+            or not isinstance(filament_id, int)
+            or filament_id < 1
+            or filament_id > MAX_LOGICAL_FILAMENT_ID
+            or filament_id in seen_ids
+            or color is None
+            or family is None
+        ):
+            return None
+        seen_ids.add(filament_id)
+        required.append((filament_id, color, family))
+    return required
+
+
+def _validate_sparse_ams_mapping(value, required):
+    expected_length = max((filament_id for filament_id, _color, _family in required), default=0)
+    if not isinstance(value, list) or len(value) != expected_length:
+        return None
+    required_positions = {filament_id - 1 for filament_id, _color, _family in required}
+    mapping = []
+    for index, item in enumerate(value):
+        if (
+            isinstance(item, bool)
+            or not isinstance(item, int)
+            or item < -1
+            or item > MAX_BAMBU_AMS_TRAY_INDEX
+        ):
+            return None
+        if index in required_positions:
+            if item < 0:
+                return None
+        elif item != -1:
+            return None
+        mapping.append(item)
+    return mapping
+
+
+def _mapping_from_live_slots(required, live):
+    slots = live.get("slots") if isinstance(live, dict) else None
+    if not isinstance(slots, list):
+        return None
+    required_colors = {color for _filament_id, color, _family in required}
+    candidates = {}
+    for slot in slots:
+        if not isinstance(slot, dict):
+            return None
+        color = normalize_hex(slot.get("color_hex"))
+        if color not in required_colors:
+            continue
+        family = _filament_family(slot.get("filament_type"))
+        slot_number = slot.get("slot_number")
+        if (
+            family is None
+            or isinstance(slot_number, bool)
+            or not isinstance(slot_number, int)
+            or slot_number < 1
+            or slot_number > MAX_BAMBU_AMS_TRAY_INDEX + 1
+        ):
+            return None
+        candidates.setdefault((color, family), []).append(slot_number - 1)
+    mapping = [-1] * max(
+        (filament_id for filament_id, _color, _family in required),
+        default=0,
+    )
+    for filament_id, color, family in required:
+        trays = candidates.get((color, family)) or []
+        if len(trays) != 1:
+            return None
+        mapping[filament_id - 1] = trays[0]
+    return _validate_sparse_ams_mapping(mapping, required)
 
 
 def _live_snapshot(fleet, bambu_id: str):
     by_id = getattr(fleet, "by_id", None)
     if not callable(by_id):
         return None
-    printer = by_id(bambu_id)
-    if printer is None or not hasattr(printer, "snapshot"):
+    try:
+        printer = by_id(bambu_id)
+    except Exception:
+        return {}
+    if printer is None:
         return None
+    if not hasattr(printer, "snapshot"):
+        return {}
     try:
         snap = printer.snapshot()
     except Exception:
-        return None
-    return snap if isinstance(snap, dict) else None
+        return {}
+    return snap if isinstance(snap, dict) else {}
 
 
-def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> list:
-    """Live AMS first (same rule as local dispatch), then the cloud payload.
+def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[list]:
+    """Validate the sparse contract and use live slots whenever a snapshot exists.
 
-    An empty mapping for a color-tagged file is HMS 0700_7000_0002_0008 — the
-    caller must refuse to start rather than send `use_ams=True` with `[]`.
+    Missing/legacy contracts, stale live mismatches, and compact mappings fail
+    closed so profile positions cannot silently bind to the wrong material.
     """
-    required = _required_filament_hexes(send)
+    logical_required = _required_filaments(send)
+    if logical_required is None:
+        return None
+    validated = _validate_sparse_ams_mapping(send.get("ams_mapping"), logical_required)
+    if validated is None:
+        return None
     live = _live_snapshot(fleet, bambu_id)
-    if required and live is not None:
-        computed = Dispatcher._ams_mapping(required, live)
-        if len(computed) == len(required):
-            return computed
-    provided = _int_trays(send.get("ams_mapping"))
-    if provided is not None and (not required or len(provided) == len(required)):
-        return provided
-    return []
+    if live is not None:
+        return _mapping_from_live_slots(logical_required, live)
+    return validated
 
 
 if __name__ == "__main__":
