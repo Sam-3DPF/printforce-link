@@ -14,6 +14,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from typing import Optional, Tuple
@@ -23,7 +24,9 @@ logger = logging.getLogger(__name__)
 _REPO = "Sam-3DPF/printforce-link"
 _RELEASES_LATEST_API = f"https://api.github.com/repos/{_REPO}/releases/latest"
 _DEFAULT_INTERVAL_SECONDS = 6 * 3600   # check a few times a day
+_REQUEST_RETRY_SECONDS = 5 * 60
 _STATE_FILE = "update-state.json"
+_HEALTH_FILE = "update-healthy"
 
 STATUS_CHECKING = "checking"
 STATUS_CURRENT = "current"
@@ -104,6 +107,7 @@ def _windows_swap_script(
     staged: str,
     backup: str,
     temp_dir: str,
+    health_file: str,
     pid: int,
 ) -> str:
     """Write the detached Windows helper that swaps after this process releases its files."""
@@ -114,18 +118,35 @@ $Current = '{current.replace("'", "''")}'
 $Staged = '{staged.replace("'", "''")}'
 $Backup = '{backup.replace("'", "''")}'
 $TempDir = '{temp_dir.replace("'", "''")}'
+$HealthFile = '{health_file.replace("'", "''")}'
 try {{
   Wait-Process -Id {pid} -ErrorAction SilentlyContinue
   if (Test-Path $Backup) {{ Remove-Item $Backup -Recurse -Force }}
-  Rename-Item $Current $Backup
+  Move-Item $Current $Backup
   try {{
     Move-Item $Staged $Current
   }} catch {{
     if (Test-Path $Current) {{ Remove-Item $Current -Recurse -Force }}
-    Rename-Item $Backup $Current
+    Move-Item $Backup $Current
     throw
   }}
+  Remove-Item $HealthFile -Force -ErrorAction SilentlyContinue
   Start-ScheduledTask -TaskName "PrintForceLink"
+  $Healthy = $false
+  for ($i = 0; $i -lt 120; $i++) {{
+    if (Test-Path $HealthFile) {{ $Healthy = $true; break }}
+    Start-Sleep -Seconds 1
+  }}
+  if ($Healthy) {{
+    Remove-Item $Backup -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $HealthFile -Force -ErrorAction SilentlyContinue
+  }} else {{
+    Stop-ScheduledTask -TaskName "PrintForceLink" -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 2
+    if (Test-Path $Current) {{ Remove-Item $Current -Recurse -Force }}
+    if (Test-Path $Backup) {{ Move-Item $Backup $Current }}
+    Start-ScheduledTask -TaskName "PrintForceLink"
+  }}
 }} catch {{
   try {{ Start-ScheduledTask -TaskName "PrintForceLink" }} catch {{}}
 }} finally {{
@@ -135,6 +156,64 @@ try {{
 """
     with open(script, "w", encoding="utf-8") as handle:
         handle.write(content)
+    return script
+
+
+def _macos_swap_script(
+    *,
+    root: str,
+    current: str,
+    staged: str,
+    backup: str,
+    temp_dir: str,
+    health_file: str,
+    pid: int,
+) -> str:
+    """Write a detached macOS watchdog that swaps, health-checks, and rolls back."""
+    script = os.path.join(root, "complete-update.sh")
+    content = f"""\
+#!/usr/bin/env bash
+set -u
+CURRENT={json.dumps(current)}
+STAGED={json.dumps(staged)}
+BACKUP={json.dumps(backup)}
+TEMP_DIR={json.dumps(temp_dir)}
+HEALTH_FILE={json.dumps(health_file)}
+PID={pid}
+LABEL="gui/$(id -u)/com.3dprintforce.printforce-link"
+while kill -0 "$PID" 2>/dev/null; do sleep 0.2; done
+rm -rf "$BACKUP"
+if ! mv "$CURRENT" "$BACKUP" || ! mv "$STAGED" "$CURRENT"; then
+  rm -rf "$CURRENT"
+  [ -d "$BACKUP" ] && mv "$BACKUP" "$CURRENT"
+  launchctl kickstart -k "$LABEL" >/dev/null 2>&1 || true
+  rm -rf "$TEMP_DIR"
+  rm -f "$0"
+  exit 1
+fi
+rm -f "$HEALTH_FILE"
+launchctl kickstart -k "$LABEL" >/dev/null 2>&1 || true
+HEALTHY=0
+for _ in $(seq 1 120); do
+  if [ -f "$HEALTH_FILE" ]; then HEALTHY=1; break; fi
+  sleep 1
+done
+if [ "$HEALTHY" -eq 1 ]; then
+  rm -rf "$BACKUP"
+  rm -f "$HEALTH_FILE"
+else
+  launchctl kill SIGTERM "$LABEL" >/dev/null 2>&1 || true
+  sleep 2
+  rm -rf "$CURRENT"
+  [ -d "$BACKUP" ] && mv "$BACKUP" "$CURRENT"
+  launchctl kickstart -k "$LABEL" >/dev/null 2>&1 || true
+fi
+rm -rf "$TEMP_DIR"
+rm -f "$0"
+"""
+    with open(script, "w", encoding="utf-8") as handle:
+        handle.write(content)
+    os.chmod(script, 0o700)
     return script
 
 
@@ -191,6 +270,7 @@ def _apply_update(tag: str) -> str:
             return APPLY_FAILED
 
         backup = onedir + ".old"
+        health_file = os.path.join(root, _HEALTH_FILE)
         if sys.platform == "win32":
             script = _windows_swap_script(
                 root=root,
@@ -198,6 +278,7 @@ def _apply_update(tag: str) -> str:
                 staged=new_onedir,
                 backup=backup,
                 temp_dir=tmp,
+                health_file=health_file,
                 pid=os.getpid(),
             )
             flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(
@@ -215,10 +296,22 @@ def _apply_update(tag: str) -> str:
             logger.info("self-update: staged %s; handing off to Windows updater", tag)
             os._exit(75)
 
-        _swap_macos(onedir, new_onedir, backup)
-        # Keep .old until the new build has successfully talked to 3DPF. That is the
-        # health checkpoint; SelfUpdater.confirm_running() removes it.
-        logger.info("self-update: installed %s; restarting", tag)
+        script = _macos_swap_script(
+            root=root,
+            current=onedir,
+            staged=new_onedir,
+            backup=backup,
+            temp_dir=tmp,
+            health_file=health_file,
+            pid=os.getpid(),
+        )
+        subprocess.Popen(
+            ["/bin/bash", script],
+            close_fds=True,
+            start_new_session=True,
+        )
+        handed_off = True
+        logger.info("self-update: staged %s; handing off to macOS updater", tag)
         os._exit(75)
     except Exception:
         logger.exception("self-update: install failed; keeping current version")
@@ -248,6 +341,7 @@ class SelfUpdater:
         self._apply = apply_fn or _apply_update
         self._monotonic = monotonic
         self._last = None
+        self._check_lock = threading.Lock()
         self._state_path = state_path
         state = self._read_state()
         self._enabled = state.get("auto_update_enabled", True) is not False
@@ -255,6 +349,7 @@ class SelfUpdater:
         self._status = state.get("update_status") or STATUS_CHECKING
         self._error = state.get("update_error")
         self._request_id = state.get("update_request_id")
+        self._pending_request_id = state.get("pending_update_request_id")
         if self._status == STATUS_INSTALLING and self._latest and not is_newer(
             self._latest, self._current
         ):
@@ -281,6 +376,7 @@ class SelfUpdater:
             "update_status": self._status,
             "update_error": self._error,
             "update_request_id": self._request_id,
+            "pending_update_request_id": self._pending_request_id,
         }
         os.makedirs(os.path.dirname(self._state_path), exist_ok=True)
         tmp = self._state_path + ".tmp"
@@ -299,43 +395,58 @@ class SelfUpdater:
             "update_request_id": self._request_id,
         }
 
-    def apply_cloud_command(self, command) -> None:
-        """Apply the server-owned preference and one-shot "check now" request."""
+    def apply_cloud_command(self, command) -> bool:
+        """Persist desired settings and return whether a new forced check was requested."""
         if not isinstance(command, dict):
-            return
+            return False
         enabled = command.get("auto_update_enabled")
         if isinstance(enabled, bool) and enabled != self._enabled:
             self._enabled = enabled
             self._persist()
         request_id = command.get("request_id")
-        if request_id and str(request_id) != self._request_id:
-            self._request_id = str(request_id)
+        if (
+            request_id
+            and str(request_id) != self._request_id
+            and str(request_id) != self._pending_request_id
+        ):
+            self._pending_request_id = str(request_id)
             self._persist()
-            self.tick(force=True)
+            return True
+        return False
 
     def tick(self, force: bool = False) -> None:
         """Throttled update check. Never raises."""
         now = self._monotonic()
-        if not force and self._last is not None and now - self._last < self._interval:
+        interval = _REQUEST_RETRY_SECONDS if self._pending_request_id else self._interval
+        if not force and self._last is not None and now - self._last < interval:
             return
         self._last = now
         try:
             tag = self._latest_tag()
             if not tag:
+                self._status = STATUS_ERROR
+                self._error = "Could not reach the stable release channel. Link will retry."
+                self._persist()
                 return
             self._latest = tag.lstrip("vV")
             if not is_newer(tag, self._current):
                 self._status = STATUS_CURRENT
                 self._error = None
+                if self._pending_request_id:
+                    self._request_id = self._pending_request_id
+                    self._pending_request_id = None
                 self._persist()
                 return
-            if not self._enabled and not force:
+            if not self._enabled and not force and not self._pending_request_id:
                 self._status = STATUS_AVAILABLE
                 self._error = None
                 self._persist()
                 return
             self._status = STATUS_INSTALLING
             self._error = None
+            if self._pending_request_id:
+                self._request_id = self._pending_request_id
+                self._pending_request_id = None
             self._persist()
             result = self._apply(tag)
             if result == APPLY_FAILED:
@@ -350,10 +461,46 @@ class SelfUpdater:
             self._persist()
             logger.warning("self-update check failed (%s); will retry", type(e).__name__)
 
+    def tick_async(self, force: bool = False) -> None:
+        """Run network/download work off the sole printer-control reporting loop."""
+        if not self._check_lock.acquire(blocking=False):
+            return
+
+        def run() -> None:
+            try:
+                self.tick(force=force)
+            finally:
+                self._check_lock.release()
+
+        threading.Thread(
+            target=run,
+            name="printforce-link-updater",
+            daemon=True,
+        ).start()
+
     def confirm_running(self) -> None:
         """Remove the previous build only after this build has reached 3DPF successfully."""
         if not getattr(sys, "frozen", False):
             return
-        backup = os.path.dirname(sys.executable) + ".old"
-        if os.path.isdir(backup):
+        onedir = os.path.dirname(sys.executable)
+        root = os.path.dirname(onedir)
+        health_file = os.path.join(root, _HEALTH_FILE)
+        try:
+            with open(health_file, "w", encoding="utf-8") as handle:
+                handle.write(self._current)
+        except OSError:
+            logger.warning("self-update: could not write healthy-start marker")
+        # A v0.1.5-style in-process update has no watchdog script. Clean its backup
+        # after the same successful cloud checkpoint so the first migration to this
+        # updater does not leave a permanent copy behind.
+        watchdogs = (
+            os.path.join(root, "complete-update.sh"),
+            os.path.join(root, "complete-update.ps1"),
+        )
+        backup = onedir + ".old"
+        if not any(os.path.exists(path) for path in watchdogs) and os.path.isdir(backup):
             shutil.rmtree(backup, ignore_errors=True)
+            try:
+                os.unlink(health_file)
+            except OSError:
+                pass

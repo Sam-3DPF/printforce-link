@@ -146,10 +146,10 @@ def main(config_path: str = "config.toml") -> None:
             response = dpf.report_state(reports, link=updater.metadata())
             if response:
                 updater.confirm_running()
-            updater.apply_cloud_command(
+            force_update = updater.apply_cloud_command(
                 response.get("update") if isinstance(response, dict) else None
             )
-            updater.tick()
+            updater.tick_async(force=force_update)
             desired = response.get("printers") if isinstance(response, dict) else None
             # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
             # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
@@ -196,9 +196,10 @@ def main(config_path: str = "config.toml") -> None:
                 heartbeat = dpf.heartbeat(link=updater.metadata())
                 if heartbeat:
                     updater.confirm_running()
-                updater.apply_cloud_command(
+                force_update = updater.apply_cloud_command(
                     heartbeat.get("update") if isinstance(heartbeat, dict) else None
                 )
+                updater.tick_async(force=force_update)
                 heartbeat_desired = (
                     heartbeat.get("printers") if isinstance(heartbeat, dict) else None
                 )

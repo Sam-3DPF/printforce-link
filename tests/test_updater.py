@@ -1,6 +1,8 @@
 """Self-updater version logic, cloud controls, and durable operator preference."""
 import json
 import shutil
+import threading
+import time
 
 import pytest
 
@@ -10,7 +12,9 @@ from bridge.updater import (
     STATUS_AVAILABLE,
     STATUS_CURRENT,
     STATUS_ERROR,
+    _macos_swap_script,
     _swap_macos,
+    _windows_swap_script,
     is_newer,
     latest_release_tag,
 )
@@ -120,10 +124,11 @@ def test_update_now_forces_check_when_automatic_updates_are_off(tmp_path):
         state_path=str(state_path),
     )
 
-    updater.apply_cloud_command({
+    force = updater.apply_cloud_command({
         "auto_update_enabled": False,
         "request_id": "request-1",
     })
+    updater.tick(force=force)
 
     assert applied == ["v0.2.0"]
     assert updater.metadata()["update_request_id"] == "request-1"
@@ -202,3 +207,80 @@ def test_macos_swap_rolls_back_if_staged_move_fails(tmp_path, monkeypatch):
         _swap_macos(str(current), str(staged), str(backup))
 
     assert (current / "build.txt").read_text() == "old"
+
+
+def test_transient_release_failure_keeps_update_request_pending(tmp_path):
+    responses = iter([None, "v0.1.0"])
+    clock = Clock()
+    updater = SelfUpdater(
+        "0.1.0",
+        latest_tag_fn=lambda: next(responses),
+        monotonic=clock,
+        state_path=str(tmp_path / "state.json"),
+    )
+    force = updater.apply_cloud_command({"request_id": "request-1"})
+
+    updater.tick(force=force)
+
+    assert updater.metadata()["update_status"] == STATUS_ERROR
+    assert updater.metadata()["update_request_id"] is None
+    assert updater.apply_cloud_command({"request_id": "request-1"}) is False
+
+    clock.t += 301
+    updater.tick()
+    assert updater.metadata()["update_request_id"] == "request-1"
+    assert updater.metadata()["update_status"] == STATUS_CURRENT
+
+
+def test_tick_async_does_not_block_the_printer_loop(monkeypatch):
+    updater = SelfUpdater("0.1.0")
+    started = threading.Event()
+    release = threading.Event()
+
+    def slow_tick(force=False):
+        started.set()
+        release.wait(timeout=1)
+
+    monkeypatch.setattr(updater, "tick", slow_tick)
+    before = time.monotonic()
+    updater.tick_async()
+
+    assert time.monotonic() - before < 0.1
+    assert started.wait(timeout=1)
+    release.set()
+
+
+def test_windows_helper_uses_move_and_health_rollback(tmp_path):
+    script = _windows_swap_script(
+        root=str(tmp_path),
+        current=r"C:\Link\printforce-link",
+        staged=r"C:\Temp\printforce-link",
+        backup=r"C:\Link\printforce-link.old",
+        temp_dir=r"C:\Temp",
+        health_file=r"C:\Link\update-healthy",
+        pid=123,
+    )
+    content = open(script, encoding="utf-8").read()
+
+    assert "Move-Item $Current $Backup" in content
+    assert "Rename-Item $Current $Backup" not in content
+    assert "if ($Healthy)" in content
+    assert "Stop-ScheduledTask" in content
+    assert "Move-Item $Backup $Current" in content
+
+
+def test_macos_helper_rolls_back_without_health_marker(tmp_path):
+    script = _macos_swap_script(
+        root=str(tmp_path),
+        current="/Link/printforce-link",
+        staged="/tmp/printforce-link",
+        backup="/Link/printforce-link.old",
+        temp_dir="/tmp/update",
+        health_file="/Link/update-healthy",
+        pid=123,
+    )
+    content = open(script, encoding="utf-8").read()
+
+    assert 'launchctl kill SIGTERM "$LABEL"' in content
+    assert 'mv "$BACKUP" "$CURRENT"' in content
+    assert 'if [ -f "$HEALTH_FILE" ]' in content
