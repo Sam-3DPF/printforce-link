@@ -12,6 +12,7 @@ import threading
 import time
 from typing import List, Dict, Optional
 
+from . import __version__
 from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
@@ -20,6 +21,7 @@ from .pairing import ensure_paired
 from .reconciler import ConfigReconciler
 from .router import Dispatcher, Router
 from .store import PrinterStore
+from .updater import SelfUpdater, default_state_path
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,12 @@ def main(config_path: str = "config.toml") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(config_path)
     logger.info("Loaded %s", cfg)  # __repr__ redacts secrets
+    update_restart_lock = threading.Lock()
+    updater = SelfUpdater(
+        __version__,
+        state_path=default_state_path(config_path),
+        restart_lock=update_restart_lock,
+    )
 
     store = PrinterStore(_store_path_for(config_path))
 
@@ -135,9 +143,18 @@ def main(config_path: str = "config.toml") -> None:
                 cfg.state_interval_seconds, cfg.heartbeat_interval_seconds,
                 cfg.stale_after_seconds)
     while True:
+        # The updater downloads concurrently, but its final swap/restart must wait until
+        # this iteration has finished every irreversible printer action and durable marker.
+        update_restart_lock.acquire()
         try:
             reports = fleet.snapshot()
-            response = dpf.report_state(reports)
+            response = dpf.report_state(reports, link=updater.metadata())
+            if response:
+                updater.confirm_running()
+            force_update = updater.apply_cloud_command(
+                response.get("update") if isinstance(response, dict) else None
+            )
+            updater.tick_async(force=force_update)
             desired = response.get("printers") if isinstance(response, dict) else None
             # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
             # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
@@ -181,7 +198,13 @@ def main(config_path: str = "config.toml") -> None:
 
             now = time.monotonic()
             if now - last_heartbeat >= cfg.heartbeat_interval_seconds:
-                heartbeat = dpf.heartbeat()
+                heartbeat = dpf.heartbeat(link=updater.metadata())
+                if heartbeat:
+                    updater.confirm_running()
+                force_update = updater.apply_cloud_command(
+                    heartbeat.get("update") if isinstance(heartbeat, dict) else None
+                )
+                updater.tick_async(force=force_update)
                 heartbeat_desired = (
                     heartbeat.get("printers") if isinstance(heartbeat, dict) else None
                 )
@@ -194,6 +217,8 @@ def main(config_path: str = "config.toml") -> None:
             # Never let one bad iteration kill the long-running reporter — nothing
             # supervises/restarts it. Log and keep polling.
             logger.exception("bridge loop iteration failed; continuing")
+        finally:
+            update_restart_lock.release()
 
         time.sleep(cfg.state_interval_seconds)
 

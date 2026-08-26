@@ -61,10 +61,16 @@ the product is PrintForce Link.
 
 ## Releases
 
-Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which builds the standalone agent
-for macOS (Apple Silicon + Intel) and Windows with PyInstaller and publishes the archives +
-`SHA256SUMS` to a GitHub Release. The installers and the self-updater download from the
-latest release.
+Tagging `vX.Y.Z` triggers `.github/workflows/release.yml`, which stamps that tag into the
+binary, builds the standalone agent for macOS (Apple Silicon) and Windows with PyInstaller,
+smoke-checks the frozen version, and publishes the archives + `SHA256SUMS` to a GitHub
+Release.
+
+An installed Link checks the stable release channel automatically, verifies the archive,
+keeps the previous build until the replacement has successfully reached 3D PrintForce, and
+reports its version/update health to **3D PrintForce → Integrations**. Operators can turn
+automatic stable updates off or request an immediate check there; they do not reinstall Link
+for routine releases.
 
 ## Security
 

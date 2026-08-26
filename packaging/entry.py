@@ -27,6 +27,10 @@ def _ensure_ca_bundle() -> None:
 
 def run() -> None:
     _ensure_ca_bundle()
+    from bridge import __version__
+    if "--version" in sys.argv[1:]:
+        print(__version__)
+        return
     from bridge.app import main
     main(_config_path())
 

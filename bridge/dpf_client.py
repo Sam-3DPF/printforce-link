@@ -47,13 +47,16 @@ class DpfClient:
         self._headers["Authorization"] = f"Bearer {cloud_token}"
         self.unauthorized = False
 
-    def report_state(self, reports: List[Dict]) -> Dict:
+    def report_state(self, reports: List[Dict], link: Optional[Dict] = None) -> Dict:
         """POST a batch of printer-state reports; returns the desired-state body."""
-        return self._post("/api/bridge/printers/state", {"printers": reports})
+        return self._post(
+            "/api/bridge/printers/state",
+            {"printers": reports, "link": link or {}},
+        )
 
-    def heartbeat(self) -> Dict:
+    def heartbeat(self, link: Optional[Dict] = None) -> Dict:
         """Liveness ping; returns desired-state for all bridge-managed printers."""
-        return self._post("/api/bridge/heartbeat", {})
+        return self._post("/api/bridge/heartbeat", {"link": link or {}})
 
     def resolve_batch(self, correlation_key: str) -> Dict:
         """Resolve an upload's correlation key → {batch_id, required_colors, ...} (U8).
