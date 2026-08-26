@@ -25,12 +25,33 @@ def test_report_state_posts_expected_shape(monkeypatch):
     monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
 
     client = DpfClient("https://app.3dprintforce.com", "tok")
-    out = client.report_state([{"bambu_id": "S1", "status": "IDLE", "slots": []}])
+    metadata = {"version": "0.1.6", "platform": "macos-arm64"}
+    out = client.report_state(
+        [{"bambu_id": "S1", "status": "IDLE", "slots": []}],
+        link=metadata,
+    )
 
     assert captured["url"] == "https://app.3dprintforce.com/api/bridge/printers/state"
-    assert captured["json"] == {"printers": [{"bambu_id": "S1", "status": "IDLE", "slots": []}]}
+    assert captured["json"] == {
+        "printers": [{"bambu_id": "S1", "status": "IDLE", "slots": []}],
+        "link": metadata,
+    }
     assert captured["headers"]["Authorization"] == "Bearer tok"
     assert out == {"printers": [{"bambu_id": "S1", "desired_status": "IDLE"}]}
+
+
+def test_heartbeat_posts_link_metadata(monkeypatch):
+    captured = {}
+
+    def fake_post(self, url, json=None, headers=None):
+        captured.update(url=url, json=json)
+        return _FakeResp(200, {"data": {"ok": True}})
+
+    monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
+    client = DpfClient("https://app.3dprintforce.com", "tok")
+
+    assert client.heartbeat(link={"version": "0.1.6"}) == {"ok": True}
+    assert captured["json"] == {"link": {"version": "0.1.6"}}
 
 
 def test_post_retries_on_5xx_then_returns_empty(monkeypatch):
@@ -291,4 +312,3 @@ def test_download_url_writes_dest(tmp_path, monkeypatch):
 def test_download_url_empty_is_false():
     client = DpfClient("https://app.3dprintforce.com", "tok")
     assert client.download_url("", "/tmp/x") is False
-

@@ -1,6 +1,19 @@
-"""Self-updater version logic + throttled check (U9). The download/swap is validated by
-the release smoke test, not here (it needs a real release + a frozen build)."""
-from bridge.updater import SelfUpdater, is_newer, latest_release_tag
+"""Self-updater version logic, cloud controls, and durable operator preference."""
+import json
+import shutil
+
+import pytest
+
+from bridge.updater import (
+    APPLY_FAILED,
+    SelfUpdater,
+    STATUS_AVAILABLE,
+    STATUS_CURRENT,
+    STATUS_ERROR,
+    _swap_macos,
+    is_newer,
+    latest_release_tag,
+)
 
 
 def test_is_newer_compares_semver():
@@ -73,3 +86,119 @@ def test_updater_swallows_check_failure():
     def boom():
         raise OSError("down")
     SelfUpdater("0.1.0", latest_tag_fn=boom, apply_fn=lambda tag: None, monotonic=Clock()).tick()
+
+
+def test_disabled_updater_still_reports_available_without_installing(tmp_path):
+    state_path = tmp_path / "update-state.json"
+    state_path.write_text(json.dumps({"auto_update_enabled": False}))
+    applied = []
+    updater = SelfUpdater(
+        "0.1.0",
+        latest_tag_fn=lambda: "v0.2.0",
+        apply_fn=applied.append,
+        monotonic=Clock(),
+        state_path=str(state_path),
+    )
+
+    updater.tick()
+
+    assert applied == []
+    assert updater.metadata()["latest_version"] == "0.2.0"
+    assert updater.metadata()["update_status"] == STATUS_AVAILABLE
+    assert updater.metadata()["auto_update_enabled"] is False
+
+
+def test_update_now_forces_check_when_automatic_updates_are_off(tmp_path):
+    state_path = tmp_path / "update-state.json"
+    state_path.write_text(json.dumps({"auto_update_enabled": False}))
+    applied = []
+    updater = SelfUpdater(
+        "0.1.0",
+        latest_tag_fn=lambda: "v0.2.0",
+        apply_fn=applied.append,
+        monotonic=Clock(),
+        state_path=str(state_path),
+    )
+
+    updater.apply_cloud_command({
+        "auto_update_enabled": False,
+        "request_id": "request-1",
+    })
+
+    assert applied == ["v0.2.0"]
+    assert updater.metadata()["update_request_id"] == "request-1"
+
+
+def test_cloud_auto_update_preference_persists_across_restart(tmp_path):
+    state_path = tmp_path / "update-state.json"
+    updater = SelfUpdater("0.1.0", state_path=str(state_path))
+
+    updater.apply_cloud_command({"auto_update_enabled": False})
+    restarted = SelfUpdater("0.1.0", state_path=str(state_path))
+
+    assert restarted.metadata()["auto_update_enabled"] is False
+
+
+def test_failed_install_is_reported_without_raising():
+    updater = SelfUpdater(
+        "0.1.0",
+        latest_tag_fn=lambda: "v0.2.0",
+        apply_fn=lambda _tag: APPLY_FAILED,
+        monotonic=Clock(),
+    )
+
+    updater.tick()
+
+    assert updater.metadata()["update_status"] == STATUS_ERROR
+    assert "Could not install" in updater.metadata()["update_error"]
+
+
+def test_new_build_turns_persisted_installing_state_current(tmp_path):
+    state_path = tmp_path / "update-state.json"
+    state_path.write_text(json.dumps({
+        "latest_version": "0.2.0",
+        "update_status": "installing",
+        "update_request_id": "request-1",
+    }))
+
+    updater = SelfUpdater("0.2.0", state_path=str(state_path))
+
+    assert updater.metadata()["update_status"] == STATUS_CURRENT
+    assert updater.metadata()["update_request_id"] == "request-1"
+
+
+def test_macos_swap_keeps_backup_until_new_build_is_healthy(tmp_path):
+    current = tmp_path / "printforce-link"
+    staged = tmp_path / "staged"
+    backup = tmp_path / "printforce-link.old"
+    current.mkdir()
+    staged.mkdir()
+    (current / "build.txt").write_text("old")
+    (staged / "build.txt").write_text("new")
+
+    _swap_macos(str(current), str(staged), str(backup))
+
+    assert (current / "build.txt").read_text() == "new"
+    assert (backup / "build.txt").read_text() == "old"
+
+
+def test_macos_swap_rolls_back_if_staged_move_fails(tmp_path, monkeypatch):
+    current = tmp_path / "printforce-link"
+    staged = tmp_path / "staged"
+    backup = tmp_path / "printforce-link.old"
+    current.mkdir()
+    staged.mkdir()
+    (current / "build.txt").write_text("old")
+    real_move = shutil.move
+
+    def fail_staged_move(source, destination):
+        if str(source) == str(staged):
+            raise OSError("disk failure")
+        return real_move(source, destination)
+
+    monkeypatch.setattr("bridge.updater.shutil.move", fail_staged_move)
+
+    with pytest.raises(OSError):
+        _swap_macos(str(current), str(staged), str(backup))
+
+    assert (current / "build.txt").read_text() == "old"

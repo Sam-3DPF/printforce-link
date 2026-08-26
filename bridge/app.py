@@ -12,6 +12,7 @@ import threading
 import time
 from typing import List, Dict, Optional
 
+from . import __version__
 from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
@@ -20,6 +21,7 @@ from .pairing import ensure_paired
 from .reconciler import ConfigReconciler
 from .router import Dispatcher, Router
 from .store import PrinterStore
+from .updater import SelfUpdater, default_state_path
 
 logger = logging.getLogger(__name__)
 
@@ -89,6 +91,10 @@ def main(config_path: str = "config.toml") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(config_path)
     logger.info("Loaded %s", cfg)  # __repr__ redacts secrets
+    updater = SelfUpdater(
+        __version__,
+        state_path=default_state_path(config_path),
+    )
 
     store = PrinterStore(_store_path_for(config_path))
 
@@ -137,7 +143,13 @@ def main(config_path: str = "config.toml") -> None:
     while True:
         try:
             reports = fleet.snapshot()
-            response = dpf.report_state(reports)
+            response = dpf.report_state(reports, link=updater.metadata())
+            if response:
+                updater.confirm_running()
+            updater.apply_cloud_command(
+                response.get("update") if isinstance(response, dict) else None
+            )
+            updater.tick()
             desired = response.get("printers") if isinstance(response, dict) else None
             # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
             # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
@@ -181,7 +193,12 @@ def main(config_path: str = "config.toml") -> None:
 
             now = time.monotonic()
             if now - last_heartbeat >= cfg.heartbeat_interval_seconds:
-                heartbeat = dpf.heartbeat()
+                heartbeat = dpf.heartbeat(link=updater.metadata())
+                if heartbeat:
+                    updater.confirm_running()
+                updater.apply_cloud_command(
+                    heartbeat.get("update") if isinstance(heartbeat, dict) else None
+                )
                 heartbeat_desired = (
                     heartbeat.get("printers") if isinstance(heartbeat, dict) else None
                 )

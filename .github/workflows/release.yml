@@ -1,9 +1,10 @@
 name: Release
 
-# Cut a release by pushing a version tag, e.g.:  git tag v0.1.0 && git push origin v0.1.0
+# Cut a release by pushing a version tag, e.g.: git tag v0.1.0 && git push origin v0.1.0
 # Builds the --onedir agent on macOS (Apple Silicon) and Windows, then publishes the
 # archives + SHA256SUMS to a GitHub Release. Asset names match install.sh / install.ps1
-# / bridge/updater.py exactly.
+# / bridge/updater.py exactly. The tag is stamped into the frozen binary automatically;
+# there is no separate version-bump commit to forget.
 #
 # Intel Macs (macos-13) are intentionally omitted: GitHub is deprecating the free Intel
 # runners and they can sit queued for hours, hanging the whole release. install.sh guards
@@ -27,6 +28,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+      - name: Stamp release version from tag
+        run: python packaging/stamp_version.py "${{ github.ref_name }}"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -39,6 +42,16 @@ jobs:
           --collect-submodules bambulabs_api
           --collect-data certifi
           packaging/entry.py
+      - name: Smoke version (macOS)
+        if: matrix.kind == 'macos'
+        run: test "$(dist/printforce-link/printforce-link --version)" = "${GITHUB_REF_NAME#v}"
+      - name: Smoke version (Windows)
+        if: matrix.kind == 'windows'
+        shell: pwsh
+        run: |
+          $expected = $env:GITHUB_REF_NAME.TrimStart("v")
+          $actual = & "dist/printforce-link/printforce-link.exe" --version
+          if ($actual -ne $expected) { throw "Expected $expected, got $actual" }
       - name: Package (macOS)
         if: matrix.kind == 'macos'
         run: tar -czf "printforce-link-${{ matrix.target }}.tar.gz" -C dist printforce-link

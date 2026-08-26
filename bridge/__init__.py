@@ -4,4 +4,4 @@ The internal Python package keeps the name `bridge` (its endpoints, tests, and t
 `bambu-bridge` feature flag all speak it); the product/repo is PrintForce Link.
 """
 
-__version__ = "0.1.5"
+from ._release_version import __version__
