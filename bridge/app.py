@@ -300,22 +300,30 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
         logger.warning("control %s for unknown printer %s", control["action"], bambu_id)
         return
     action = control["action"]
+    result = None
     try:
-        if action == "pause":
-            printer.pause_print()
+        if callable(getattr(fleet, "apply_control", None)):
+            result = fleet.apply_control(bambu_id, action)
+        elif action == "pause":
+            result = printer.pause_print()
         elif action == "resume":
-            if hasattr(printer, "resume_from_stage"):
+            result = (
                 printer.resume_from_stage()
-            else:
-                printer.resume_print()
+                if hasattr(printer, "resume_from_stage")
+                else printer.resume_print()
+            )
         elif action == "stop":
-            printer.stop_print()
-            if router is not None and hasattr(router, "clear_assignment"):
-                router.clear_assignment(bambu_id)
+            result = printer.stop_print()
     except Exception:
         logger.exception("printer %s: %s failed; will retry this control.id",
                          bambu_id, action)
         return
+    if result is False:
+        logger.warning("printer %s: %s was not published; will retry this control.id",
+                       bambu_id, action)
+        return
+    if action == "stop" and router is not None and hasattr(router, "clear_assignment"):
+        router.clear_assignment(bambu_id)
     applied_controls.add(control_id)
     if marker:
         try:
