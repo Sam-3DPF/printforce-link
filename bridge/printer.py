@@ -74,12 +74,82 @@ _DURATION_DISAGREEMENT_SECONDS = 120
 # (`Config.stale_after_seconds` = state_interval x offline_after_stale_polls); this is
 # the fallback for a `BambuPrinter` built without one, and equals that default (15s x 3).
 _DEFAULT_STALE_AFTER_SECONDS = 45
+# Raw firmware labels/codes cross the bridge boundary only in this bounded form.
+_MAX_FIRMWARE_TEXT = 64
 
 
 def _norm_error_code(value) -> str:
     if value is None:
         return ""
-    return str(value).strip().upper().replace("0X", "").replace("_", "").replace("-", "")
+    return (
+        str(value).strip().upper().replace("0X", "").replace("_", "").replace("-", "")
+    )[:_MAX_FIRMWARE_TEXT]
+
+
+def _bounded_text(value, *, upper: bool = False) -> Optional[str]:
+    text = clean_str(value)
+    if text is None:
+        return None
+    text = text.upper() if upper else text
+    return text[:_MAX_FIRMWARE_TEXT]
+
+
+def _identifier_present(value) -> bool:
+    """Redact firmware identifiers to presence only; zero is Bambu's empty sentinel."""
+    if value is None or value == 0:
+        return False
+    if isinstance(value, str):
+        return value.strip() not in ("", "0")
+    # An unexpected non-zero/non-string value cannot safely be treated as empty.
+    return True
+
+
+def _failed_ready_fields(print_obj: Dict) -> Dict:
+    """Bounded/redacted evidence used to identify a historical sticky FAILED state."""
+    hms_present = "hms" in print_obj
+    hms = print_obj.get("hms")
+    stg = print_obj.get("stg")
+    return {
+        "gcode_state": _bounded_text(print_obj.get("gcode_state"), upper=True),
+        "hms_present": hms_present,
+        "hms_empty": hms_present and isinstance(hms, list) and not hms,
+        # Never send task/project ids. Their presence is enough for the safety gate.
+        "has_active_file": (
+            _identifier_present(print_obj.get("gcode_file"))
+            or _identifier_present(print_obj.get("subtask_name"))
+        ),
+        "has_active_task": (
+            _identifier_present(print_obj.get("task_id"))
+            or _identifier_present(print_obj.get("subtask_id"))
+        ),
+        "has_active_project": _identifier_present(print_obj.get("project_id")),
+        # None means the field was absent; only an explicitly empty queue qualifies.
+        "stage_queue_empty": isinstance(stg, list) and not stg if "stg" in print_obj else None,
+        "print_type": _bounded_text(print_obj.get("print_type")),
+    }
+
+
+def _is_zero_or_absent_error(value) -> bool:
+    code = _norm_error_code(value)
+    return not code or not code.strip("0")
+
+
+def _is_historical_failed_candidate(print_obj: Dict, fields: Dict) -> bool:
+    print_type = (fields.get("print_type") or "").strip().lower()
+    return (
+        fields.get("gcode_state") == "FAILED"
+        and _is_zero_or_absent_error(print_obj.get("print_error"))
+        and fields.get("hms_present") is True
+        and fields.get("hms_empty") is True
+        and fields.get("has_active_file") is False
+        and fields.get("has_active_task") is False
+        and fields.get("has_active_project") is False
+        and as_int(print_obj.get("mc_percent"), None) == 0
+        and as_float(print_obj.get("nozzle_target_temper"), None) == 0
+        and as_float(print_obj.get("bed_target_temper"), None) == 0
+        and fields.get("stage_queue_empty") is True
+        and print_type in ("", "idle")
+    )
 
 
 def is_cancel_failed(print_error=None, hms_code=None, hms=None) -> bool:
@@ -201,6 +271,7 @@ def parse_telemetry(status: dict) -> Dict:
         "print_error": _print_error_str(print_obj.get("print_error")),
     }
     telemetry.update(decode_hms(print_obj.get("hms")))
+    telemetry.update(_failed_ready_fields(print_obj))
     return telemetry
 
 
@@ -400,6 +471,7 @@ class BambuPrinter:
         self._last_fresh_monotonic: Optional[float] = None
         self._offline = False                     # for logging the edge, not every poll
         self._warned_no_connection_probe = False
+        self._historical_failed_streak = 0
 
     @property
     def bambu_id(self) -> str:
@@ -446,6 +518,7 @@ class BambuPrinter:
         self._cached = None
         self._last_raw = None
         self._last_fresh_monotonic = None
+        self._historical_failed_streak = 0
         self._connect(target_ip)
 
     def disconnect(self) -> None:
@@ -559,6 +632,12 @@ class BambuPrinter:
               "status": IDLE | PRINTING | PAUSED | NEEDS_CLEARING | ERROR | OFFLINE,
               "slots": [{slot_number, color_hex, filament_type}] | None,  # see below
               <the telemetry fields, flat>,                        # see parse_telemetry
+              "gcode_state": str | None,                            # bounded firmware state
+              "hms_present": bool, "hms_empty": bool,
+              "has_active_file": bool, "has_active_task": bool,
+              "has_active_project": bool,                           # ids are never exposed
+              "stage_queue_empty": bool | None, "print_type": str | None,
+              "historical_failed_ready": bool,                      # separate from status
               "print_duration_seconds": int | None,                # observed, not estimated
               "print_duration_source": "bridge" | "printer" | None,
             }
@@ -610,7 +689,7 @@ class BambuPrinter:
             # itself, not on some intermediary.
             return self._go_offline("MQTT link is down")
 
-        self._note_freshness(raw)
+        fresh = self._note_freshness(raw)
         if isinstance(raw, dict) and raw:
             self._cached = merge_status_payload(self._cached, raw)
 
@@ -631,7 +710,7 @@ class BambuPrinter:
             self._offline = False
 
         try:
-            return self._build_snapshot(self._cached)
+            return self._build_snapshot(self._cached, fresh=fresh)
         except Exception:
             # NOT an unreachable printer — a bug in the bridge's own parsing. Letting it
             # pass for one would silently delete a *live* printer from the UI, leaving a
@@ -657,9 +736,10 @@ class BambuPrinter:
             logger.warning("printer %s -> OFFLINE: %s", self.bambu_id, reason)
             self._offline = True
         self._cached = None
+        self._historical_failed_streak = 0
         return self._offline_snapshot()
 
-    def _note_freshness(self, raw) -> None:
+    def _note_freshness(self, raw) -> bool:
         """Stamp the clock when the printer says something NEW.
 
         Keyed on the payload *changing*, never on `mqtt_dump()` merely returning
@@ -671,11 +751,12 @@ class BambuPrinter:
         reference would compare equal to itself forever and nothing would ever look stale.
         """
         if not isinstance(raw, dict) or not raw:
-            return                      # silence, not news
+            return False                # silence, not news
         if raw == self._last_raw:
-            return                      # the same frozen payload, not a new one
+            return False                # the same frozen payload, not a new one
         self._last_raw = copy.deepcopy(raw)
         self._last_fresh_monotonic = self._monotonic()
+        return True
 
     def _stale_for(self) -> Optional[float]:
         """Seconds of silence, if the printer has been quiet too long — else None."""
@@ -684,13 +765,18 @@ class BambuPrinter:
         silent_for = self._monotonic() - self._last_fresh_monotonic
         return silent_for if silent_for > self._stale_after_seconds else None
 
-    def _build_snapshot(self, payload: Dict) -> Dict:
+    def _build_snapshot(self, payload: Dict, *, fresh: bool) -> Dict:
         print_obj = payload.get("print")
         if not isinstance(print_obj, dict):
             print_obj = {}
         gcode_state = print_obj.get("gcode_state")
         self._stopwatch.observe(gcode_state, print_obj)
         telemetry = parse_telemetry(payload)
+        if fresh and _is_historical_failed_candidate(print_obj, telemetry):
+            self._historical_failed_streak += 1
+        else:
+            # Duplicate/non-fresh reports and every disqualifier break consecutiveness.
+            self._historical_failed_streak = 0
         return {
             "bambu_id": self.bambu_id,
             "status": map_status(
@@ -705,6 +791,9 @@ class BambuPrinter:
             # trays of a live machine that simply has not been asked yet. See `parse_ams`.
             "slots": parse_ams(payload),
             **telemetry,   # flat, not nested — see snapshot()
+            # Status intentionally remains ERROR. This separate signal lets the cloud
+            # check its own assignment state before deciding whether the failure is old.
+            "historical_failed_ready": self._historical_failed_streak >= 2,
             "print_duration_seconds": self._stopwatch.duration_seconds,
             "print_duration_source": self._stopwatch.source,
         }
@@ -714,11 +803,13 @@ class BambuPrinter:
         we cannot currently see. A stale temperature or ETA on an unreachable printer
         would be actively misleading, and the ingest clears what stops being reported.
         """
+        self._historical_failed_streak = 0
         return {
             "bambu_id": self.bambu_id,
             "status": "OFFLINE",
             "slots": [],
             **parse_telemetry(None),
+            "historical_failed_ready": False,
             "print_duration_seconds": None,
             "print_duration_source": None,
         }
@@ -807,9 +898,10 @@ def _valid_epoch(value) -> Optional[int]:
 
 def _print_error_str(value) -> Optional[str]:
     """`print_error` is 0 when nothing is wrong. That is an absence, not a code."""
-    if value in (None, "", 0, "0"):
+    code = _norm_error_code(value)
+    if not code or not code.strip("0"):
         return None
-    return str(value)
+    return code
 
 
 def _valid_stage(value) -> Optional[int]:
