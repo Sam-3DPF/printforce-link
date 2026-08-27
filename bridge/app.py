@@ -5,8 +5,10 @@ and act on the desired-state the response carries. Heartbeats on a slower
 interval. Run with: `python -m bridge.app config.toml`.
 """
 
+from collections import OrderedDict
 import logging
 import os
+import re
 import sys
 import threading
 import time
@@ -20,7 +22,7 @@ from .dpf_client import DpfClient
 from .fleet import Fleet
 from .pairing import ensure_paired
 from .reconciler import ConfigReconciler
-from .router import Dispatcher, Router
+from .router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
 from .store import PrinterStore
 from .updater import SelfUpdater, default_state_path
 
@@ -29,6 +31,60 @@ AMS_MAPPING_FORMAT = "filament-id-v1"
 MAX_LOGICAL_FILAMENT_ID = 256
 MAX_BAMBU_AMS_TRAY_INDEX = 15
 _FILAMENT_FAMILIES = ("PETG", "PLA", "ABS", "ASA", "TPU", "PA", "PC", "PVA", "HIPS")
+# A legacy marker was written immediately before a physical start. Do not reinterpret it
+# as stale residue during the same startup uncertainty window used by the assignment
+# tracker, and do not let report + heartbeat in one loop count as two observations.
+LEGACY_MARKER_MIN_AGE_SECONDS = ASSIGNMENT_STARTUP_GRACE_SECONDS
+LEGACY_READY_OBSERVATION_MIN_GAP_SECONDS = 5.0
+LEGACY_READY_OBSERVATION_LIMIT = 256
+
+
+class _LegacyMarkerReadiness:
+    """Bound, resettable evidence for clearing one ambiguous pre-plate marker."""
+
+    def __init__(
+        self,
+        monotonic=time.monotonic,
+        min_gap_seconds=LEGACY_READY_OBSERVATION_MIN_GAP_SECONDS,
+        max_entries=LEGACY_READY_OBSERVATION_LIMIT,
+    ):
+        self._monotonic = monotonic
+        self._min_gap = max(0.0, float(min_gap_seconds))
+        self._max_entries = max(1, int(max_entries))
+        self._observations = OrderedDict()
+
+    def __len__(self):
+        return len(self._observations)
+
+    def reset(self, key) -> None:
+        self._observations.pop(key, None)
+
+    def retain(self, keys) -> None:
+        keep = set(keys)
+        for key in list(self._observations):
+            if key not in keep:
+                self.reset(key)
+
+    def observe(self, key, marker_identity, ready: bool) -> bool:
+        """Return true only on a second ready observation of the same old marker."""
+        if not ready:
+            self.reset(key)
+            return False
+        now = float(self._monotonic())
+        previous = self._observations.get(key)
+        if previous is not None:
+            previous_identity, first_ready_at = previous
+            if marker_identity == previous_identity and now >= first_ready_at:
+                if now - first_ready_at >= self._min_gap:
+                    self.reset(key)
+                    return True
+                self._observations.move_to_end(key)
+                return False
+        self._observations[key] = (marker_identity, now)
+        self._observations.move_to_end(key)
+        while len(self._observations) > self._max_entries:
+            self._observations.popitem(last=False)
+        return False
 
 
 def _filament_family(value) -> Optional[str]:
@@ -149,6 +205,7 @@ def main(config_path: str = "config.toml") -> None:
     last_heartbeat = 0.0
     started_sends = set()
     applied_controls = set()
+    legacy_marker_readiness = _LegacyMarkerReadiness()
     spool_dir = cfg.printhost.spool_dir if cfg.printhost else "/tmp/printforce-spool"
     os.makedirs(spool_dir, exist_ok=True)
     logger.info("Reporting every %ss; heartbeat every %ss; a printer that says nothing "
@@ -161,7 +218,16 @@ def main(config_path: str = "config.toml") -> None:
         update_restart_lock.acquire()
         try:
             reports = fleet.snapshot()
-            response = dpf.report_state(reports, link=updater.metadata())
+            wire_reports = (
+                router.annotate_reports(reports)
+                if router is not None
+                else [
+                    {**report, "assignment_observed_active": False}
+                    for report in reports
+                    if isinstance(report, dict)
+                ]
+            )
+            response = dpf.report_state(wire_reports, link=updater.metadata())
             if response:
                 updater.confirm_running()
             force_update = updater.apply_cloud_command(
@@ -176,7 +242,7 @@ def main(config_path: str = "config.toml") -> None:
             scan_requested = bool(response.get("scan_requested")) if isinstance(response, dict) else False
             _apply_desired(
                 desired or [], fleet, dpf, spool_dir, started_sends, applied_controls,
-                router=router,
+                router=router, legacy_marker_readiness=legacy_marker_readiness,
             )
 
             # Drain queued uploads onto idle, color-matched printers, matching on THIS
@@ -224,6 +290,7 @@ def main(config_path: str = "config.toml") -> None:
                 _apply_desired(
                     heartbeat_desired or [], fleet, dpf, spool_dir, started_sends,
                     applied_controls, router=router,
+                    legacy_marker_readiness=legacy_marker_readiness,
                 )
                 last_heartbeat = now
         except Exception:
@@ -240,11 +307,13 @@ _CONTROL_ACTIONS = frozenset({"pause", "resume", "stop"})
 
 
 def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
-                   started_sends, applied_controls, router=None) -> None:
+                   started_sends, applied_controls, router=None,
+                   legacy_marker_readiness=None) -> None:
     """Apply control then cloud sends from one desired-state payload."""
     _handle_desired(desired, fleet, applied_controls, spool_dir, router=router)
     _handle_cloud_sends(
         desired, fleet, dpf, spool_dir, started_sends, router=router,
+        legacy_marker_readiness=legacy_marker_readiness,
     )
 
 
@@ -264,12 +333,16 @@ def _row_has_stop(row: dict) -> bool:
     return control is not None and control["action"] == "stop"
 
 
-def _desired_allows_send(desired: List[Dict], bambu_id: str, batch_id: str) -> bool:
+def _desired_allows_send(desired: List[Dict], bambu_id: str, batch_id: str,
+                         plate_index: int = 1, item_id=None) -> bool:
     """True only when a fresh desired-state still authorizes this exact send."""
-    return _authorized_send(desired, bambu_id, batch_id) is not None
+    return _authorized_send(
+        desired, bambu_id, batch_id, plate_index=plate_index, item_id=item_id,
+    ) is not None
 
 
-def _authorized_send(desired: List[Dict], bambu_id: str, batch_id: str) -> Optional[dict]:
+def _authorized_send(desired: List[Dict], bambu_id: str, batch_id: str,
+                     plate_index: int = 1, item_id=None) -> Optional[dict]:
     """Return the fresh exact send command, or None when authorization changed."""
     for row in desired:
         if not isinstance(row, dict) or str(row.get("bambu_id") or "") != str(bambu_id):
@@ -277,7 +350,13 @@ def _authorized_send(desired: List[Dict], bambu_id: str, batch_id: str) -> Optio
         if _row_has_stop(row) or str(row.get("desired_status") or "IDLE") != "IDLE":
             return None
         send = row.get("send")
-        if isinstance(send, dict) and str(send.get("batch_id") or "") == str(batch_id):
+        fresh_item_id = send.get("item_id") if isinstance(send, dict) else None
+        if (
+            isinstance(send, dict)
+            and str(send.get("batch_id") or "") == str(batch_id)
+            and int(send.get("plate_index") or 1) == int(plate_index)
+            and (not item_id or not fresh_item_id or str(fresh_item_id) == str(item_id))
+        ):
             return send
         return None
     return None
@@ -354,7 +433,9 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
 
 
 def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
-                       started_sends=None, router=None) -> None:
+                       started_sends=None, router=None,
+                       legacy_marker_readiness=None,
+                       wall_time=time.time) -> None:
     """Start a print only when the cloud Sliced Queue says so.
 
     A send that already physically started is only re-reported — never started twice
@@ -363,7 +444,10 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
     import os
     if started_sends is None:
         started_sends = set()
+    if legacy_marker_readiness is None:
+        legacy_marker_readiness = _LegacyMarkerReadiness()
     live = set()
+    pending_legacy_markers = set()
     seen_serials = {
         str(row.get("bambu_id"))
         for row in desired
@@ -381,12 +465,72 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         plate_index = int(send.get("plate_index") or 1)
         if not bambu_id or not batch_id:
             continue
-        key = (str(batch_id), str(bambu_id))
+        key = (str(batch_id), str(bambu_id), plate_index)
         live.add(key)
         dest = os.path.join(spool_dir, f"{batch_id}.3mf")
-        started_path = dest + ".started"
-        if key in started_sends or os.path.exists(started_path):
+        started_path = _cloud_send_started_path(spool_dir, key)
+        legacy_started_path = dest + ".started"
+        assignment_matches = _router_assignment_matches(router, key)
+        if os.path.exists(legacy_started_path):
+            migration_key = _router_assignment_key_for_batch(router, str(batch_id))
+            try:
+                if migration_key is not None:
+                    migration_path = _cloud_send_started_path(spool_dir, migration_key)
+                    if os.path.exists(migration_path):
+                        os.unlink(legacy_started_path)
+                    else:
+                        os.replace(legacy_started_path, migration_path)
+            except OSError:
+                pass
+            if os.path.exists(legacy_started_path) and not os.path.exists(started_path):
+                pending_legacy_markers.add(key)
+                live_snapshot = (
+                    _live_snapshot(fleet, str(bambu_id))
+                    if migration_key is None
+                    else None
+                )
+                try:
+                    marker_stat = os.stat(legacy_started_path)
+                    marker_age = float(wall_time()) - marker_stat.st_mtime
+                    marker_identity = (
+                        getattr(marker_stat, "st_mtime_ns", marker_stat.st_mtime),
+                        getattr(marker_stat, "st_ctime_ns", marker_stat.st_ctime),
+                    )
+                except (OSError, TypeError, ValueError):
+                    marker_age = -1.0
+                    marker_identity = None
+                ready_observation = (
+                    migration_key is None
+                    and marker_identity is not None
+                    and marker_age >= LEGACY_MARKER_MIN_AGE_SECONDS
+                    and _legacy_marker_snapshot_allows_start(live_snapshot)
+                )
+                if legacy_marker_readiness.observe(
+                    key, marker_identity, ready_observation,
+                ):
+                    try:
+                        os.unlink(legacy_started_path)
+                    except OSError:
+                        logger.warning(
+                            "cloud send %s: could not clear safe legacy start marker; "
+                            "not starting",
+                            batch_id,
+                        )
+                        continue
+            else:
+                legacy_marker_readiness.reset(key)
+            if os.path.exists(legacy_started_path):
+                logger.warning(
+                    "cloud send %s: legacy start marker is ambiguous and live "
+                    "snapshot does not prove the printer is physically idle; "
+                    "not starting",
+                    batch_id,
+                )
+                continue
+        if key in started_sends or os.path.exists(started_path) or assignment_matches:
             started_sends.add(key)
+            if router is not None and not assignment_matches:
+                router.record_assignment(str(bambu_id), str(batch_id), plate_index)
             dpf.report_dispatched(batch_id, bambu_id)
             continue
         if _row_has_stop(row):
@@ -425,7 +569,13 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             uploaded = fleet.upload(bambu_id, dest, remote_name=remote_name)
             latest = dpf.heartbeat() if hasattr(dpf, "heartbeat") else {}
             latest_rows = latest.get("printers") if isinstance(latest, dict) else None
-            fresh_send = _authorized_send(latest_rows or [], bambu_id, batch_id)
+            fresh_send = _authorized_send(
+                latest_rows or [],
+                bambu_id,
+                batch_id,
+                plate_index=plate_index,
+                item_id=send.get("item_id"),
+            )
             if fresh_send is None:
                 logger.warning(
                     "cloud send %s: fresh desired-state no longer authorizes start; "
@@ -463,14 +613,95 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         else:
             logger.warning("printer %s did not start batch %s", bambu_id, batch_id)
     for key in list(started_sends):
-        _batch_id, bambu_id = key
+        _batch_id, bambu_id, _plate_index = key
         if bambu_id in seen_serials and key not in live:
             started_sends.discard(key)
-            leftover = os.path.join(spool_dir, f"{_batch_id}.3mf.started")
+            leftover = _cloud_send_started_path(spool_dir, key)
             try:
                 os.unlink(leftover)
             except OSError:
                 pass
+    _cleanup_orphaned_cloud_send_markers(spool_dir, live, seen_serials)
+    legacy_marker_readiness.retain(pending_legacy_markers)
+
+
+def _cloud_send_started_path(spool_dir: str, key) -> str:
+    batch_id, bambu_id, plate_index = key
+    safe_batch = re.sub(r"[^A-Za-z0-9._-]", "_", str(batch_id))[:128] or "batch"
+    safe_printer = re.sub(r"[^A-Za-z0-9._-]", "_", str(bambu_id))[:128] or "printer"
+    return os.path.join(
+        spool_dir,
+        f"cloud-send-{safe_batch}-{safe_printer}-plate-{int(plate_index)}.started",
+    )
+
+
+def _router_assignment_matches(router, key) -> bool:
+    if router is None or not callable(getattr(router, "assignments_snapshot", None)):
+        return False
+    batch_id, bambu_id, plate_index = key
+    assignment = router.assignments_snapshot().get(bambu_id)
+    if not isinstance(assignment, dict):
+        return False
+    try:
+        assigned_plate = int(assignment.get("plate_number") or 1)
+    except (TypeError, ValueError):
+        return False
+    return (
+        str(assignment.get("batch_id") or "") == batch_id
+        and assigned_plate == plate_index
+    )
+
+
+def _router_assignment_key_for_batch(router, batch_id: str):
+    if router is None or not callable(getattr(router, "assignments_snapshot", None)):
+        return None
+    matches = []
+    for bambu_id, assignment in router.assignments_snapshot().items():
+        if (
+            not isinstance(assignment, dict)
+            or str(assignment.get("batch_id") or "") != batch_id
+        ):
+            continue
+        try:
+            plate_index = int(assignment.get("plate_number") or 1)
+        except (TypeError, ValueError):
+            continue
+        matches.append((batch_id, str(bambu_id), plate_index))
+    return matches[0] if len(matches) == 1 else None
+
+
+def _cleanup_orphaned_cloud_send_markers(spool_dir: str, live, seen_serials) -> None:
+    """Remove durable markers only for printers covered by this desired-state."""
+    if not seen_serials:
+        return
+    live_paths = {
+        os.path.abspath(_cloud_send_started_path(spool_dir, key))
+        for key in live
+    }
+    printer_suffixes = {
+        f"-{re.sub(r'[^A-Za-z0-9._-]', '_', serial)[:128] or 'printer'}-plate-"
+        for serial in seen_serials
+    }
+    try:
+        entries = list(os.scandir(spool_dir))
+    except OSError:
+        return
+    for entry in entries:
+        name = entry.name
+        if (
+            not name.startswith("cloud-send-")
+            or not name.endswith(".started")
+            or os.path.abspath(entry.path) in live_paths
+            or not any(
+                re.search(re.escape(suffix) + r"\d+\.started\Z", name)
+                for suffix in printer_suffixes
+            )
+        ):
+            continue
+        try:
+            os.unlink(entry.path)
+        except OSError:
+            pass
 
 
 def _cloud_remote_name(send: dict):
@@ -585,6 +816,34 @@ def _live_snapshot(fleet, bambu_id: str):
     except Exception:
         return {}
     return snap if isinstance(snap, dict) else {}
+
+
+def _strict_zero(value) -> bool:
+    return (
+        not isinstance(value, bool)
+        and isinstance(value, (int, float))
+        and value == 0
+    )
+
+
+def _legacy_marker_snapshot_allows_start(snapshot) -> bool:
+    """True only for fresh live proof that no physical print can be in progress."""
+    if not isinstance(snapshot, dict):
+        return False
+    status = snapshot.get("status")
+    if status in ("PRINTING", "PAUSED", "NEEDS_CLEARING", "OFFLINE"):
+        return False
+    if status != "IDLE" and snapshot.get("historical_failed_ready") is not True:
+        return False
+    return (
+        snapshot.get("has_active_file") is False
+        and snapshot.get("has_active_task") is False
+        and snapshot.get("has_active_project") is False
+        and _strict_zero(snapshot.get("progress_percent"))
+        and _strict_zero(snapshot.get("nozzle_target_temper"))
+        and _strict_zero(snapshot.get("bed_target_temper"))
+        and snapshot.get("hms_empty") is True
+    )
 
 
 def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[list]:

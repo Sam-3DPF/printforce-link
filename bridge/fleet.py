@@ -157,6 +157,9 @@ class Fleet:
                 "bed_target_temper", "chamber_temper", "gcode_file", "subtask_name",
                 "nozzle_diameter", "stage", "tray_exist_bits",
                 "hms_severity", "hms_code", "hms_count", "print_error",
+                "gcode_state", "hms_present", "hms_empty",
+                "has_active_file", "has_active_task", "has_active_project",
+                "stage_queue_empty", "print_type", "historical_failed_ready",
 
                 "print_duration_seconds": int | None,
                 "print_duration_source": "bridge" | "printer" | None,

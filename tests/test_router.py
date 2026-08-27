@@ -8,7 +8,15 @@ failure paths are all proven without a real printer or network.
 """
 import json
 
-from bridge.router import Router, Job, Dispatcher, QUEUED, UNRESOLVED, DISPATCHED
+from bridge.router import (
+    ASSIGNMENT_STARTUP_GRACE_SECONDS,
+    DISPATCHED,
+    QUEUED,
+    UNRESOLVED,
+    Dispatcher,
+    Job,
+    Router,
+)
 
 
 def test_enqueue_persists_and_survives_restart(tmp_path):
@@ -205,13 +213,13 @@ def test_failed_report_keeps_job_dispatched_then_retries_until_acked(tmp_path):
 
 # --- U11: completion / failure detection + durable report --------------------
 
-def _dispatch_one(tmp_path, dpf=None):
+def _dispatch_one(tmp_path, dpf=None, *, started_at=None):
     """Record a cloud-started print on P1. Local drain no longer starts jobs."""
     r = _router_with_job(tmp_path)
     job = r.pending()[0]
     r.mark_resolved(job.id, "B1", ["#FF6A13"])
     r.mark_dispatched(job.id, "P1")
-    r.record_assignment("P1", "B1")
+    r.record_assignment("P1", "B1", started_at=started_at)
     dpf = dpf or _FakeDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}})
     assert r.assignments_snapshot()["P1"]["batch_id"] == "B1"
     return r, dpf
@@ -220,7 +228,8 @@ def _dispatch_one(tmp_path, dpf=None):
 def test_finished_print_reports_complete_and_clears_assignment(tmp_path):
     r, dpf = _dispatch_one(tmp_path)
     d = Dispatcher(r, _FakeFleet(), dpf)
-    # The printer that was PRINTING now reports NEEDS_CLEARING (Bambu FINISH).
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
+    # Active evidence belongs to this assignment; its later FINISH is safe.
     d.drain([_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])])
     assert dpf.completed == [("B1", None)]
     assert dpf.failed == []
@@ -230,10 +239,175 @@ def test_finished_print_reports_complete_and_clears_assignment(tmp_path):
 def test_failed_print_reports_failed_and_clears_assignment(tmp_path):
     r, dpf = _dispatch_one(tmp_path)
     d = Dispatcher(r, _FakeFleet(), dpf)
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
     d.drain([_snap("P1", "ERROR", [(1, "FF6A13FF")])])
     assert dpf.failed == [("B1", None)]
     assert dpf.completed == []
     assert "P1" not in r.assignments_snapshot()
+
+
+def test_historical_failed_signal_does_not_suppress_an_assigned_batch_failure(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
+    snap = _snap("P1", "ERROR", [(1, "FF6A13FF")])
+    snap["historical_failed_ready"] = True
+
+    d.drain([snap])
+
+    assert dpf.failed == [("B1", None)]
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_same_pass_start_ignores_old_error_snapshot(tmp_path):
+    r, dpf = _dispatch_one(tmp_path, started_at=100.0)
+    d = Dispatcher(r, _FakeFleet(), dpf, now_fn=lambda: 100.0)
+
+    d.drain([_snap("P1", "ERROR", [(1, "FF6A13FF")])])
+
+    assignment = r.assignments_snapshot()["P1"]
+    assert assignment["observed_active"] is False
+    assert assignment["started_at"] == 100.0
+    assert assignment["terminal"] is None
+    assert dpf.failed == []
+
+
+def test_no_active_persistent_error_fails_after_startup_grace_and_restart(tmp_path):
+    path = str(tmp_path / "queue.json")
+    r, dpf = _dispatch_one(tmp_path, started_at=100.0)
+    error = [_snap("P1", "ERROR", [(1, "FF6A13FF")])]
+
+    before_grace = 100.0 + ASSIGNMENT_STARTUP_GRACE_SECONDS - 1
+    Dispatcher(r, _FakeFleet(), dpf, now_fn=lambda: before_grace).drain(error)
+    assert dpf.failed == []
+    assert r.assignments_snapshot()["P1"]["terminal"] is None
+
+    restarted = Router(path)
+    assignment = restarted.assignments_snapshot()["P1"]
+    assert assignment["started_at"] == 100.0
+    assert assignment["observed_active"] is False
+    grace_end = 100.0 + ASSIGNMENT_STARTUP_GRACE_SECONDS
+    Dispatcher(restarted, _FakeFleet(), dpf, now_fn=lambda: grace_end).drain(error)
+
+    assert dpf.failed == [("B1", None)]
+    assert "P1" not in restarted.assignments_snapshot()
+
+
+def test_observed_active_survives_restart_then_real_error_fails(tmp_path):
+    path = str(tmp_path / "queue.json")
+    r, dpf = _dispatch_one(tmp_path, started_at=100.0)
+    Dispatcher(r, _FakeFleet(), dpf, now_fn=lambda: 101.0).drain([
+        _snap("P1", "PAUSED", [(1, "FF6A13FF")]),
+    ])
+
+    restarted = Router(path)
+    assignment = restarted.assignments_snapshot()["P1"]
+    assert assignment["started_at"] == 100.0
+    assert assignment["observed_active"] is True
+    Dispatcher(restarted, _FakeFleet(), dpf, now_fn=lambda: 102.0).drain([
+        _snap("P1", "ERROR", [(1, "FF6A13FF")]),
+    ])
+
+    assert dpf.failed == [("B1", None)]
+    assert "P1" not in restarted.assignments_snapshot()
+
+
+def test_prestart_finish_ignored_during_grace_then_active_finish_completes(tmp_path):
+    r, dpf = _dispatch_one(tmp_path, started_at=100.0)
+    d = Dispatcher(
+        r, _FakeFleet(), dpf,
+        now_fn=lambda: 100.0 + ASSIGNMENT_STARTUP_GRACE_SECONDS - 1,
+    )
+    finished = [_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])]
+
+    d.drain(finished)
+    assert dpf.completed == []
+    assert "P1" in r.assignments_snapshot()
+
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
+    d.drain(finished)
+    assert dpf.completed == [("B1", None)]
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_pre_active_finish_after_startup_grace_reports_failed_not_complete(tmp_path):
+    r, dpf = _dispatch_one(tmp_path, started_at=100.0)
+    d = Dispatcher(
+        r, _FakeFleet(), dpf,
+        now_fn=lambda: 100.0 + ASSIGNMENT_STARTUP_GRACE_SECONDS,
+    )
+
+    d.drain([_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])])
+
+    assert dpf.completed == []
+    assert dpf.failed == [("B1", None)]
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_legacy_assignment_is_normalized_as_active_and_can_report_finish(tmp_path):
+    path = str(tmp_path / "queue.json")
+    with open(path + ".assignments", "w") as handle:
+        json.dump({
+            "P1": {
+                "batch_id": "B1",
+                "plate_number": 2,
+                "terminal": None,
+            },
+        }, handle)
+
+    r = Router(path)
+    assignment = r.assignments_snapshot()["P1"]
+    assert assignment["started_at"] == 0.0
+    assert assignment["observed_active"] is True
+    with open(path + ".assignments") as handle:
+        assert json.load(handle)["P1"] == assignment
+
+    dpf = _FakeDpf({})
+    Dispatcher(r, _FakeFleet(), dpf).drain([
+        _snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")]),
+    ])
+
+    assert dpf.completed == [("B1", 2)]
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_assignment_proof_annotation_is_strict_and_precedes_current_pass(tmp_path):
+    r, _dpf = _dispatch_one(tmp_path, started_at=100.0)
+    printing = _snap("P1", "PRINTING", [(1, "FF6A13FF")])
+
+    first = r.annotate_reports([printing])
+    assert first[0]["assignment_observed_active"] is False
+
+    Dispatcher(r, _FakeFleet(), _FakeDpf({}), now_fn=lambda: 101.0).drain([printing])
+    second = r.annotate_reports([{
+        **printing,
+        "assignment_observed_active": "hostile-overwrite",
+    }])
+    assert second[0]["assignment_observed_active"] is True
+
+    unassigned = r.annotate_reports([_snap("P2", "IDLE", [])])
+    assert unassigned[0]["assignment_observed_active"] is False
+
+
+def test_non_boolean_assignment_proof_is_normalized_false_and_persisted(tmp_path):
+    path = str(tmp_path / "queue.json")
+    with open(path + ".assignments", "w") as handle:
+        json.dump({
+            "P1": {
+                "batch_id": "B1",
+                "plate_number": None,
+                "terminal": None,
+                "started_at": 100.0,
+                "observed_active": "true",
+            },
+        }, handle)
+
+    assignment = Router(path).assignments_snapshot()["P1"]
+
+    assert assignment["observed_active"] is False
+    with open(path + ".assignments") as handle:
+        assert json.load(handle)["P1"]["observed_active"] is False
 
 
 def test_still_printing_does_not_report(tmp_path):
@@ -248,6 +422,7 @@ def test_completion_reported_exactly_once_across_passes(tmp_path):
     r, dpf = _dispatch_one(tmp_path)
     d = Dispatcher(r, _FakeFleet(), dpf)
     finished = [_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])]
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
     d.drain(finished)                 # reports + clears
     d.drain(finished)                 # assignment gone -> no second report
     assert dpf.completed == [("B1", None)]
@@ -273,6 +448,7 @@ def test_failed_completion_report_is_retried_until_acked(tmp_path):
     d = Dispatcher(r, _FakeFleet(), dpf)
     finished = [_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])]
 
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
     d.drain(finished)                 # terminal latched, report FAILS -> stays owed
     assert r.assignments_snapshot()["P1"]["terminal"] == "complete"
     d.drain(finished)                 # retried, now acks -> cleared
@@ -289,6 +465,9 @@ def test_assignment_and_latch_survive_a_restart(tmp_path):
     r.record_assignment("P1", "B1")
     dpf = _CompleteFailsOnceDpf({"batch-a": {"batch_id": "B1", "required_colors": ["#FF6A13"]}},
                                 fail_completes=1)
+    Dispatcher(r, _FakeFleet(), dpf).drain([
+        _snap("P1", "PRINTING", [(1, "FF6A13FF")]),
+    ])
     # Print finishes, but the completion report fails this pass -> latched, persisted.
     Dispatcher(r, _FakeFleet(), dpf).drain([_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])])
     assert r.assignments_snapshot()["P1"]["terminal"] == "complete"
@@ -330,6 +509,7 @@ def test_printer_owing_a_completion_report_is_not_re_dispatched(tmp_path):
     # The printer finished (NEEDS_CLEARING) and the operator cleared it (desired IDLE), but
     # its completion report is still owed -> it must not be re-dispatched.
     finished = [_snap("P1", "NEEDS_CLEARING", [(1, "FF6A13FF")])]
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
     fleet_calls_before = len(d._fleet.calls)
     d.drain(finished, desired=[{"bambu_id": "P1", "desired_status": "IDLE"}])
     assert len(d._fleet.calls) == fleet_calls_before   # NOT re-dispatched while owed
@@ -339,6 +519,7 @@ def test_printer_owing_a_completion_report_is_not_re_dispatched(tmp_path):
 def test_cancel_failed_print_error_does_not_report_failed(tmp_path):
     r, dpf = _dispatch_one(tmp_path)
     d = Dispatcher(r, _FakeFleet(), dpf)
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
     snap = _snap("P1", "ERROR", [(1, "FF6A13FF")])
     snap["print_error"] = "50348044"
     d.drain([snap])
@@ -350,6 +531,7 @@ def test_cancel_failed_print_error_does_not_report_failed(tmp_path):
 def test_cancel_failed_hms_does_not_report_failed(tmp_path):
     r, dpf = _dispatch_one(tmp_path)
     d = Dispatcher(r, _FakeFleet(), dpf)
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
     snap = _snap("P1", "ERROR", [(1, "FF6A13FF")])
     snap["hms_code"] = "0300_400C_0000_0000"
     d.drain([snap])
@@ -360,10 +542,28 @@ def test_cancel_failed_hms_does_not_report_failed(tmp_path):
 def test_cancel_failed_idle_snapshot_clears_assignment_without_failure(tmp_path):
     r, dpf = _dispatch_one(tmp_path)
     d = Dispatcher(r, _FakeFleet(), dpf)
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
     snap = _snap("P1", "IDLE", [(1, "FF6A13FF")])
     snap["print_error"] = "50348044"
     d.drain([snap])
     assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
+def test_pre_active_cancel_after_startup_grace_reports_failed_not_requeue(tmp_path):
+    r, dpf = _dispatch_one(tmp_path, started_at=100.0)
+    now = [100.0 + ASSIGNMENT_STARTUP_GRACE_SECONDS - 1]
+    d = Dispatcher(r, _FakeFleet(), dpf, now_fn=lambda: now[0])
+    snap = _snap("P1", "IDLE", [(1, "FF6A13FF")])
+    snap["print_error"] = "50348044"
+
+    d.drain([snap])
+    assert "P1" in r.assignments_snapshot()
+
+    now[0] = 100.0 + ASSIGNMENT_STARTUP_GRACE_SECONDS
+    d.drain([snap])
+    assert dpf.failed == [("B1", None)]
     assert dpf.completed == []
     assert "P1" not in r.assignments_snapshot()
 

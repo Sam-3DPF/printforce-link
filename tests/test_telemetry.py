@@ -8,6 +8,8 @@ only ever touches its client through `mqtt_dump()`, so a fake stands in for it.
 import logging
 import sys
 
+import pytest
+
 from bridge.config import PrinterConfig
 from bridge.printer import (
     _DEFAULT_STALE_AFTER_SECONDS,
@@ -182,6 +184,15 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "hms_code": None,
         "hms_count": 0,
         "print_error": None,
+        "gcode_state": "RUNNING",
+        "hms_present": True,
+        "hms_empty": True,
+        "has_active_file": True,
+        "has_active_task": False,
+        "has_active_project": False,
+        "stage_queue_empty": None,
+        "print_type": None,
+        "historical_failed_ready": False,
         "print_duration_seconds": None,
         "print_duration_source": None,
     }
@@ -220,6 +231,125 @@ def test_real_failed_snapshot_stays_error():
     }]).snapshot()
     assert snapshot["status"] == "ERROR"
     assert snapshot["print_error"] == "12345"
+
+
+_P1S_10_HISTORICAL_FAILED = {
+    "print": {
+        "gcode_state": "FAILED",
+        "print_error": 0,
+        "hms": [],
+        "gcode_file": "",
+        "subtask_name": "",
+        "subtask_id": "0",
+        "task_id": "0",
+        "project_id": "0",
+        "mc_percent": 0,
+        "nozzle_target_temper": 0,
+        "bed_target_temper": 0,
+        "stg": [],
+        "print_type": "idle",
+        # These fields remain sticky after an old print and are deliberately ignored.
+        "stg_cur": 255,
+        "layer_num": 147,
+        "total_layer_num": 147,
+        "mc_remaining_time": 23,
+    },
+}
+
+
+def _historical_failed_observation(sequence_id, **print_overrides):
+    payload = {
+        "sequence_id": sequence_id,
+        "print": dict(_P1S_10_HISTORICAL_FAILED["print"]),
+    }
+    payload["print"].update(print_overrides)
+    return payload
+
+
+def test_p1s_10_historical_failed_requires_two_consecutive_fresh_observations():
+    printer = _printer([
+        _historical_failed_observation("first"),
+        _historical_failed_observation("second"),
+    ])
+
+    first = printer.snapshot()
+    second = printer.snapshot()
+
+    assert first["status"] == second["status"] == "ERROR"
+    assert first["historical_failed_ready"] is False
+    assert second["historical_failed_ready"] is True
+    assert second["gcode_state"] == "FAILED"
+    assert second["hms_present"] is True
+    assert second["hms_empty"] is True
+    assert second["has_active_file"] is False
+    assert second["has_active_task"] is False
+    assert second["has_active_project"] is False
+    assert second["stage_queue_empty"] is True
+    assert second["print_type"] == "idle"
+
+
+def test_historical_failed_allows_absent_zero_error_and_empty_print_type():
+    first = _historical_failed_observation("first", print_type="")
+    second = _historical_failed_observation("second", print_type="")
+    del first["print"]["print_error"]
+    del second["print"]["print_error"]
+    printer = _printer([first, second])
+
+    assert printer.snapshot()["historical_failed_ready"] is False
+    assert printer.snapshot()["historical_failed_ready"] is True
+
+
+def test_raw_readiness_labels_and_error_code_are_safely_bounded():
+    telemetry = parse_telemetry({"print": {
+        "gcode_state": "failed-" + ("x" * 100),
+        "print_error": "e" * 100,
+        "print_type": "mode-" + ("y" * 100),
+    }})
+
+    assert len(telemetry["gcode_state"]) == 64
+    assert len(telemetry["print_error"]) == 64
+    assert len(telemetry["print_type"]) == 64
+
+
+@pytest.mark.parametrize("disqualifier", [
+    {"hms": [{"attr": 1, "code": 1}]},
+    {"print_error": 12345},
+    {"gcode_file": "Metadata/plate_1.gcode"},
+    {"task_id": "task-1"},
+    {"project_id": "project-1"},
+    {"mc_percent": 1},
+    {"nozzle_target_temper": 220},
+    {"bed_target_temper": 60},
+    {"stg": [1]},
+    {"print_type": "normal"},
+])
+def test_historical_failed_disqualifier_resets_the_fresh_streak(disqualifier):
+    printer = _printer([
+        _historical_failed_observation("first"),
+        _historical_failed_observation("disqualified", **disqualifier),
+        _historical_failed_observation("restart-one"),
+        _historical_failed_observation("restart-two"),
+    ])
+
+    assert printer.snapshot()["historical_failed_ready"] is False
+    assert printer.snapshot()["historical_failed_ready"] is False
+    assert printer.snapshot()["historical_failed_ready"] is False
+    assert printer.snapshot()["historical_failed_ready"] is True
+
+
+def test_duplicate_historical_failed_payload_resets_the_fresh_streak():
+    first = _historical_failed_observation("same")
+    printer = _printer([
+        first,
+        first,
+        _historical_failed_observation("fresh-after-duplicate"),
+        _historical_failed_observation("second-fresh-after-duplicate"),
+    ])
+
+    assert printer.snapshot()["historical_failed_ready"] is False
+    assert printer.snapshot()["historical_failed_ready"] is False
+    assert printer.snapshot()["historical_failed_ready"] is False
+    assert printer.snapshot()["historical_failed_ready"] is True
 
 
 def test_stage_says_why_a_print_paused():
@@ -697,6 +827,21 @@ def test_a_printer_that_dies_mid_print_goes_offline_not_printing_forever():
     assert snapshot["progress_percent"] is None            # not a frozen 47%
     assert snapshot["nozzle_temper"] is None               # not a frozen 220°C
     assert snapshot["slots"] == []                         # not a colour it no longer holds
+
+
+def test_stale_historical_failed_payload_never_becomes_ready():
+    clock = FakeClock()
+    printer = _printer(
+        [_historical_failed_observation("first")],
+        monotonic=clock.now,
+    )
+    assert printer.snapshot()["historical_failed_ready"] is False
+
+    clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    stale = printer.snapshot()
+
+    assert stale["status"] == "OFFLINE"
+    assert stale["historical_failed_ready"] is False
 
 
 def test_a_frozen_idle_printer_reports_offline_and_never_idle():

@@ -70,10 +70,12 @@ def test_reconnect_clears_cached_payload_and_freshness(fake_bl):
     p._cached = {"print": {"gcode_state": "RUNNING"}}
     p._last_raw = {"print": {}}
     p._last_fresh_monotonic = 123.0
+    p._historical_failed_streak = 1
     p.reconnect(new_ip="192.168.1.55")
     assert p._cached is None            # old address's state must not leak into the new one
     assert p._last_raw is None
     assert p._last_fresh_monotonic is None
+    assert p._historical_failed_streak == 0
 
 
 def test_disconnect_when_never_connected_is_safe(fake_bl):

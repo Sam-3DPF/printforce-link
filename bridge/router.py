@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import tempfile
 import threading
@@ -52,6 +53,10 @@ UNRESOLVED = "unresolved"
 # the job on physical start instead would strand the batch NEW-in-cloud forever if that
 # one POST failed (no filament deducted, order stuck, completion later rejected).
 DISPATCHED = "dispatched"
+
+# A start can succeed before the printer publishes its first state for the new job.
+# During this bounded window, a terminal snapshot may still describe the old print.
+ASSIGNMENT_STARTUP_GRACE_SECONDS = 60.0
 
 
 @dataclass
@@ -102,7 +107,8 @@ class Router:
         # prevents torn files, not racing writers).
         self._lock = threading.Lock()
         self.jobs: List[Job] = self._load()
-        # {bambu_id: {"batch_id", "plate_number", "terminal": None|"complete"|"failed"}}
+        # {bambu_id: {"batch_id", "plate_number", "terminal",
+        #             "started_at", "observed_active"}}
         self.assignments: dict = self._load_assignments()
 
     def enqueue(self, job: Job) -> Job:
@@ -156,15 +162,26 @@ class Router:
     # --- printer->batch assignments (U11 completion tracking) ----------------
 
     def record_assignment(self, bambu_id: str, batch_id: str,
-                          plate_number: Optional[int] = None) -> None:
+                          plate_number: Optional[int] = None,
+                          started_at: Optional[float] = None) -> None:
         """Remember that `batch_id` is now printing on `bambu_id`, so its completion can be
         reported after the job has left the queue. Recorded at physical start; persisted so
         a restart mid-print can still report the finish."""
         with self._lock:
             self.assignments[bambu_id] = {
                 "batch_id": batch_id, "plate_number": plate_number, "terminal": None,
+                "started_at": time.time() if started_at is None else float(started_at),
+                "observed_active": False,
             }
             self._persist_assignments()
+
+    def mark_assignment_active(self, bambu_id: str) -> None:
+        """Persist proof that this assignment reached PRINTING/PAUSED at least once."""
+        with self._lock:
+            assignment = self.assignments.get(bambu_id)
+            if assignment is not None and not assignment.get("observed_active"):
+                assignment["observed_active"] = True
+                self._persist_assignments()
 
     def set_assignment_terminal(self, bambu_id: str, kind: str) -> None:
         """Latch a printer's assignment as finished (`complete`) or failed (`failed`). Once
@@ -187,6 +204,28 @@ class Router:
         with self._lock:
             return {k: dict(v) for k, v in self.assignments.items()}
 
+    def annotate_reports(self, reports: List[Dict]) -> List[Dict]:
+        """Copy reports and attach persisted pre-report assignment proof.
+
+        The report-state POST happens before this pass's snapshots are drained, so this
+        value means the assignment had already reached PRINTING/PAUSED on an earlier pass.
+        Missing assignments are explicit False, keeping a newer backend safe during a
+        Link-first rolling release.
+        """
+        assignments = self.assignments_snapshot()
+        annotated = []
+        for report in reports if isinstance(reports, list) else []:
+            if not isinstance(report, dict):
+                continue
+            item = dict(report)
+            assignment = assignments.get(report.get("bambu_id"))
+            item["assignment_observed_active"] = (
+                isinstance(assignment, dict)
+                and assignment.get("observed_active") is True
+            )
+            annotated.append(item)
+        return annotated
+
     # --- persistence ---------------------------------------------------------
 
     def _load(self) -> List[Job]:
@@ -201,7 +240,34 @@ class Router:
 
     def _load_assignments(self) -> dict:
         raw = self._read_json(self.assignments_path, "printer assignments")
-        return raw if isinstance(raw, dict) else {}
+        if not isinstance(raw, dict):
+            return {}
+        changed = False
+        for bambu_id, assignment in list(raw.items()):
+            if not isinstance(bambu_id, str) or not bambu_id or not isinstance(assignment, dict):
+                del raw[bambu_id]
+                changed = True
+                continue
+            # Pre-grace assignments were also written only after a physical start.
+            # Preserve that proof when upgrading their persisted three-field shape.
+            if "started_at" not in assignment and "observed_active" not in assignment:
+                assignment["started_at"] = 0.0
+                assignment["observed_active"] = True
+                changed = True
+                continue
+            if not isinstance(assignment.get("observed_active"), bool):
+                assignment["observed_active"] = False
+                changed = True
+            try:
+                started_at = float(assignment.get("started_at"))
+            except (TypeError, ValueError):
+                started_at = float("nan")
+            if not math.isfinite(started_at) or started_at < 0:
+                assignment["started_at"] = time.time()
+                changed = True
+        if changed:
+            self._atomic_write(self.assignments_path, raw)
+        return raw
 
     @staticmethod
     def _read_json(path: str, label: str):
@@ -261,10 +327,11 @@ class Dispatcher:
     next reports IDLE.
     """
 
-    def __init__(self, router: Router, fleet, dpf):
+    def __init__(self, router: Router, fleet, dpf, now_fn=time.time):
         self._router = router
         self._fleet = fleet
         self._dpf = dpf
+        self._now = now_fn
         # Job ids we've already logged as "waiting for a color", so a job that waits hours
         # for a filament swap logs once, not an identical line every ~15s pass.
         self._waiting_logged: set = set()
@@ -395,25 +462,54 @@ class Dispatcher:
         terminal = assignment.get("terminal")
         if terminal is None:
             status = snap.get("status") if isinstance(snap, dict) else None
+            observed_active = assignment.get("observed_active") is True
+            if status in ("PRINTING", "PAUSED"):
+                if not observed_active:
+                    self._router.mark_assignment_active(bambu_id)
+                return
+            started_at = assignment.get("started_at")
+            try:
+                startup_age = max(0.0, self._now() - float(started_at))
+            except (TypeError, ValueError):
+                startup_age = 0.0
             # Cancel codes can linger in Bambu's merged MQTT payload after a new
             # print starts. They are terminal evidence only while the normalized
             # snapshot is IDLE/ERROR; never drop a live PRINTING assignment.
             cancel_terminal = (
                 status in ("IDLE", "ERROR") and is_cancel_failed_snapshot(snap)
             )
-            if stop_in_flight or cancel_terminal:
+            startup_grace_elapsed = (
+                startup_age >= ASSIGNMENT_STARTUP_GRACE_SECONDS
+            )
+            if stop_in_flight:
                 self._router.clear_assignment(bambu_id)
                 logger.info(
-                    "printer %s: stop or cancel-failed; not reporting failed or complete",
+                    "printer %s: explicit cloud stop; not reporting failed or complete",
                     bambu_id,
                 )
                 return
-            if status == "NEEDS_CLEARING":
-                terminal = "complete"
-            elif status == "ERROR":
+            if cancel_terminal:
+                if observed_active:
+                    self._router.clear_assignment(bambu_id)
+                    logger.info(
+                        "printer %s: active print cancelled; not reporting failed or complete",
+                        bambu_id,
+                    )
+                    return
+                if not startup_grace_elapsed:
+                    return
+                terminal = "failed"
+            elif status in ("NEEDS_CLEARING", "FINISH"):
+                if observed_active:
+                    terminal = "complete"
+                elif startup_grace_elapsed:
+                    terminal = "failed"
+                else:
+                    return
+            elif status == "ERROR" and (observed_active or startup_grace_elapsed):
                 terminal = "failed"
             else:
-                return  # still printing, or the printer is unreadable — not terminal yet
+                return  # pre-start terminal, idle, or unreadable — not terminal yet
             self._router.set_assignment_terminal(bambu_id, terminal)
 
         batch_id = assignment.get("batch_id")
