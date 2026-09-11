@@ -23,9 +23,6 @@ main() {
   warn() { printf '\033[1;33m!\033[0m %s\n' "$*"; }
   die()  { printf '\033[1;31mError:\033[0m %s\n' "$*" >&2; exit 1; }
 
-  # A running job must be stopped before we replace its binary. Doing it the
-  # other way around leaves launchd holding a dead job, and the next
-  # `bootstrap` fails with "Bootstrap failed: 5: Input/output error".
   stop_agent() {
     launchctl bootout "gui/$(id -u)/${LABEL}" 2>/dev/null || true
     if [ -f "$PLIST" ]; then
@@ -34,8 +31,6 @@ main() {
     sleep 1
   }
 
-  # Prefer bootstrap for a fresh job. On reinstall launchd often still has the
-  # label registered (error 5) — restart in place, then fall back to `load`.
   start_agent() {
     launchctl enable "gui/$(id -u)/${LABEL}" 2>/dev/null || true
     if launchctl bootstrap "gui/$(id -u)" "$PLIST" 2>/dev/null; then

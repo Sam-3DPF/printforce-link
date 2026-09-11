@@ -13,6 +13,8 @@ import httpx
 
 logger = logging.getLogger(__name__)
 
+REPAIR_RETRY_SECONDS = 60.0
+
 
 def exchange_pair_token(dpf_base_url: str, pair_token: str, timeout: float = 10.0) -> Optional[str]:
     """Trade a one-time pair token for a durable cloud token via
@@ -71,3 +73,35 @@ def repair(store, dpf_base_url: str, pair_token: str) -> Optional[str]:
     if token:
         store.set_cloud_token(token)
     return token
+
+
+def maybe_repair(
+    dpf,
+    store,
+    dpf_base_url: str,
+    pair_token: Optional[str],
+    hand_authored_token: Optional[str],
+    now: float,
+    last_repair_attempt: Optional[float],
+    min_interval: float = REPAIR_RETRY_SECONDS,
+) -> Optional[float]:
+    """Re-pair once per interval when the cloud rejected the stored token.
+
+    Returns the updated last-attempt time. Pairing-mode only: a hand-authored
+    config.toml token is left for the operator to fix. A missing pair token
+    cannot exchange, so the function is a no-op.
+    """
+    if not getattr(dpf, "unauthorized", False) or hand_authored_token or not pair_token:
+        return last_repair_attempt
+    if last_repair_attempt is not None and now - last_repair_attempt < min_interval:
+        return last_repair_attempt
+    new_token = repair(store, dpf_base_url, pair_token)
+    if new_token:
+        dpf.set_token(new_token)
+        logger.info("re-paired after a rejected credential; resuming")
+    else:
+        logger.error(
+            "credential rejected and re-pairing did not complete — the pair "
+            "code may be expired or already used. In 3DPF, click Disconnect, "
+            "then Get install command, and re-run the install command.")
+    return now

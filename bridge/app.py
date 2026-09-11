@@ -20,7 +20,7 @@ from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
 from .fleet import Fleet
-from .pairing import ensure_paired
+from .pairing import ensure_paired, maybe_repair
 from .reconciler import ConfigReconciler
 from .router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
 from .store import PrinterStore
@@ -203,6 +203,7 @@ def main(config_path: str = "config.toml") -> None:
                     len(router.pending()))
 
     last_heartbeat = 0.0
+    last_repair_attempt = None
     started_sends = set()
     applied_controls = set()
     legacy_marker_readiness = _LegacyMarkerReadiness()
@@ -228,6 +229,15 @@ def main(config_path: str = "config.toml") -> None:
                 ]
             )
             response = dpf.report_state(wire_reports, link=updater.metadata())
+            last_repair_attempt = maybe_repair(
+                dpf,
+                store,
+                cfg.dpf_base_url,
+                pair_token,
+                cfg.cloud_token,
+                time.monotonic(),
+                last_repair_attempt,
+            )
             if response:
                 updater.confirm_running()
             force_update = updater.apply_cloud_command(
