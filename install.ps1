@@ -34,6 +34,9 @@ function Install-PrintForceLink {
     if ($expected.ToLower() -ne $actual.ToLower()) { throw "The download didn't verify. Please run the command again." }
 
     Write-Host "==> Installing..." -ForegroundColor Cyan
+    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+      Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    }
     if (Test-Path (Join-Path $root "printforce-link")) { Remove-Item (Join-Path $root "printforce-link") -Recurse -Force }
     New-Item -ItemType Directory -Path $root -Force | Out-Null
     Expand-Archive -Path (Join-Path $tmp $asset) -DestinationPath $root -Force   # -> $root\printforce-link\
