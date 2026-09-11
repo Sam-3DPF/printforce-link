@@ -2,7 +2,13 @@
 import httpx
 
 import bridge.pairing as pairing_mod
-from bridge.pairing import ensure_paired, exchange_pair_token, repair
+from bridge.pairing import (
+    REPAIR_RETRY_SECONDS,
+    ensure_paired,
+    exchange_pair_token,
+    maybe_repair,
+    repair,
+)
 
 
 class FakeResp:
@@ -15,6 +21,16 @@ class FakeResp:
         if self._raise:
             raise ValueError("not json")
         return self._json
+
+
+class FakeDpf:
+    def __init__(self, unauthorized=False):
+        self.unauthorized = unauthorized
+        self.tokens = []
+
+    def set_token(self, token):
+        self.tokens.append(token)
+        self.unauthorized = False
 
 
 class FakeStore:
@@ -110,6 +126,70 @@ def test_repair_overwrites_the_revoked_token(monkeypatch):
     assert repair(store, "https://x", "FRESH-PAIR") == "NEW-CLOUD"
     assert store.get_cloud_token() == "NEW-CLOUD"
     assert store.saved == ["NEW-CLOUD"]
+
+
+def test_maybe_repair_exchanges_after_disconnect_and_swaps_the_live_token(monkeypatch):
+    monkeypatch.setattr(pairing_mod, "repair", lambda store, url, token: "NEW-CLOUD")
+    dpf = FakeDpf(unauthorized=True)
+    store = FakeStore(token="revoked-old")
+    attempted = maybe_repair(dpf, store, "https://dev.3dprintforce.com", "FRESH-PAIR", None, 100.0, None)
+    assert attempted == 100.0
+    assert dpf.tokens == ["NEW-CLOUD"]
+    assert dpf.unauthorized is False
+
+
+def test_maybe_repair_skips_a_valid_token(monkeypatch):
+    monkeypatch.setattr(pairing_mod, "repair", lambda *a, **k: (_ for _ in ()).throw(AssertionError("repair")))
+    dpf = FakeDpf(unauthorized=False)
+    assert maybe_repair(dpf, FakeStore(), "https://x", "PAIR", None, 10.0, None) is None
+    assert dpf.tokens == []
+
+
+def test_maybe_repair_needs_a_pair_token(monkeypatch):
+    monkeypatch.setattr(pairing_mod, "repair", lambda *a, **k: (_ for _ in ()).throw(AssertionError("repair")))
+    dpf = FakeDpf(unauthorized=True)
+    assert maybe_repair(dpf, FakeStore(), "https://x", None, None, 10.0, None) is None
+    assert dpf.tokens == []
+
+
+def test_maybe_repair_leaves_a_hand_authored_token_alone(monkeypatch):
+    monkeypatch.setattr(pairing_mod, "repair", lambda *a, **k: (_ for _ in ()).throw(AssertionError("repair")))
+    dpf = FakeDpf(unauthorized=True)
+    assert maybe_repair(dpf, FakeStore(), "https://x", "PAIR", "HAND-AUTHORED", 10.0, None) is None
+    assert dpf.tokens == []
+
+
+def test_maybe_repair_does_not_spam_exchange_inside_the_retry_window(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_repair(*a, **k):
+        calls["n"] += 1
+        return None
+
+    monkeypatch.setattr(pairing_mod, "repair", fake_repair)
+    dpf = FakeDpf(unauthorized=True)
+    first = maybe_repair(dpf, FakeStore(), "https://x", "PAIR", None, 10.0, None)
+    second = maybe_repair(dpf, FakeStore(), "https://x", "PAIR", None, 10.0 + REPAIR_RETRY_SECONDS - 1, first)
+    assert first == 10.0
+    assert second == first
+    assert calls["n"] == 1
+
+
+def test_maybe_repair_retries_after_the_window(monkeypatch):
+    calls = {"n": 0}
+
+    def fake_repair(*a, **k):
+        calls["n"] += 1
+        return "CLOUD-%d" % calls["n"]
+
+    monkeypatch.setattr(pairing_mod, "repair", fake_repair)
+    dpf = FakeDpf(unauthorized=True)
+    first = maybe_repair(dpf, FakeStore(), "https://x", "PAIR", None, 10.0, None)
+    dpf.unauthorized = True
+    second = maybe_repair(dpf, FakeStore(), "https://x", "PAIR", None, 10.0 + REPAIR_RETRY_SECONDS, first)
+    assert first == 10.0
+    assert second == 10.0 + REPAIR_RETRY_SECONDS
+    assert dpf.tokens == ["CLOUD-1", "CLOUD-2"]
 
 
 def test_repair_keeps_the_old_token_when_the_pair_code_is_dead(monkeypatch):
