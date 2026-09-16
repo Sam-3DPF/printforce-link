@@ -1,4 +1,12 @@
-from bridge.ams import merge_ams, parse_ams, parse_tray_exist_bits, normalize_hex
+from bridge.ams import (
+    ams_needs_pushall,
+    merge_ams,
+    parse_ams,
+    parse_tray_exist_bits,
+    normalize_hex,
+    load_remembered_ams,
+    save_remembered_ams,
+)
 
 
 # normalize_hex is a hand-kept copy of the cloud's canonical matcher; these cases are the
@@ -159,6 +167,29 @@ def test_merge_ams_keeps_rfid_colors_when_print_delta_only_details_the_active_tr
     ]
 
 
+def test_merge_ams_keeps_hex_when_idle_trays_only_repeat_rfid_ids():
+    previous = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA", "tray_info_idx": "GFL07"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA", "tray_info_idx": "GFL06"},
+            {"id": "2", "tray_color": "000000FF", "tray_type": "PLA", "tray_info_idx": "GFL01"},
+            {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA", "tray_info_idx": "GFL00"},
+        ]},
+    ]}
+    incoming = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA", "tray_info_idx": "GFL07"},
+            {"id": "1", "tray_info_idx": "GFL06"},
+            {"id": "2", "tray_info_idx": "GFL01"},
+            {"id": "3", "tray_info_idx": "GFL00"},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert [tray.get("tray_color") for tray in merged["ams"][0]["tray"]] == [
+        "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
+    ]
+
+
 def test_merge_ams_clears_a_tray_when_the_bit_says_it_is_gone():
     previous = {"tray_exist_bits": "f", "ams": [
         {"id": "0", "tray": [
@@ -188,3 +219,34 @@ def test_parse_tray_exist_bits_absent_or_malformed():
     assert parse_tray_exist_bits(None) is None
     assert parse_tray_exist_bits({"print": {"ams": {}}}) is None
     assert parse_tray_exist_bits({"print": "not-a-dict"}) is None
+
+
+def test_ams_needs_pushall_when_loaded_bits_have_no_color():
+    status = {"print": {"ams": {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]},
+    ]}}}
+    assert ams_needs_pushall(status) is True
+    assert ams_needs_pushall({"print": {"gcode_state": "RUNNING"}}) is True
+    assert ams_needs_pushall({"print": {"ams": {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+            {"id": "2", "tray_color": "000000FF", "tray_type": "PLA"},
+            {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+        ]},
+    ]}}}) is False
+
+
+def test_remembered_ams_round_trip(tmp_path):
+    path = str(tmp_path / "ams-cache.json")
+    ams = {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
+        {"id": "0", "tray_color": "E8AFCFFF"},
+    ]}]}
+    save_remembered_ams(path, "P1", ams)
+    assert load_remembered_ams(path, "P1")["ams"][0]["tray"][0]["tray_color"] == "E8AFCFFF"
+    assert load_remembered_ams(path, "other") is None

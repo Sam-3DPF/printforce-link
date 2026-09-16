@@ -36,6 +36,9 @@ tray 254 does not exist.
 """
 
 import copy
+import json
+import os
+import tempfile
 from typing import Dict, List, Optional
 
 from .coerce import as_int, clean_str
@@ -148,14 +151,34 @@ def _tray_color(tray: dict):
     return None
 
 
+def ams_needs_pushall(status) -> bool:
+    """True when a full MQTT dump is still needed to know loaded tray colours.
+
+    A unit list can exist while idle trays are id-only. That is not "no AMS
+    information" (`parse_ams` is a list), but it is also not a finished reading.
+    """
+    slots = parse_ams(status)
+    if slots is None:
+        return True
+    bits = parse_tray_exist_bits(status)
+    if not bits:
+        return False
+    for slot in slots:
+        if _bit_present(bits, slot["slot_number"]) is True:
+            if not slot.get("color_hex") and not slot.get("filament_type"):
+                return True
+    return False
+
+
 def merge_ams(previous, incoming):
     """Keep RFID tray readings across a P1 print delta that only details the active tray.
 
     Incremental `print.ams` payloads still carry `tray_exist_bits` and a full tray
-    list, but idle trays arrive as `{id}` only. Replacing the AMS object wholesale
-    then blanks hex the printer already sent. If the bitmask still says that tray
-    is loaded and we already have a colour, keep it. A real unload is either an
-    id-only tray with the bit cleared, or no bitmask and an id-only tray.
+    list, but idle trays arrive as `{id}` only, or as RFID identity without hex.
+    Replacing the AMS object wholesale then blanks hex the printer already sent.
+    If the bitmask still says that tray is loaded and we already have a colour,
+    keep it. A real unload is either an id-only tray with the bit cleared, or no
+    bitmask and an id-only tray.
     """
     if not isinstance(incoming, dict):
         return copy.deepcopy(previous) if isinstance(previous, dict) else None
@@ -199,12 +222,18 @@ def merge_ams(previous, incoming):
             slot_number = unit_index * TRAYS_PER_AMS + tray_index + 1
             prev_tray = prev_trays.get(tray_index)
             if (
-                not _tray_has_reading(tray)
+                not _tray_color(tray)
                 and _bit_present(bits, slot_number) is True
                 and isinstance(prev_tray, dict)
-                and _tray_has_reading(prev_tray)
+                and _tray_color(prev_tray)
             ):
-                trays.append(copy.deepcopy(prev_tray))
+                kept = copy.deepcopy(prev_tray)
+                for key, value in tray.items():
+                    if key in ("tray_color", "cols"):
+                        continue
+                    if value not in (None, ""):
+                        kept[key] = copy.deepcopy(value)
+                trays.append(kept)
             else:
                 trays.append(tray)
         merged = dict(unit)
@@ -229,6 +258,50 @@ def _bit_present(bits: Optional[str], slot_number: int) -> Optional[bool]:
         return None
     value = int(bits, 16)
     return ((value >> (slot_number - 1)) & 1) == 1
+
+
+def load_remembered_ams(path: Optional[str], bambu_id: str):
+    """Last `print.ams` object saved for this serial, or None."""
+    if not path or not bambu_id:
+        return None
+    try:
+        with open(path, "r") as handle:
+            raw = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    remembered = raw.get(str(bambu_id))
+    return copy.deepcopy(remembered) if isinstance(remembered, dict) else None
+
+
+def save_remembered_ams(path: Optional[str], bambu_id: str, ams) -> None:
+    """Remember `print.ams` so a restart can keep RFID hex across a partial dump."""
+    if not path or not bambu_id or not isinstance(ams, dict):
+        return
+    raw = {}
+    try:
+        with open(path, "r") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            raw = loaded
+    except FileNotFoundError:
+        raw = {}
+    except (OSError, ValueError):
+        raw = {}
+    raw[str(bambu_id)] = copy.deepcopy(ams)
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".ams-cache-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as handle:
+            json.dump(raw, handle)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def parse_tray_exist_bits(status: dict) -> Optional[str]:

@@ -15,7 +15,14 @@ import os
 import time
 from typing import Dict, Optional, Tuple
 
-from .ams import merge_ams, parse_ams, parse_tray_exist_bits
+from .ams import (
+    ams_needs_pushall,
+    load_remembered_ams,
+    merge_ams,
+    parse_ams,
+    parse_tray_exist_bits,
+    save_remembered_ams,
+)
 from .coerce import as_float, as_int, clean_str
 from .config import PrinterConfig
 
@@ -74,6 +81,9 @@ _DURATION_DISAGREEMENT_SECONDS = 120
 # (`Config.stale_after_seconds` = state_interval x offline_after_stale_polls); this is
 # the fallback for a `BambuPrinter` built without one, and equals that default (15s x 3).
 _DEFAULT_STALE_AFTER_SECONDS = 45
+# pushall is expensive on the printer. Ask a few times after connect / a partial AMS,
+# then wait for Refresh.
+_MAX_FULL_STATUS_ATTEMPTS = 3
 # Raw firmware labels/codes cross the bridge boundary only in this bounded form.
 _MAX_FIRMWARE_TEXT = 64
 
@@ -450,7 +460,7 @@ class BambuPrinter:
 
     def __init__(self, cfg: PrinterConfig, stopwatch: Optional[PrintStopwatch] = None,
                  stale_after_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic, ams_cache_path: Optional[str] = None):
         self._cfg = cfg
         # IP is a cache, the serial (bambu_id) is the identity. Seeded from config, then
         # updated by reconnect() when SSDP finds the serial at a new address (U1) — so a
@@ -474,6 +484,8 @@ class BambuPrinter:
         self._warned_no_connection_probe = False
         self._historical_failed_streak = 0
         self._asked_full_status = False
+        self._full_status_attempts = 0
+        self._ams_cache_path = ams_cache_path
 
     @property
     def bambu_id(self) -> str:
@@ -505,6 +517,7 @@ class BambuPrinter:
         self._ip = ip
         logger.info("connected to printer %s (%s) at %s", self.bambu_id, self._cfg.name, ip)
         self._asked_full_status = False
+        self._full_status_attempts = 0
         self._request_ams_if_needed()
 
     def reconnect(self, new_ip: Optional[str] = None) -> None:
@@ -531,6 +544,7 @@ class BambuPrinter:
         client = self._client
         self._client = None
         self._asked_full_status = False
+        self._full_status_attempts = 0
         if client is None:
             return
         closer = getattr(client, "disconnect", None) or getattr(client, "mqtt_stop", None)
@@ -628,14 +642,31 @@ class BambuPrinter:
         return bool(result)
 
     def _request_ams_if_needed(self) -> None:
-        """Ask once after connect / until a full dump is accepted."""
-        if self._asked_full_status:
+        """Ask for a full dump after connect, and again while loaded trays have no hex."""
+        if self._full_status_attempts >= _MAX_FULL_STATUS_ATTEMPTS:
             return
         try:
             if self.request_full_status():
+                self._full_status_attempts += 1
                 self._asked_full_status = True
         except Exception:
             logger.info("printer %s: full AMS dump not available yet", self.bambu_id)
+
+    def _seed_remembered_ams(self) -> None:
+        if self._cached is not None:
+            return
+        remembered = load_remembered_ams(self._ams_cache_path, self.bambu_id)
+        if remembered:
+            self._cached = {"print": {"ams": remembered}}
+
+    def _remember_ams(self) -> None:
+        if not isinstance(self._cached, dict):
+            return
+        print_obj = self._cached.get("print")
+        ams = print_obj.get("ams") if isinstance(print_obj, dict) else None
+        slots = parse_ams(self._cached)
+        if isinstance(ams, dict) and slots and any(slot.get("color_hex") for slot in slots):
+            save_remembered_ams(self._ams_cache_path, self.bambu_id, ams)
 
     def retry_filament_action(self) -> bool:
         """Retry a halted AMS / load / runout action, then the caller resumes."""
@@ -729,6 +760,8 @@ class BambuPrinter:
 
         fresh = self._note_freshness(raw)
         if isinstance(raw, dict) and raw:
+            if self._cached is None:
+                self._seed_remembered_ams()
             self._cached = merge_status_payload(self._cached, raw)
 
         if not self._cached:
@@ -748,7 +781,8 @@ class BambuPrinter:
             self._offline = False
 
         try:
-            if parse_ams(self._cached) is None:
+            self._remember_ams()
+            if ams_needs_pushall(self._cached):
                 self._request_ams_if_needed()
             return self._build_snapshot(self._cached, fresh=fresh)
         except Exception:
