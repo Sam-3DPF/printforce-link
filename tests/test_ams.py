@@ -1,4 +1,4 @@
-from bridge.ams import parse_ams, parse_tray_exist_bits, normalize_hex
+from bridge.ams import merge_ams, parse_ams, parse_tray_exist_bits, normalize_hex
 
 
 # normalize_hex is a hand-kept copy of the cloud's canonical matcher; these cases are the
@@ -84,6 +84,15 @@ def test_parse_ams_loaded_black_spool_is_not_mistaken_for_empty():
     ]
 
 
+def test_parse_ams_reads_color_from_cols_when_tray_color_is_missing():
+    status = {"print": {"ams": {"ams": [
+        {"id": "0", "tray": [{"id": "1", "cols": ["AE96D4FF"], "tray_type": "PLA"}]},
+    ]}}}
+    assert parse_ams(status) == [
+        {"slot_number": 2, "color_hex": "AE96D4FF", "filament_type": "PLA"},
+    ]
+
+
 def test_parse_ams_blank_type_keeps_the_reported_color():
     """A tray the printer knows a color for but no type (a dark RFID read) is not an
     empty slot — keep the color so the override has something to correct."""
@@ -125,6 +134,46 @@ def test_parse_ams_unplaceable_tray_is_skipped_but_still_a_report():
     assert parse_ams(
         {"print": {"ams": {"ams": [{"id": "0", "tray": [{"id": "x", "tray_type": "PLA"}]}]}}}
     ) == []
+
+
+def test_merge_ams_keeps_rfid_colors_when_print_delta_only_details_the_active_tray():
+    previous = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+            {"id": "2", "tray_color": "000000FF", "tray_type": "PLA"},
+            {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+        ]},
+    ]}
+    incoming = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert [tray.get("tray_color") for tray in merged["ams"][0]["tray"]] == [
+        "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
+    ]
+
+
+def test_merge_ams_clears_a_tray_when_the_bit_says_it_is_gone():
+    previous = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+        ]},
+    ]}
+    incoming = {"tray_exist_bits": "1", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert merged["ams"][0]["tray"][1] == {"id": "1"}
 
 
 def test_parse_tray_exist_bits():

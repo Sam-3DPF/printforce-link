@@ -35,6 +35,7 @@ a phantom swatch in the AMS strip and become a candidate slot for routing, where
 tray 254 does not exist.
 """
 
+import copy
 from typing import Dict, List, Optional
 
 from .coerce import as_int, clean_str
@@ -126,10 +127,108 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
                 continue  # a tray we cannot place has no slot number to report under
             slots.append({
                 "slot_number": unit_index * TRAYS_PER_AMS + tray_index + 1,
-                "color_hex": clean_str(tray.get("tray_color")),
+                "color_hex": clean_str(_tray_color(tray)),
                 "filament_type": clean_str(tray.get("tray_type")),
             })
     return slots
+
+
+def _tray_color(tray: dict):
+    """`tray_color`, or the first `cols` entry when the named field is blank.
+
+    P1 trays with a set colour but a dark RFID often omit `tray_color` and only
+    send `cols`.
+    """
+    color = tray.get("tray_color")
+    if color:
+        return color
+    cols = tray.get("cols")
+    if isinstance(cols, list) and cols:
+        return cols[0]
+    return None
+
+
+def merge_ams(previous, incoming):
+    """Keep RFID tray readings across a P1 print delta that only details the active tray.
+
+    Incremental `print.ams` payloads still carry `tray_exist_bits` and a full tray
+    list, but idle trays arrive as `{id}` only. Replacing the AMS object wholesale
+    then blanks hex the printer already sent. If the bitmask still says that tray
+    is loaded and we already have a colour, keep it. A real unload is either an
+    id-only tray with the bit cleared, or no bitmask and an id-only tray.
+    """
+    if not isinstance(incoming, dict):
+        return copy.deepcopy(previous) if isinstance(previous, dict) else None
+    incoming = copy.deepcopy(incoming)
+    if not isinstance(previous, dict):
+        return incoming
+    incoming_units = incoming.get("ams")
+    if incoming_units == []:
+        return incoming
+    if not isinstance(incoming_units, list):
+        outgoing = copy.deepcopy(previous)
+        for key, value in incoming.items():
+            if key != "ams":
+                outgoing[key] = copy.deepcopy(value)
+        return outgoing
+    previous_units = previous.get("ams")
+    if not isinstance(previous_units, list):
+        return incoming
+    prev_by_id = {}
+    for unit in previous_units:
+        if isinstance(unit, dict):
+            prev_by_id[as_int(unit.get("id"), default=None)] = unit
+    bits = clean_str(incoming.get("tray_exist_bits")) or clean_str(previous.get("tray_exist_bits"))
+    merged_units = []
+    for unit in incoming_units:
+        if not isinstance(unit, dict):
+            continue
+        unit_index = as_int(unit.get("id"), default=0)
+        prev_unit = prev_by_id.get(unit_index) or {}
+        prev_trays = {}
+        for tray in prev_unit.get("tray") or []:
+            if isinstance(tray, dict):
+                prev_trays[as_int(tray.get("id"), default=None)] = tray
+        trays = []
+        for tray in unit.get("tray") or []:
+            if not isinstance(tray, dict):
+                continue
+            tray_index = as_int(tray.get("id"), default=None)
+            if tray_index is None:
+                continue
+            slot_number = unit_index * TRAYS_PER_AMS + tray_index + 1
+            prev_tray = prev_trays.get(tray_index)
+            if (
+                not _tray_has_reading(tray)
+                and _bit_present(bits, slot_number) is True
+                and isinstance(prev_tray, dict)
+                and _tray_has_reading(prev_tray)
+            ):
+                trays.append(copy.deepcopy(prev_tray))
+            else:
+                trays.append(tray)
+        merged = dict(unit)
+        merged["tray"] = trays
+        merged_units.append(merged)
+    incoming["ams"] = merged_units
+    return incoming
+
+
+def _tray_has_reading(tray: dict) -> bool:
+    if _tray_color(tray):
+        return True
+    if clean_str(tray.get("tray_type")):
+        return True
+    if clean_str(tray.get("tray_info_idx")):
+        return True
+    return False
+
+
+def _bit_present(bits: Optional[str], slot_number: int) -> Optional[bool]:
+    if not bits or any(c not in _HEX_DIGITS for c in bits.upper()):
+        return None
+    value = int(bits, 16)
+    return ((value >> (slot_number - 1)) & 1) == 1
 
 
 def parse_tray_exist_bits(status: dict) -> Optional[str]:
