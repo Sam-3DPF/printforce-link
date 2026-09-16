@@ -599,6 +599,29 @@ class BambuPrinter:
         """Publish stop. True is not an ack — confirm via the next gcode_state."""
         return self._mqtt_command("stop_print")
 
+    def request_full_status(self) -> bool:
+        """Ask the printer for a full MQTT dump so AMS trays land in the next snapshot.
+
+        P1-series printers only send AMS on `pushing.pushall`, not on the incremental
+        reports the poll already reads. True is not an ack — the next `snapshot()`
+        that carries a `slots` list is the confirmation.
+        """
+        if self._client is None:
+            raise RuntimeError("printer not connected")
+        pushall = getattr(self._client, "pushall", None)
+        if not callable(pushall):
+            mqtt = None
+            for name in ("mqtt_client", "_mqtt_client"):
+                mqtt = getattr(self._client, name, None)
+                if mqtt is not None:
+                    break
+            pushall = getattr(mqtt, "pushall", None) if mqtt is not None else None
+        if not callable(pushall):
+            raise RuntimeError("printer client has no pushall()")
+        result = pushall()
+        logger.info("printer %s: pushall -> %s", self.bambu_id, result)
+        return bool(result)
+
     def retry_filament_action(self) -> bool:
         """Retry a halted AMS / load / runout action, then the caller resumes."""
         return self._mqtt_command("retry_filament_action")

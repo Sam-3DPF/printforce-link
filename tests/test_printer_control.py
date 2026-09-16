@@ -30,6 +30,10 @@ class _FakePrinter:
         self.calls.append("retry_filament_action")
         return True
 
+    def request_full_status(self):
+        self.calls.append("request_full_status")
+        return True
+
     def resume_from_stage(self, stage=None):
         if stage is None:
             stage = self.snapshot().get("stage")
@@ -84,6 +88,12 @@ def test_resume_user_pause_skips_filament_retry(tmp_path):
     assert printer.calls == ["resume_print"]
 
 
+def test_refresh_requests_full_status(tmp_path):
+    printer = _FakePrinter()
+    _handle_desired(_desired("refresh"), _ControlFleet(printer), set(), str(tmp_path))
+    assert printer.calls == ["request_full_status"]
+
+
 def test_stop_clears_assignment(tmp_path):
     printer = _FakePrinter()
     router = _FakeRouter()
@@ -123,6 +133,27 @@ def test_false_control_result_is_retried_without_applied_state(tmp_path):
     assert printer.calls == ["pause_print"]
     assert applied == set()
     assert not (tmp_path / "control-c1.applied").exists()
+
+
+def test_request_full_status_uses_mqtt_client_pushall():
+    cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
+    printer = BambuPrinter(cfg)
+
+    class _Mqtt:
+        def __init__(self):
+            self.calls = []
+
+        def pushall(self):
+            self.calls.append("pushall")
+            return True
+
+    class _Client:
+        def __init__(self):
+            self.mqtt_client = _Mqtt()
+
+    printer._client = _Client()
+    assert printer.request_full_status() is True
+    assert printer._client.mqtt_client.calls == ["pushall"]
 
 
 def test_resume_from_stage_on_real_printer_wrapper():
