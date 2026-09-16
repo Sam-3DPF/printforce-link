@@ -87,9 +87,11 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
     printer's slot rows (`bridge_state_service._reconcile_slots`), which is correct:
     the spools are genuinely gone, and anything stored on the row goes with them.
 
-    `None` means the payload carries no AMS unit list at all, so we know nothing about
-    this printer's trays right now. That is NOT the same claim, and returning `[]` for
-    it is what let a healthy printer's slots be wiped:
+    `None` means we do not have a finished AMS reading. That includes a payload with
+    no unit list, and a P1 dump that lists trays as `{id}` only without
+    `tray_exist_bits` proving those slots are empty. Emitting Empty for that mix is
+    what stored P1S-6 slots 2-4 as Empty on Main. Returning `[]` for "no information"
+    is what let a healthy printer's slots be wiped:
 
       Bambu pushes a full status once and then sends deltas. `mqtt_dump()` accumulates
       only one level deep, so between connecting and the first full push a printer's
