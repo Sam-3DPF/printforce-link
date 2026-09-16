@@ -53,20 +53,22 @@ def test_parse_ams_multi_unit_slot_numbering():
 
 def test_parse_ams_three_units_number_slots_one_through_twelve():
     status = {"print": {"ams": {"ams": [
-        {"id": str(unit), "tray": [{"id": str(tray)} for tray in range(4)]}
+        {"id": str(unit), "tray": [
+            {"id": str(tray), "tray_color": "000000FF", "tray_type": "PLA"}
+            for tray in range(4)
+        ]}
         for unit in range(3)
     ]}}}
     assert [s["slot_number"] for s in parse_ams(status)] == list(range(1, 13))
 
 
-def test_parse_ams_emits_empty_trays_rather_than_dropping_them():
-    """An empty tray is a dict carrying only an `id`. Skip those and a live P1S
-    reporting trays 2/3/4 simply has no slot 1, which makes "show me the empty slots"
-    impossible."""
-    status = {"print": {"ams": {"ams": [
+def test_parse_ams_emits_empty_only_when_the_bit_says_the_tray_is_gone():
+    """A P1 idle tray is also `{id}` only. That is not Empty unless the bitmask
+    clears the slot. Live P1S-6 stored slots 2-4 as Empty from this mix."""
+    status = {"print": {"ams": {"tray_exist_bits": "1", "ams": [
         {"id": "0", "tray": [
-            {"id": "0", "tray_color": "1A1A1AFF", "tray_type": "PLA"},  # loaded
-            {"id": "1"},                                                # EMPTY
+            {"id": "0", "tray_color": "1A1A1AFF", "tray_type": "PLA"},
+            {"id": "1"},
         ]},
     ]}}}
     assert parse_ams(status) == [
@@ -76,8 +78,36 @@ def test_parse_ams_emits_empty_trays_rather_than_dropping_them():
 
 
 def test_parse_ams_empty_tray_keeps_its_slot_number():
-    status = {"print": {"ams": {"ams": [{"id": "0", "tray": [{"id": "2"}]}]}}}
+    status = {"print": {"ams": {"tray_exist_bits": "0", "ams": [
+        {"id": "0", "tray": [{"id": "2"}]},
+    ]}}}
     assert parse_ams(status) == [{"slot_number": 3, "color_hex": None, "filament_type": None}]
+
+
+def test_parse_ams_does_not_store_empty_for_a_partial_p1_dump():
+    """P1S-6 after Refresh on 0.1.13: one color, three id-only trays, no bits.
+    Emitting Empty here is what Main stored and the app displayed."""
+    status = {"print": {"ams": {"ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]},
+    ]}}}
+    assert parse_ams(status) is None
+
+
+def test_parse_ams_does_not_store_empty_when_bits_say_the_blank_trays_are_loaded():
+    status = {"print": {"ams": {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]},
+    ]}}}
+    assert parse_ams(status) is None
 
 
 def test_parse_ams_loaded_black_spool_is_not_mistaken_for_empty():
@@ -207,10 +237,78 @@ def test_merge_ams_clears_a_tray_when_the_bit_says_it_is_gone():
     assert merged["ams"][0]["tray"][1] == {"id": "1"}
 
 
+def test_merge_ams_keeps_hex_when_a_delta_omits_tray_exist_bits():
+    previous = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+            {"id": "2", "tray_color": "000000FF", "tray_type": "PLA"},
+            {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+        ]},
+    ]}
+    incoming = {"ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert merged["tray_exist_bits"] == "f"
+    assert [tray.get("tray_color") for tray in merged["ams"][0]["tray"]] == [
+        "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
+    ]
+
+
+def test_merge_ams_keeps_hex_when_bits_are_missing_on_both_sides():
+    previous = {"ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+        ]},
+    ]}
+    incoming = {"ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert [tray.get("tray_color") for tray in merged["ams"][0]["tray"]] == [
+        "E8AFCFFF", "A3D8E1FF",
+    ]
+
+
+def test_merge_ams_reads_integer_tray_exist_bits():
+    previous = {"tray_exist_bits": 15, "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+        ]},
+    ]}
+    incoming = {"tray_exist_bits": 15, "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert merged["tray_exist_bits"] == "f"
+    assert merged["ams"][0]["tray"][1]["tray_color"] == "A3D8E1FF"
+
+
 def test_parse_tray_exist_bits():
     """The bitmask is reported as-is: it is the only signal that detects a spool swap
     in a slot whose RFID is dark, since such a slot's reported color never changes."""
     status = {"print": {"ams": {"tray_exist_bits": "f", "ams": []}}}
+    assert parse_tray_exist_bits(status) == "f"
+
+
+def test_parse_tray_exist_bits_accepts_an_integer_bitmask():
+    """bambulabs_api can leave this as int 15. clean_str dropped that, so every
+    shop printer on Main stored tray_exist_bits null and keep-hex never fired."""
+    status = {"print": {"ams": {"tray_exist_bits": 15, "ams": []}}}
     assert parse_tray_exist_bits(status) == "f"
 
 
@@ -219,6 +317,7 @@ def test_parse_tray_exist_bits_absent_or_malformed():
     assert parse_tray_exist_bits(None) is None
     assert parse_tray_exist_bits({"print": {"ams": {}}}) is None
     assert parse_tray_exist_bits({"print": "not-a-dict"}) is None
+    assert parse_tray_exist_bits({"print": {"ams": {"tray_exist_bits": True}}}) is None
 
 
 def test_ams_needs_pushall_when_loaded_bits_have_no_color():
@@ -232,6 +331,14 @@ def test_ams_needs_pushall_when_loaded_bits_have_no_color():
     ]}}}
     assert ams_needs_pushall(status) is True
     assert ams_needs_pushall({"print": {"gcode_state": "RUNNING"}}) is True
+    assert ams_needs_pushall({"print": {"ams": {"ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]},
+    ]}}}) is True
     assert ams_needs_pushall({"print": {"ams": {"tray_exist_bits": "f", "ams": [
         {"id": "0", "tray": [
             {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},

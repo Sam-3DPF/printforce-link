@@ -50,12 +50,18 @@ class FakeClient:
     printer off the LAN.
     """
 
-    def __init__(self, payloads, connected=True):
+    def __init__(self, payloads, connected=True, after_pushall=None):
         self._payloads = list(payloads)
         self._last = {}
         self.connected = connected
+        self.after_pushall = after_pushall
 
     def mqtt_dump(self):
+        if getattr(self, "_next_dump_is_absorb", False):
+            self._next_dump_is_absorb = False
+            if self.after_pushall is not None:
+                self._last = self.after_pushall
+            return self._last
         if self._payloads:
             self._last = self._payloads.pop(0)
         return self._last
@@ -65,6 +71,7 @@ class FakeClient:
 
     def pushall(self):
         self.pushall_calls = getattr(self, "pushall_calls", 0) + 1
+        self._next_dump_is_absorb = True
         return True
 
     def push(self, payload):
@@ -81,7 +88,8 @@ def _stopwatch(monotonic=None, wall_clock=None) -> PrintStopwatch:
 
 
 def _printer(payloads, monotonic=None, wall_clock=None, connected=True,
-             stale_after_seconds=_DEFAULT_STALE_AFTER_SECONDS) -> BambuPrinter:
+             stale_after_seconds=_DEFAULT_STALE_AFTER_SECONDS,
+             after_pushall=None) -> BambuPrinter:
     cfg = PrinterConfig(bambu_id=_BAMBU_ID, ip="10.0.0.5",
                         access_code="secret", name="P1S-1")
     # The printer's clock defaults to a *frozen* one, so a test that says nothing about
@@ -89,8 +97,11 @@ def _printer(payloads, monotonic=None, wall_clock=None, connected=True,
     # pass a FakeClock and advance it themselves.
     printer = BambuPrinter(cfg, stopwatch=_stopwatch(monotonic, wall_clock),
                            stale_after_seconds=stale_after_seconds,
-                           monotonic=monotonic or (lambda: 0.0))
-    printer._client = FakeClient(payloads, connected=connected)
+                           monotonic=monotonic or (lambda: 0.0),
+                           sleep=lambda _seconds: None)
+    printer._client = FakeClient(
+        payloads, connected=connected, after_pushall=after_pushall,
+    )
     return printer
 
 
@@ -565,15 +576,96 @@ def test_partial_ams_with_loaded_bits_asks_the_printer_for_a_full_dump():
         },
     }])
     snapshot = printer.snapshot()
-    assert snapshot["slots"][0]["color_hex"] == "E8AFCFFF"
-    assert [slot["color_hex"] for slot in snapshot["slots"][1:]] == [None, None, None]
+    assert snapshot["slots"] is None
     assert printer._client.pushall_calls == 1
+
+
+def test_p1s6_partial_dump_does_not_store_empty_for_loaded_trays():
+    """Live Main after Refresh on 0.1.13: P1S-6 slot 1 #E8AFCF PLA, slots 2-4
+    hex/type null, tray_exist_bits null. The app showed Empty because Link stored it."""
+    printer = _printer([{
+        "print": {
+            "gcode_state": "FINISH",
+            "ams": {
+                "ams": [{"id": "0", "tray": [
+                    {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+                    {"id": "1"},
+                    {"id": "2"},
+                    {"id": "3"},
+                ]}],
+            },
+        },
+    }])
+    snapshot = printer.snapshot()
+    assert snapshot["slots"] is None
+    assert snapshot["tray_exist_bits"] is None
+    assert printer._client.pushall_calls == 1
+
+
+def test_integer_tray_exist_bits_are_reported_as_hex():
+    printer = _printer([{
+        "print": {
+            "gcode_state": "IDLE",
+            "ams": {
+                "tray_exist_bits": 15,
+                "ams": [{"id": "0", "tray": [
+                    {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+                    {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+                    {"id": "2", "tray_color": "000000FF", "tray_type": "PLA"},
+                    {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+                ]}],
+            },
+        },
+    }])
+    snapshot = printer.snapshot()
+    assert snapshot["tray_exist_bits"] == "f"
+    assert [slot["color_hex"] for slot in snapshot["slots"]] == [
+        "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
+    ]
+
+
+def test_pushall_absorbs_the_full_ams_dump_before_the_next_delta():
+    """mqtt_dump is one-level-deep. A later P1 delta can overwrite the pushall
+    dump before the 15s poll. Absorb the dump right after asking."""
+    full = {"print": {
+        "gcode_state": "FINISH",
+        "ams": {"tray_exist_bits": 15, "ams": [
+            {"id": "0", "tray": [
+                {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+                {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+                {"id": "2", "tray_color": "000000FF", "tray_type": "PLA"},
+                {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+            ]},
+        ]},
+    }}
+    printer = _printer(
+        [{
+            "print": {
+                "gcode_state": "FINISH",
+                "ams": {"ams": [{"id": "0", "tray": [
+                    {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+                    {"id": "1"},
+                    {"id": "2"},
+                    {"id": "3"},
+                ]}]},
+            },
+        }],
+        after_pushall=full,
+    )
+    snapshot = printer.snapshot()
+    assert [slot["color_hex"] for slot in snapshot["slots"]] == [
+        "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
+    ]
+    assert snapshot["tray_exist_bits"] == "f"
 
 
 def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(tmp_path):
     cache = tmp_path / "ams-cache.json"
     cfg = PrinterConfig(bambu_id=_BAMBU_ID, ip="10.0.0.5", access_code="secret", name="P1S-6")
-    first = BambuPrinter(cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache))
+    first = BambuPrinter(
+        cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache),
+        sleep=lambda _seconds: None,
+    )
     first._client = FakeClient([{
         "print": {"gcode_state": "IDLE", "ams": {"tray_exist_bits": "f", "ams": [
             {"id": "0", "tray": [
@@ -586,7 +678,10 @@ def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(t
     }])
     first.snapshot()
 
-    restarted = BambuPrinter(cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache))
+    restarted = BambuPrinter(
+        cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache),
+        sleep=lambda _seconds: None,
+    )
     restarted._client = FakeClient([{
         "print": {"gcode_state": "FINISH", "ams": {"tray_exist_bits": "f", "ams": [
             {"id": "0", "tray": [
@@ -606,17 +701,18 @@ def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(t
 def test_ams_delta_clears_a_tray_that_became_empty():
     """The merge must be able to express key *removal*. A naive deep merge cannot: a
     tray going from loaded to empty would keep its last-known color forever, telling the
-    router the printer holds a color it does not."""
+    router the printer holds a color it does not. The bit clearing is the unload
+    signal. An id-only tray without that bit is a P1 delta, not Empty."""
     printer = _printer([
-        {"print": {"gcode_state": "IDLE", "ams": {"ams": [
+        {"print": {"gcode_state": "IDLE", "ams": {"tray_exist_bits": "3", "ams": [
             {"id": "0", "tray": [
                 {"id": "0", "tray_color": "FF6A13FF", "tray_type": "PLA"},
                 {"id": "1", "tray_color": "00AE42FF", "tray_type": "PLA"},
             ]}]}}},
-        {"print": {"gcode_state": "IDLE", "ams": {"ams": [
+        {"print": {"gcode_state": "IDLE", "ams": {"tray_exist_bits": "1", "ams": [
             {"id": "0", "tray": [
                 {"id": "0", "tray_color": "FF6A13FF", "tray_type": "PLA"},
-                {"id": "1"},                     # the spool was pulled out
+                {"id": "1"},
             ]}]}}},
     ])
     printer.snapshot()
