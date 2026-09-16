@@ -94,6 +94,18 @@ def test_refresh_requests_full_status(tmp_path):
     assert printer.calls == ["request_full_status"]
 
 
+def test_fleet_refresh_asks_the_printer_for_a_full_status(tmp_path):
+    printer = _FakePrinter()
+    cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
+    fleet = Fleet(
+        [cfg],
+        printer_factory=lambda _cfg, stale_after_seconds=None: printer,
+        discover_fn=lambda _timeout: [],
+    )
+    _handle_desired(_desired("refresh"), fleet, set(), str(tmp_path))
+    assert printer.calls == ["request_full_status"]
+
+
 def test_stop_clears_assignment(tmp_path):
     printer = _FakePrinter()
     router = _FakeRouter()

@@ -97,6 +97,8 @@ class Fleet:
                 return printer.resume_print()
             if action == "stop":
                 return printer.stop_print()
+            if action == "refresh":
+                return printer.request_full_status()
             logger.warning("unknown control %s requested for printer %s", action, bambu_id)
             return False
 
