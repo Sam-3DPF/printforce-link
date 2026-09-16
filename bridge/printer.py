@@ -15,7 +15,7 @@ import os
 import time
 from typing import Dict, Optional, Tuple
 
-from .ams import parse_ams, parse_tray_exist_bits
+from .ams import merge_ams, parse_ams, parse_tray_exist_bits
 from .coerce import as_float, as_int, clean_str
 from .config import PrinterConfig
 
@@ -286,13 +286,10 @@ def merge_status_payload(cached: Optional[dict], incoming: Optional[dict]) -> Di
 
       * scalars merge key-by-key, so a delta that omits `nozzle_temper` keeps the last
         known value rather than blanking it;
-      * `ams` is taken **wholesale** from any payload that carries one, never merged
-        tray-by-tray.
-
-    That second rule is load-bearing — do not "improve" this into a deep merge. A deep
-    merge cannot express key *removal*, so a tray going from loaded to empty would keep
-    its last-known color forever, telling the router the printer holds a color it does
-    not.
+      * `ams` is merged by `merge_ams`: a P1 print delta that only details the
+        active tray must not blank RFID colours on trays `tray_exist_bits` still
+        marks loaded. A real unload (bit cleared, or no bits and an id-only tray)
+        still replaces.
 
     Nothing from `incoming` is ever stored by reference. `mqtt_dump()` hands back the
     library's live internal dict *by reference* (`MqttClient.dump()` is literally
@@ -310,7 +307,11 @@ def merge_status_payload(cached: Optional[dict], incoming: Optional[dict]) -> Di
         if key == "print" and isinstance(value, dict):
             previous = merged.get("print")
             print_obj = dict(previous) if isinstance(previous, dict) else {}
-            print_obj.update(copy.deepcopy(value))  # shallow: `ams` is replaced whole
+            incoming_print = copy.deepcopy(value)
+            if "ams" in incoming_print:
+                previous_ams = previous.get("ams") if isinstance(previous, dict) else None
+                incoming_print["ams"] = merge_ams(previous_ams, incoming_print.get("ams"))
+            print_obj.update(incoming_print)
             merged["print"] = print_obj             # rebuilt, so cached["print"] is untouched
         else:
             merged[key] = copy.deepcopy(value)
@@ -472,6 +473,7 @@ class BambuPrinter:
         self._offline = False                     # for logging the edge, not every poll
         self._warned_no_connection_probe = False
         self._historical_failed_streak = 0
+        self._asked_full_status = False
 
     @property
     def bambu_id(self) -> str:
@@ -502,6 +504,8 @@ class BambuPrinter:
         # actually started, which would strand the printer OFFLINE until a restart (U1).
         self._ip = ip
         logger.info("connected to printer %s (%s) at %s", self.bambu_id, self._cfg.name, ip)
+        self._asked_full_status = False
+        self._request_ams_if_needed()
 
     def reconnect(self, new_ip: Optional[str] = None) -> None:
         """Rebuild the MQTT client, optionally at a new IP after the printer's DHCP lease
@@ -526,6 +530,7 @@ class BambuPrinter:
         Never raises — a printer being torn down must not take the loop down with it."""
         client = self._client
         self._client = None
+        self._asked_full_status = False
         if client is None:
             return
         closer = getattr(client, "disconnect", None) or getattr(client, "mqtt_stop", None)
@@ -621,6 +626,16 @@ class BambuPrinter:
         result = pushall()
         logger.info("printer %s: pushall -> %s", self.bambu_id, result)
         return bool(result)
+
+    def _request_ams_if_needed(self) -> None:
+        """Ask once after connect / until a full dump is accepted."""
+        if self._asked_full_status:
+            return
+        try:
+            if self.request_full_status():
+                self._asked_full_status = True
+        except Exception:
+            logger.info("printer %s: full AMS dump not available yet", self.bambu_id)
 
     def retry_filament_action(self) -> bool:
         """Retry a halted AMS / load / runout action, then the caller resumes."""
@@ -733,6 +748,8 @@ class BambuPrinter:
             self._offline = False
 
         try:
+            if parse_ams(self._cached) is None:
+                self._request_ams_if_needed()
             return self._build_snapshot(self._cached, fresh=fresh)
         except Exception:
             # NOT an unreachable printer — a bug in the bridge's own parsing. Letting it
