@@ -20,6 +20,7 @@ from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
 from .fleet import Fleet
+from .printer import BambuPrinter
 from .pairing import ensure_paired, maybe_repair
 from .reconciler import ConfigReconciler
 from .router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
@@ -185,7 +186,19 @@ def main(config_path: str = "config.toml") -> None:
     # store (U4) — the store is how the onboarding wizard's printers reach the bridge
     # without a file edit. On restart the store re-connects everything already onboarded.
     printer_configs = _merge_printer_configs(cfg.printers, store.configs())
-    fleet = Fleet(printer_configs, stale_after_seconds=cfg.stale_after_seconds)
+    ams_cache_path = os.path.join(os.path.dirname(os.path.abspath(config_path)) or ".", "ams-cache.json")
+
+    def make_printer(printer_cfg, stale_after_seconds=None):
+        kwargs = {"ams_cache_path": ams_cache_path}
+        if stale_after_seconds is not None:
+            kwargs["stale_after_seconds"] = stale_after_seconds
+        return BambuPrinter(printer_cfg, **kwargs)
+
+    fleet = Fleet(
+        printer_configs,
+        stale_after_seconds=cfg.stale_after_seconds,
+        printer_factory=make_printer,
+    )
     fleet.connect_all()
     dpf = DpfClient(cfg.dpf_base_url, cloud_token)
     reconciler = ConfigReconciler(dpf, fleet, store)

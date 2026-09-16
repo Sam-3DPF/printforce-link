@@ -63,6 +63,10 @@ class FakeClient:
     def mqtt_client_connected(self):
         return self.connected
 
+    def pushall(self):
+        self.pushall_calls = getattr(self, "pushall_calls", 0) + 1
+        return True
+
     def push(self, payload):
         """The printer sends a new report."""
         self._payloads.append(payload)
@@ -543,6 +547,60 @@ def test_a_printer_reporting_zero_ams_units_still_says_no_trays():
     not swallow this case — see `_reconcile_slots`'s staleness argument."""
     printer = _printer([{"print": {"gcode_state": "RUNNING", "ams": {"ams": []}}}])
     assert printer.snapshot()["slots"] == []
+
+
+def test_partial_ams_with_loaded_bits_asks_the_printer_for_a_full_dump():
+    printer = _printer([{
+        "print": {
+            "gcode_state": "FINISH",
+            "ams": {
+                "tray_exist_bits": "f",
+                "ams": [{"id": "0", "tray": [
+                    {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+                    {"id": "1"},
+                    {"id": "2"},
+                    {"id": "3"},
+                ]}],
+            },
+        },
+    }])
+    snapshot = printer.snapshot()
+    assert snapshot["slots"][0]["color_hex"] == "E8AFCFFF"
+    assert [slot["color_hex"] for slot in snapshot["slots"][1:]] == [None, None, None]
+    assert printer._client.pushall_calls == 1
+
+
+def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(tmp_path):
+    cache = tmp_path / "ams-cache.json"
+    cfg = PrinterConfig(bambu_id=_BAMBU_ID, ip="10.0.0.5", access_code="secret", name="P1S-6")
+    first = BambuPrinter(cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache))
+    first._client = FakeClient([{
+        "print": {"gcode_state": "IDLE", "ams": {"tray_exist_bits": "f", "ams": [
+            {"id": "0", "tray": [
+                {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+                {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+                {"id": "2", "tray_color": "000000FF", "tray_type": "PLA"},
+                {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+            ]},
+        ]}},
+    }])
+    first.snapshot()
+
+    restarted = BambuPrinter(cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache))
+    restarted._client = FakeClient([{
+        "print": {"gcode_state": "FINISH", "ams": {"tray_exist_bits": "f", "ams": [
+            {"id": "0", "tray": [
+                {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+                {"id": "1"},
+                {"id": "2"},
+                {"id": "3"},
+            ]},
+        ]}},
+    }])
+    slots = restarted.snapshot()["slots"]
+    assert [slot["color_hex"] for slot in slots] == [
+        "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
+    ]
 
 
 def test_ams_delta_clears_a_tray_that_became_empty():
