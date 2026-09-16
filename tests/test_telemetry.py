@@ -57,6 +57,11 @@ class FakeClient:
         self.after_pushall = after_pushall
 
     def mqtt_dump(self):
+        if getattr(self, "_next_dump_is_absorb", False):
+            self._next_dump_is_absorb = False
+            if self.after_pushall is not None:
+                self._last = self.after_pushall
+            return self._last
         if self._payloads:
             self._last = self._payloads.pop(0)
         return self._last
@@ -66,8 +71,7 @@ class FakeClient:
 
     def pushall(self):
         self.pushall_calls = getattr(self, "pushall_calls", 0) + 1
-        if self.after_pushall is not None:
-            self._payloads.append(self.after_pushall)
+        self._next_dump_is_absorb = True
         return True
 
     def push(self, payload):
@@ -93,7 +97,8 @@ def _printer(payloads, monotonic=None, wall_clock=None, connected=True,
     # pass a FakeClock and advance it themselves.
     printer = BambuPrinter(cfg, stopwatch=_stopwatch(monotonic, wall_clock),
                            stale_after_seconds=stale_after_seconds,
-                           monotonic=monotonic or (lambda: 0.0))
+                           monotonic=monotonic or (lambda: 0.0),
+                           sleep=lambda _seconds: None)
     printer._client = FakeClient(
         payloads, connected=connected, after_pushall=after_pushall,
     )
@@ -657,7 +662,10 @@ def test_pushall_absorbs_the_full_ams_dump_before_the_next_delta():
 def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(tmp_path):
     cache = tmp_path / "ams-cache.json"
     cfg = PrinterConfig(bambu_id=_BAMBU_ID, ip="10.0.0.5", access_code="secret", name="P1S-6")
-    first = BambuPrinter(cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache))
+    first = BambuPrinter(
+        cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache),
+        sleep=lambda _seconds: None,
+    )
     first._client = FakeClient([{
         "print": {"gcode_state": "IDLE", "ams": {"tray_exist_bits": "f", "ams": [
             {"id": "0", "tray": [
@@ -670,7 +678,10 @@ def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(t
     }])
     first.snapshot()
 
-    restarted = BambuPrinter(cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache))
+    restarted = BambuPrinter(
+        cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache),
+        sleep=lambda _seconds: None,
+    )
     restarted._client = FakeClient([{
         "print": {"gcode_state": "FINISH", "ams": {"tray_exist_bits": "f", "ams": [
             {"id": "0", "tray": [

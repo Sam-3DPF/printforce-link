@@ -164,6 +164,7 @@ def test_request_full_status_uses_mqtt_client_pushall():
             self.mqtt_client = _Mqtt()
 
     printer._client = _Client()
+    printer._sleep = lambda _seconds: None
     assert printer.request_full_status() is True
     assert printer._client.mqtt_client.calls == ["pushall"]
 

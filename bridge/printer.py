@@ -16,6 +16,7 @@ import time
 from typing import Dict, Optional, Tuple
 
 from .ams import (
+    ams_has_color,
     ams_needs_pushall,
     load_remembered_ams,
     merge_ams,
@@ -84,6 +85,9 @@ _DEFAULT_STALE_AFTER_SECONDS = 45
 # pushall is expensive on the printer. Ask a few times after connect / a partial AMS,
 # then wait for Refresh.
 _MAX_FULL_STATUS_ATTEMPTS = 3
+# mqtt_dump is one-level-deep. Wait briefly after pushall so the full AMS
+# object lands in the library dict before a later P1 delta overwrites it.
+_ABSORB_AFTER_PUSHALL_SECONDS = 2.0
 # Raw firmware labels/codes cross the bridge boundary only in this bounded form.
 _MAX_FIRMWARE_TEXT = 64
 
@@ -460,7 +464,8 @@ class BambuPrinter:
 
     def __init__(self, cfg: PrinterConfig, stopwatch: Optional[PrintStopwatch] = None,
                  stale_after_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
-                 monotonic=time.monotonic, ams_cache_path: Optional[str] = None):
+                 monotonic=time.monotonic, ams_cache_path: Optional[str] = None,
+                 sleep=time.sleep):
         self._cfg = cfg
         # IP is a cache, the serial (bambu_id) is the identity. Seeded from config, then
         # updated by reconnect() when SSDP finds the serial at a new address (U1) — so a
@@ -470,6 +475,7 @@ class BambuPrinter:
         self._cached: Optional[Dict] = None       # last-known merged payload
         self._stopwatch = stopwatch or PrintStopwatch(cfg.bambu_id)
         self._monotonic = monotonic               # injectable — staleness is otherwise untestable
+        self._sleep = sleep
         self._stale_after_seconds = stale_after_seconds
 
         # Liveness of `_cached`. `_last_raw` is the last payload the printer actually
@@ -639,7 +645,22 @@ class BambuPrinter:
             raise RuntimeError("printer client has no pushall()")
         result = pushall()
         logger.info("printer %s: pushall -> %s", self.bambu_id, result)
+        self._absorb_status_after_pushall()
         return bool(result)
+
+    def _absorb_status_after_pushall(self) -> None:
+        """Merge the dump that pushall just asked for before the next delta lands."""
+        self._sleep(_ABSORB_AFTER_PUSHALL_SECONDS)
+        try:
+            raw = self._raw_status()
+        except Exception:
+            return
+        if not isinstance(raw, dict) or not raw:
+            return
+        if self._cached is None:
+            self._seed_remembered_ams()
+        self._cached = merge_status_payload(self._cached, raw)
+        self._note_freshness(raw)
 
     def _request_ams_if_needed(self) -> None:
         """Ask for a full dump after connect, and again while loaded trays have no hex."""
@@ -664,8 +685,7 @@ class BambuPrinter:
             return
         print_obj = self._cached.get("print")
         ams = print_obj.get("ams") if isinstance(print_obj, dict) else None
-        slots = parse_ams(self._cached)
-        if isinstance(ams, dict) and slots and any(slot.get("color_hex") for slot in slots):
+        if ams_has_color(ams):
             save_remembered_ams(self._ams_cache_path, self.bambu_id, ams)
 
     def retry_filament_action(self) -> bool:
@@ -781,9 +801,9 @@ class BambuPrinter:
             self._offline = False
 
         try:
-            self._remember_ams()
             if ams_needs_pushall(self._cached):
                 self._request_ams_if_needed()
+            self._remember_ams()
             return self._build_snapshot(self._cached, fresh=fresh)
         except Exception:
             # NOT an unreachable printer — a bug in the bridge's own parsing. Letting it
