@@ -313,7 +313,7 @@ def main(config_path: str = "config.toml") -> None:
         time.sleep(cfg.state_interval_seconds)
 
 
-_CONTROL_ACTIONS = frozenset({"pause", "resume", "stop"})
+_CONTROL_ACTIONS = frozenset({"pause", "resume", "stop", "refresh"})
 
 
 def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
@@ -423,6 +423,12 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
             )
         elif action == "stop":
             result = printer.stop_print()
+        elif action == "refresh":
+            result = (
+                printer.request_full_status()
+                if hasattr(printer, "request_full_status")
+                else False
+            )
     except Exception:
         logger.exception("printer %s: %s failed; will retry this control.id",
                          bambu_id, action)
