@@ -66,11 +66,6 @@ class FakeClient:
             elif self.after_pushall is not None:
                 self._last = self.after_pushall
             return self._last
-        if getattr(self, "_next_dump_is_absorb", False):
-            self._next_dump_is_absorb = False
-            if self.after_pushall is not None:
-                self._last = self.after_pushall
-            return self._last
         if self._payloads:
             self._last = self._payloads.pop(0)
         return self._last
@@ -80,11 +75,8 @@ class FakeClient:
 
     def pushall(self):
         self.pushall_calls = getattr(self, "pushall_calls", 0) + 1
-        if self.absorb_dumps:
-            self._absorbing = True
-            self._absorb_remaining = list(self.absorb_dumps)
-        else:
-            self._next_dump_is_absorb = True
+        self._absorbing = True
+        self._absorb_remaining = list(self.absorb_dumps)
         return True
 
     def finish_absorb(self):
