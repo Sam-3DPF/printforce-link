@@ -119,6 +119,23 @@ def test_parse_ams_emits_the_first_connect_tray_list_when_bits_say_loaded():
     ]
 
 
+def test_parse_ams_first_connect_dual_ams_emits_every_bit_present_tray():
+    """P1S-9 live 2026-09-17: bits `ff`, zero slot rows. A new pair has no
+    last-known list to keep. Returning None leaves the card empty."""
+    trays = (
+        [{"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"}]
+        + [{"id": str(i)} for i in range(1, 4)]
+    )
+    status = {"print": {"ams": {"tray_exist_bits": "ff", "ams": [
+        {"id": "0", "tray": trays},
+        {"id": "1", "tray": [{"id": str(i)} for i in range(4)]},
+    ]}}}
+    slots = parse_ams(status)
+    assert [slot["slot_number"] for slot in slots] == list(range(1, 9))
+    assert slots[0]["color_hex"] == "E8AFCFFF"
+    assert [slot["color_hex"] for slot in slots[1:]] == [None] * 7
+
+
 def test_parse_ams_keeps_a_sibling_rfid_hex_when_other_idle_trays_are_still_blank():
     status = {"print": {"ams": {"tray_exist_bits": "f", "ams": [
         {"id": "0", "tray": [
