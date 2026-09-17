@@ -38,6 +38,12 @@ _FILAMENT_FAMILIES = ("PETG", "PLA", "ABS", "ASA", "TPU", "PA", "PC", "PVA", "HI
 LEGACY_MARKER_MIN_AGE_SECONDS = ASSIGNMENT_STARTUP_GRACE_SECONDS
 LEGACY_READY_OBSERVATION_MIN_GAP_SECONDS = 5.0
 LEGACY_READY_OBSERVATION_LIMIT = 256
+# MQTT start_print True is not an ack. Poll this long for PRINTING/PAUSED, then
+# leave the send pending until the next loop or the startup-grace timeout.
+CLOUD_SEND_CONFIRM_WAIT_SECONDS = 8.0
+CLOUD_SEND_CONFIRM_POLL_SECONDS = 0.5
+STARTED_MARKER_COMMANDED = "commanded"
+STARTED_MARKER_CONFIRMED = "confirmed"
 
 
 class _LegacyMarkerReadiness:
@@ -464,11 +470,15 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
 def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                        started_sends=None, router=None,
                        legacy_marker_readiness=None,
-                       wall_time=time.time) -> None:
+                       wall_time=time.time,
+                       confirm_wait_seconds=CLOUD_SEND_CONFIRM_WAIT_SECONDS,
+                       sleep_fn=time.sleep) -> None:
     """Start a print only when the cloud Sliced Queue says so.
 
-    A send that already physically started is only re-reported — never started twice
-    while the cloud row is still SENDING (report 5xx / next poll / Link restart).
+    MQTT publish True is not a physical start. DISPATCHED is reported only after
+    the printer snapshot shows PRINTING or PAUSED. A commanded-but-idle send is
+    left pending (never started twice) until that proof arrives, or the startup
+    grace expires and local start state is cleared so the cloud can keep SENDING.
     """
     import os
     if started_sends is None:
@@ -559,8 +569,13 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         if key in started_sends or os.path.exists(started_path) or assignment_matches:
             started_sends.add(key)
             if router is not None and not assignment_matches:
-                router.record_assignment(str(bambu_id), str(batch_id), plate_index)
-            dpf.report_dispatched(batch_id, bambu_id)
+                router.record_assignment(
+                    str(bambu_id), str(batch_id), plate_index,
+                    started_at=_cloud_send_started_at(started_path, wall_time),
+                )
+            _confirm_or_abandon_cloud_send(
+                key, fleet, dpf, spool_dir, started_sends, router, wall_time,
+            )
             continue
         if _row_has_stop(row):
             logger.info("cloud send %s: live stop; not starting", batch_id)
@@ -632,13 +647,18 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         if started:
             started_sends.add(key)
             try:
-                with open(started_path, "w"):
-                    pass
+                _write_cloud_send_marker(started_path, STARTED_MARKER_COMMANDED)
             except OSError:
                 pass
             if router is not None:
-                router.record_assignment(str(bambu_id), str(batch_id), plate_index)
-            dpf.report_dispatched(batch_id, bambu_id)
+                router.record_assignment(
+                    str(bambu_id), str(batch_id), plate_index,
+                    started_at=float(wall_time()),
+                )
+            if _wait_for_active_print(
+                fleet, str(bambu_id), wall_time, sleep_fn, confirm_wait_seconds,
+            ):
+                _report_confirmed_dispatch(key, dpf, spool_dir, router)
         else:
             logger.warning("printer %s did not start batch %s", bambu_id, batch_id)
     for key in list(started_sends):
@@ -662,6 +682,135 @@ def _cloud_send_started_path(spool_dir: str, key) -> str:
         spool_dir,
         f"cloud-send-{safe_batch}-{safe_printer}-plate-{int(plate_index)}.started",
     )
+
+
+def _snapshot_shows_active(snapshot) -> bool:
+    return isinstance(snapshot, dict) and snapshot.get("status") in ("PRINTING", "PAUSED")
+
+
+def _write_cloud_send_marker(path: str, state: str) -> None:
+    with open(path, "w") as handle:
+        handle.write(state)
+
+
+def _cloud_send_marker_state(path: str) -> str:
+    try:
+        with open(path) as handle:
+            return handle.read().strip()
+    except OSError:
+        return ""
+
+
+def _cloud_send_started_at(started_path: str, wall_time) -> float:
+    try:
+        return float(os.stat(started_path).st_mtime)
+    except (OSError, TypeError, ValueError):
+        return float(wall_time())
+
+
+def _assignment_observed_active(router, bambu_id: str) -> bool:
+    if router is None or not callable(getattr(router, "assignments_snapshot", None)):
+        return False
+    assignment = router.assignments_snapshot().get(str(bambu_id))
+    return isinstance(assignment, dict) and assignment.get("observed_active") is True
+
+
+def _cloud_send_already_confirmed(started_path: str, router, bambu_id: str) -> bool:
+    return (
+        _cloud_send_marker_state(started_path) == STARTED_MARKER_CONFIRMED
+        or _assignment_observed_active(router, bambu_id)
+    )
+
+
+def _cloud_send_start_age_seconds(started_path: str, router, bambu_id: str,
+                                 wall_time) -> float:
+    now = float(wall_time())
+    if router is not None and callable(getattr(router, "assignments_snapshot", None)):
+        assignment = router.assignments_snapshot().get(str(bambu_id))
+        if isinstance(assignment, dict):
+            try:
+                started_at = float(assignment.get("started_at"))
+            except (TypeError, ValueError):
+                started_at = float("nan")
+            if started_at == started_at and started_at >= 0:
+                return max(0.0, now - started_at)
+    return max(0.0, now - _cloud_send_started_at(started_path, wall_time))
+
+
+def _wait_for_active_print(fleet, bambu_id: str, wall_time, sleep_fn,
+                          wait_seconds) -> bool:
+    if _snapshot_shows_active(_live_snapshot(fleet, bambu_id)):
+        return True
+    try:
+        remaining_budget = float(wait_seconds)
+    except (TypeError, ValueError):
+        return False
+    if remaining_budget <= 0:
+        return False
+    deadline = float(wall_time()) + remaining_budget
+    while True:
+        remaining = deadline - float(wall_time())
+        if remaining <= 0:
+            return _snapshot_shows_active(_live_snapshot(fleet, bambu_id))
+        sleep_fn(min(CLOUD_SEND_CONFIRM_POLL_SECONDS, remaining))
+        if _snapshot_shows_active(_live_snapshot(fleet, bambu_id)):
+            return True
+
+
+def _report_confirmed_dispatch(key, dpf, spool_dir: str, router) -> None:
+    batch_id, bambu_id, _plate_index = key
+    if router is not None and hasattr(router, "mark_assignment_active"):
+        router.mark_assignment_active(str(bambu_id))
+    try:
+        _write_cloud_send_marker(
+            _cloud_send_started_path(spool_dir, key), STARTED_MARKER_CONFIRMED,
+        )
+    except OSError:
+        pass
+    dpf.report_dispatched(batch_id, bambu_id)
+
+
+def _clear_pending_cloud_send(spool_dir: str, key, started_sends, router) -> None:
+    _batch_id, bambu_id, _plate_index = key
+    started_sends.discard(key)
+    leftover = _cloud_send_started_path(spool_dir, key)
+    try:
+        os.unlink(leftover)
+    except OSError:
+        pass
+    if router is not None and _router_assignment_matches(router, key):
+        clearer = getattr(router, "clear_assignment", None)
+        if callable(clearer):
+            clearer(str(bambu_id))
+
+
+def _confirm_or_abandon_cloud_send(key, fleet, dpf, spool_dir: str,
+                                  started_sends, router, wall_time) -> None:
+    batch_id, bambu_id, plate_index = key
+    started_path = _cloud_send_started_path(spool_dir, key)
+    if _cloud_send_already_confirmed(started_path, router, bambu_id):
+        dpf.report_dispatched(batch_id, bambu_id)
+        return
+    if _snapshot_shows_active(_live_snapshot(fleet, str(bambu_id))):
+        _report_confirmed_dispatch(key, dpf, spool_dir, router)
+        return
+    if (
+        _cloud_send_start_age_seconds(started_path, router, str(bambu_id), wall_time)
+        < ASSIGNMENT_STARTUP_GRACE_SECONDS
+    ):
+        return
+    logger.warning(
+        "cloud send %s: printer %s never left idle after start; "
+        "clearing local start so the cloud can retry SENDING",
+        batch_id, bambu_id,
+    )
+    _clear_pending_cloud_send(spool_dir, key, started_sends, router)
+    report_failed = getattr(dpf, "report_failed", None)
+    if callable(report_failed):
+        report_failed(
+            batch_id, plate_index,
+            reason="printer stayed idle after start command",
+        )
 
 
 def _router_assignment_matches(router, key) -> bool:

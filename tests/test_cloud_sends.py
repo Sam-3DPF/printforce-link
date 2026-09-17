@@ -5,10 +5,16 @@ from bridge.app import (
     LEGACY_MARKER_MIN_AGE_SECONDS,
     LEGACY_READY_OBSERVATION_LIMIT,
     LEGACY_READY_OBSERVATION_MIN_GAP_SECONDS,
+    STARTED_MARKER_CONFIRMED,
     _LegacyMarkerReadiness,
-    _handle_cloud_sends,
+    _handle_cloud_sends as _handle_cloud_sends_impl,
 )
-from bridge.router import Dispatcher, Router
+from bridge.router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
+
+
+def _handle_cloud_sends(*args, **kwargs):
+    kwargs.setdefault("confirm_wait_seconds", 0)
+    return _handle_cloud_sends_impl(*args, **kwargs)
 
 
 class _FakeDpf:
@@ -17,6 +23,7 @@ class _FakeDpf:
         self.desired = desired
         self.downloads = []
         self.dispatched = []
+        self.failed = []
 
     def download_url(self, url, dest):
         self.downloads.append((url, dest))
@@ -27,6 +34,10 @@ class _FakeDpf:
 
     def report_dispatched(self, batch_id, bambu_id):
         self.dispatched.append((batch_id, bambu_id))
+        return {"batch_id": batch_id}
+
+    def report_failed(self, batch_id, plate_number=None, reason=None):
+        self.failed.append((batch_id, plate_number, reason))
         return {"batch_id": batch_id}
 
     def heartbeat(self):
@@ -125,6 +136,23 @@ class _LegacySnapshotFleet(_FakeFleet):
         return self._printer if bambu_id == "P1" else None
 
 
+class _ConfirmFleet(_LegacySnapshotFleet):
+    """Live snapshot whose status can change when MQTT start is accepted."""
+
+    def __init__(self, status="IDLE", status_after_start=None):
+        super().__init__(_legacy_ready_snapshot(status=status))
+        self._status_after_start = status_after_start
+
+    def set_status(self, status):
+        self._printer._snapshot = _legacy_ready_snapshot(status=status)
+
+    def start_print(self, bambu_id, remote_name, mapping, plate_index=1):
+        started = super().start_print(bambu_id, remote_name, mapping, plate_index)
+        if self._status_after_start is not None:
+            self.set_status(self._status_after_start)
+        return started
+
+
 class _FakeClock:
     def __init__(self, now=1_000.0):
         self.now = now
@@ -142,7 +170,7 @@ def _age_marker(marker, clock, age=LEGACY_MARKER_MIN_AGE_SECONDS):
 
 
 def test_cloud_send_starts_once_then_only_re_reports(tmp_path):
-    fleet = _FakeFleet()
+    fleet = _ConfirmFleet(status_after_start="PRINTING")
     dpf = _FakeDpf()
     started = set()
     desired = _desired()
@@ -191,13 +219,136 @@ def test_cloud_send_skips_dispatch_when_printer_not_idle(tmp_path):
 
 
 def test_restart_with_started_marker_only_re_reports(tmp_path):
-    fleet = _FakeFleet()
+    fleet = _ConfirmFleet(status_after_start="PRINTING")
     dpf = _FakeDpf()
     _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set())
     assert len(fleet.calls) == 1
     _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set())
     assert len(fleet.calls) == 1
     assert dpf.dispatched == [("B1", "P1"), ("B1", "P1")]
+
+
+def test_upload_ok_mqtt_true_still_idle_does_not_report_dispatched(tmp_path):
+    fleet = _ConfirmFleet()
+    dpf = _FakeDpf()
+    started = set()
+
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started)
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started)
+
+    assert len(fleet.uploads) == 1
+    assert len(fleet.starts) == 1
+    assert dpf.dispatched == []
+    assert dpf.failed == []
+    assert (tmp_path / "cloud-send-B1-P1-plate-2.started").exists()
+    assert started == {("B1", "P1", 2)}
+
+
+def test_printing_observed_reports_dispatched_once(tmp_path):
+    fleet = _ConfirmFleet()
+    dpf = _FakeDpf()
+    started = set()
+    router = Router(str(tmp_path / "queue.json"))
+
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+    )
+    assert dpf.dispatched == []
+    assert router.assignments_snapshot()["P1"]["observed_active"] is False
+
+    fleet.set_status("PRINTING")
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+    )
+
+    assert dpf.dispatched == [("B1", "P1")]
+    assert dpf.failed == []
+    assert router.assignments_snapshot()["P1"]["observed_active"] is True
+    assert (
+        (tmp_path / "cloud-send-B1-P1-plate-2.started").read_text()
+        == STARTED_MARKER_CONFIRMED
+    )
+
+
+def test_paused_after_mqtt_true_reports_dispatched(tmp_path):
+    fleet = _ConfirmFleet(status_after_start="PAUSED")
+    dpf = _FakeDpf()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set())
+    assert dpf.dispatched == [("B1", "P1")]
+
+
+def test_confirm_wait_reports_when_printer_becomes_printing(tmp_path):
+    fleet = _ConfirmFleet()
+    dpf = _FakeDpf()
+    polls = {"n": 0}
+
+    def sleep_fn(_seconds):
+        polls["n"] += 1
+        if polls["n"] >= 2:
+            fleet.set_status("PRINTING")
+
+    _handle_cloud_sends_impl(
+        _desired(), fleet, dpf, str(tmp_path), set(),
+        confirm_wait_seconds=2.0, sleep_fn=sleep_fn,
+    )
+
+    assert polls["n"] >= 2
+    assert dpf.dispatched == [("B1", "P1")]
+
+
+def test_idle_after_start_timeout_clears_marker_and_reports_failed(tmp_path):
+    clock = _FakeClock()
+    fleet = _ConfirmFleet()
+    dpf = _FakeDpf()
+    router = Router(str(tmp_path / "queue.json"))
+    started = set()
+    marker = tmp_path / "cloud-send-B1-P1-plate-2.started"
+
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert len(fleet.starts) == 1
+    assert marker.exists()
+    assert dpf.dispatched == []
+    assert "P1" in router.assignments_snapshot()
+
+    clock.advance(ASSIGNMENT_STARTUP_GRACE_SECONDS - 1)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert marker.exists()
+    assert dpf.dispatched == []
+    assert dpf.failed == []
+    assert started == {("B1", "P1", 2)}
+
+    clock.advance(1)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+
+    assert dpf.dispatched == []
+    assert dpf.failed == [("B1", 2, "printer stayed idle after start command")]
+    assert not marker.exists()
+    assert "P1" not in router.assignments_snapshot()
+    assert started == set()
+
+
+def test_confirmed_marker_re_reports_without_live_printing(tmp_path):
+    fleet = _ConfirmFleet(status_after_start="PRINTING")
+    dpf = _FakeDpf()
+    started = set()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started)
+    assert dpf.dispatched == [("B1", "P1")]
+
+    fleet.set_status("IDLE")
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started)
+
+    assert dpf.dispatched == [("B1", "P1"), ("B1", "P1")]
+    assert dpf.failed == []
+    assert (tmp_path / "cloud-send-B1-P1-plate-2.started").exists()
 
 
 def test_plate_one_clear_to_plate_two_immediate_desired_starts_each_plate_once(tmp_path):
@@ -295,7 +446,7 @@ def test_idle_no_file_legacy_marker_requires_age_and_two_separated_observations(
     assert [call[3] for call in fleet.calls] == [2]
     assert not legacy_marker.exists()
     assert (tmp_path / "cloud-send-B1-P1-plate-2.started").exists()
-    assert dpf.dispatched == [("B1", "P1"), ("B1", "P1")]
+    assert dpf.dispatched == []
 
 
 def test_historical_failed_ready_legacy_marker_allows_next_plate(tmp_path):
@@ -545,7 +696,7 @@ class _FakeRouter:
     def __init__(self):
         self.assignments = []
 
-    def record_assignment(self, bambu_id, batch_id, plate_number=None):
+    def record_assignment(self, bambu_id, batch_id, plate_number=None, started_at=None):
         self.assignments.append((bambu_id, batch_id, plate_number))
 
 
