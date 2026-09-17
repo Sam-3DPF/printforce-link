@@ -50,13 +50,22 @@ class FakeClient:
     printer off the LAN.
     """
 
-    def __init__(self, payloads, connected=True, after_pushall=None):
+    def __init__(self, payloads, connected=True, after_pushall=None,
+                 absorb_dumps=None):
         self._payloads = list(payloads)
         self._last = {}
         self.connected = connected
         self.after_pushall = after_pushall
+        self.absorb_dumps = list(absorb_dumps or [])
 
     def mqtt_dump(self):
+        if getattr(self, "_absorbing", False):
+            remaining = getattr(self, "_absorb_remaining", None)
+            if remaining:
+                self._last = remaining.pop(0)
+            elif self.after_pushall is not None:
+                self._last = self.after_pushall
+            return self._last
         if getattr(self, "_next_dump_is_absorb", False):
             self._next_dump_is_absorb = False
             if self.after_pushall is not None:
@@ -71,8 +80,16 @@ class FakeClient:
 
     def pushall(self):
         self.pushall_calls = getattr(self, "pushall_calls", 0) + 1
-        self._next_dump_is_absorb = True
+        if self.absorb_dumps:
+            self._absorbing = True
+            self._absorb_remaining = list(self.absorb_dumps)
+        else:
+            self._next_dump_is_absorb = True
         return True
+
+    def finish_absorb(self):
+        self._absorbing = False
+        self._absorb_remaining = []
 
     def push(self, payload):
         """The printer sends a new report."""
@@ -89,7 +106,7 @@ def _stopwatch(monotonic=None, wall_clock=None) -> PrintStopwatch:
 
 def _printer(payloads, monotonic=None, wall_clock=None, connected=True,
              stale_after_seconds=_DEFAULT_STALE_AFTER_SECONDS,
-             after_pushall=None) -> BambuPrinter:
+             after_pushall=None, absorb_dumps=None) -> BambuPrinter:
     cfg = PrinterConfig(bambu_id=_BAMBU_ID, ip="10.0.0.5",
                         access_code="secret", name="P1S-1")
     # The printer's clock defaults to a *frozen* one, so a test that says nothing about
@@ -101,6 +118,7 @@ def _printer(payloads, monotonic=None, wall_clock=None, connected=True,
                            sleep=lambda _seconds: None)
     printer._client = FakeClient(
         payloads, connected=connected, after_pushall=after_pushall,
+        absorb_dumps=absorb_dumps,
     )
     return printer
 
@@ -657,6 +675,65 @@ def test_pushall_absorbs_the_full_ams_dump_before_the_next_delta():
         "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
     ]
     assert snapshot["tray_exist_bits"] == "f"
+
+
+def test_mid_print_absorb_keeps_full_ams_when_a_delta_overwrites_mqtt_dump():
+    """While PRINTING, mqtt_dump is overwritten by frequent deltas. A single
+    read after 2s sees the stub. Live P1S-6 on 0.1.14 stored bits `f` and left
+    slots 2-4 Empty."""
+    stub = {"print": {
+        "gcode_state": "RUNNING",
+        "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]}]},
+    }}
+    full = {"print": {
+        "gcode_state": "RUNNING",
+        "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+            {"id": "2", "tray_color": "000000FF", "tray_type": "PLA"},
+            {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+        ]}]},
+    }}
+    printer = _printer([stub], absorb_dumps=[stub, full, stub])
+    snapshot = printer.snapshot()
+    assert [slot["color_hex"] for slot in snapshot["slots"]] == [
+        "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
+    ]
+    assert snapshot["tray_exist_bits"] == "f"
+
+
+def test_print_end_asks_for_a_full_ams_dump_again():
+    """Refresh during a job may never get idle-tray hex. Ask again when the
+    print ends, even if the connect-time pushall budget is spent."""
+    stub = {"print": {
+        "gcode_state": "RUNNING",
+        "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]}]},
+    }}
+    ended = {"print": {
+        "gcode_state": "FINISH",
+        "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]}]},
+    }}
+    printer = _printer([stub, ended])
+    printer.snapshot()
+    printer._full_status_attempts = 3
+    printer._client.pushall_calls = 0
+    printer.snapshot()
+    assert printer._client.pushall_calls >= 1
 
 
 def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(tmp_path):
