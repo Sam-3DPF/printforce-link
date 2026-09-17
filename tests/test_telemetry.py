@@ -739,6 +739,34 @@ def test_mqtt_message_keeps_idle_hex_when_dump_is_already_a_stub():
     ]
 
 
+def test_snapshot_asks_rfid_for_p1s9_blank_loaded_trays():
+    """Live P1S-9 on 0.1.17: bits `ff`, slots 1-2 and 7-8 have hex, 3-6 do not.
+    Automatic pushall used read_idle_rfid=False, so those four never got RFID."""
+    stub = {"print": {
+        "gcode_state": "FINISH",
+        "ams": {"tray_exist_bits": "ff", "ams": [
+            {"id": "0", "tray": [
+                {"id": "0", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+                {"id": "1", "tray_color": "000000FF", "tray_type": "PLA"},
+                {"id": "2"},
+                {"id": "3"},
+            ]},
+            {"id": "1", "tray": [
+                {"id": "0"},
+                {"id": "1"},
+                {"id": "2", "tray_color": "9B9EA0FF", "tray_type": "PLA"},
+                {"id": "3", "tray_color": "042F56FF", "tray_type": "PLA"},
+            ]},
+        ]},
+    }}
+    printer = _printer([stub], absorb_dumps=[stub, stub, stub])
+    printer.snapshot()
+    published = getattr(printer._client, "published", [])
+    assert [(item["print"]["ams_id"], item["print"]["slot_id"]) for item in published] == [
+        (0, 2), (0, 3), (1, 0), (1, 1),
+    ]
+
+
 def test_refresh_asks_ams_get_rfid_for_loaded_trays_without_hex():
     stub = {"print": {
         "gcode_state": "FINISH",
@@ -751,6 +779,7 @@ def test_refresh_asks_ams_get_rfid_for_loaded_trays_without_hex():
     }}
     printer = _printer([stub], absorb_dumps=[stub, stub, stub])
     printer.snapshot()
+    printer._client.published = []
     printer.request_full_status()
     published = getattr(printer._client, "published", [])
     commands = [item["print"] for item in published]
@@ -785,8 +814,12 @@ def test_print_end_asks_for_a_full_ams_dump_again():
     printer.snapshot()
     printer._full_status_attempts = 3
     printer._client.pushall_calls = 0
+    printer._client.published = []
     printer.snapshot()
     assert printer._client.pushall_calls >= 1
+    assert [item["print"]["command"] for item in printer._client.published] == [
+        "ams_get_rfid", "ams_get_rfid", "ams_get_rfid",
+    ]
 
 
 def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(tmp_path):
