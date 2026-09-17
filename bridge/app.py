@@ -44,6 +44,7 @@ CLOUD_SEND_CONFIRM_WAIT_SECONDS = 8.0
 CLOUD_SEND_CONFIRM_POLL_SECONDS = 0.5
 STARTED_MARKER_COMMANDED = "commanded"
 STARTED_MARKER_CONFIRMED = "confirmed"
+RETRY_IDLE_START_AFTER_SECONDS = 20.0
 
 
 class _LegacyMarkerReadiness:
@@ -573,6 +574,12 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     str(bambu_id), str(batch_id), plate_index,
                     started_at=_cloud_send_started_at(started_path, wall_time),
                 )
+            if _should_retry_idle_start(
+                fleet, bambu_id, started_path, wall_time, router,
+            ):
+                _retry_idle_mqtt_start(
+                    send, fleet, bambu_id, dest, plate_index,
+                )
             _confirm_or_abandon_cloud_send(
                 key, fleet, dpf, spool_dir, started_sends, router, wall_time,
             )
@@ -627,7 +634,9 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     batch_id,
                 )
                 continue
-            ams_mapping = _resolve_cloud_ams_mapping(fresh_send, fleet, bambu_id)
+            rematch = _resolve_cloud_ams_mapping(fresh_send, fleet, bambu_id)
+            if rematch is not None:
+                ams_mapping = rematch
             if ams_mapping is None:
                 logger.warning(
                     "cloud send %s: live AMS changed after upload; "
@@ -1024,11 +1033,47 @@ def _legacy_marker_snapshot_allows_start(snapshot) -> bool:
     )
 
 
-def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[list]:
-    """Validate the sparse contract and use live slots whenever a snapshot exists.
+def _printer_still_idle(fleet, bambu_id: str) -> bool:
+    live = _live_snapshot(fleet, bambu_id)
+    return isinstance(live, dict) and live.get("status") == "IDLE"
 
-    Missing/legacy contracts, stale live mismatches, and compact mappings fail
-    closed so profile positions cannot silently bind to the wrong material.
+
+def _should_retry_idle_start(fleet, bambu_id: str, started_path: str, wall_time,
+                             router=None) -> bool:
+    if _cloud_send_already_confirmed(started_path, router, str(bambu_id)):
+        return False
+    if not _printer_still_idle(fleet, bambu_id):
+        return False
+    age = _cloud_send_start_age_seconds(
+        started_path, router, str(bambu_id), wall_time,
+    )
+    return (
+        RETRY_IDLE_START_AFTER_SECONDS <= age < ASSIGNMENT_STARTUP_GRACE_SECONDS
+    )
+
+
+def _retry_idle_mqtt_start(send, fleet, bambu_id: str, dest: str,
+                           plate_index: int) -> None:
+    if not os.path.exists(dest) or not hasattr(fleet, "start_print"):
+        return
+    ams_mapping = _resolve_cloud_ams_mapping(send, fleet, bambu_id)
+    if ams_mapping is None:
+        return
+    remote_name = _cloud_remote_name(send)
+    fleet.start_print(
+        bambu_id, remote_name or os.path.basename(dest),
+        ams_mapping, plate_index,
+    )
+
+
+def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[list]:
+    """Validate the sparse contract. Remap from live slots when a unit list exists.
+
+    `slots is None` is Link's "no AMS unit list this cycle". That is not a tray
+    disagreement. Use the already-validated cloud mapping so upload-then-start
+    still fires. A live list that uniquely remaps wins. If that list cannot
+    uniquely bind, use the cloud mapping. A malformed `slots` value and a
+    broken snapshot with no `slots` key still fail closed.
     """
     logical_required = _required_filaments(send)
     if logical_required is None:
@@ -1037,8 +1082,18 @@ def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[lis
     if validated is None:
         return None
     live = _live_snapshot(fleet, bambu_id)
-    if live is not None:
-        return _mapping_from_live_slots(logical_required, live)
+    if live is None:
+        return validated
+    if not isinstance(live, dict) or "slots" not in live:
+        return None
+    slots = live.get("slots")
+    if slots is None:
+        return validated
+    if not isinstance(slots, list):
+        return None
+    live_mapping = _mapping_from_live_slots(logical_required, live)
+    if live_mapping is not None:
+        return live_mapping
     return validated
 
 
