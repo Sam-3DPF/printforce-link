@@ -690,7 +690,7 @@ class BambuPrinter:
 
     def _ams_complete(self) -> bool:
         with self._payload_lock:
-            return parse_ams(self._cached) is not None
+            return not ams_needs_pushall(self._cached or {})
 
     def _ingest_status(self, raw) -> bool:
         """Merge one MQTT document into `_cached`. The library dump is not the source

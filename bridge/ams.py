@@ -20,9 +20,10 @@ Slot numbers are global across AMS units: unit_index * 4 + tray_index + 1.
 
 **An empty tray is a slot whose `tray_exist_bits` bit is cleared.** An `{id}`-only
 tray on a P1 is also how idle loaded trays arrive, so that shape alone is not Empty.
-We emit null color/type only when the bitmask says the spool is gone. A mixed
-filled-plus-blank dump without that confirmation is incomplete: `parse_ams` returns
-None so the cloud does not store Empty for a tray that is still loaded.
+We emit null color/type only when the bitmask says the spool is gone. When the
+bits say the spool is in, we still emit that tray (null hex) so Refresh sends the
+same full list first-connect would. A mixed filled-plus-blank dump with no bits
+is incomplete: `parse_ams` returns None so the cloud does not store Empty.
 
 Never infer "empty" from an all-zero color. A loaded black spool whose RFID read
 failed still reports a color, and conflating the two is precisely the failure mode
@@ -89,9 +90,9 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
 
     `None` means we do not have a finished AMS reading. That includes a payload with
     no unit list, and a P1 dump that lists trays as `{id}` only without
-    `tray_exist_bits` proving those slots are empty. Emitting Empty for that mix is
-    what stored P1S-6 slots 2-4 as Empty on Main. Returning `[]` for "no information"
-    is what let a healthy printer's slots be wiped:
+    `tray_exist_bits`. Emitting Empty for that mix is what stored P1S-6 slots 2-4 as
+    Empty on Main. Returning `[]` for "no information" is what let a healthy
+    printer's slots be wiped:
 
       Bambu pushes a full status once and then sends deltas. `mqtt_dump()` accumulates
       only one level deep, so between connecting and the first full push a printer's
@@ -143,15 +144,15 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
                     "color_hex": color_hex,
                     "filament_type": filament_type,
                 })
-            elif present is False:
+            elif present is False or bits is not None:
+                # Bit-present idle trays stay on the first-connect list. Returning
+                # None here swallowed a sibling RFID hex (0.1.16).
                 slots.append({
                     "slot_number": slot_number,
                     "color_hex": None,
                     "filament_type": None,
                 })
             else:
-                # Loaded (or unknown) with no reading. Emitting Empty is what
-                # stored P1S-6 slots 2-4 as Empty on Main.
                 incomplete = True
     if incomplete:
         return None
@@ -206,10 +207,12 @@ def idle_trays_needing_rfid(status) -> List[tuple]:
 def ams_needs_pushall(status) -> bool:
     """True when a full MQTT dump is still needed to know loaded tray colours.
 
-    `parse_ams` is None for both "no unit list yet" and "id-only idle trays
-    that we must not store as Empty". Both need `pushall`.
+    `parse_ams` is None when there is no unit list yet. A bit-present idle
+    tray with no hex still needs `pushall` so Refresh can ask RFID.
     """
-    return parse_ams(status) is None
+    if parse_ams(status) is None:
+        return True
+    return bool(idle_trays_needing_rfid(status))
 
 
 def merge_ams(previous, incoming):

@@ -99,7 +99,10 @@ def test_parse_ams_does_not_store_empty_for_a_partial_p1_dump():
     assert parse_ams(status) is None
 
 
-def test_parse_ams_does_not_store_empty_when_bits_say_the_blank_trays_are_loaded():
+def test_parse_ams_emits_the_first_connect_tray_list_when_bits_say_loaded():
+    """First-connect and Refresh share pushall. Returning None here dropped the
+    full tray list, so a later RFID hex on one idle tray never reached the cloud.
+    Emit every bit-present tray. Empty only when the bit is cleared."""
     status = {"print": {"ams": {"tray_exist_bits": "f", "ams": [
         {"id": "0", "tray": [
             {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
@@ -108,7 +111,46 @@ def test_parse_ams_does_not_store_empty_when_bits_say_the_blank_trays_are_loaded
             {"id": "3"},
         ]},
     ]}}}
-    assert parse_ams(status) is None
+    assert parse_ams(status) == [
+        {"slot_number": 1, "color_hex": "E8AFCFFF", "filament_type": "PLA"},
+        {"slot_number": 2, "color_hex": None, "filament_type": None},
+        {"slot_number": 3, "color_hex": None, "filament_type": None},
+        {"slot_number": 4, "color_hex": None, "filament_type": None},
+    ]
+
+
+def test_parse_ams_first_connect_dual_ams_emits_every_bit_present_tray():
+    """P1S-9 live 2026-09-17: bits `ff`, zero slot rows. A new pair has no
+    last-known list to keep. Returning None leaves the card empty."""
+    trays = (
+        [{"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"}]
+        + [{"id": str(i)} for i in range(1, 4)]
+    )
+    status = {"print": {"ams": {"tray_exist_bits": "ff", "ams": [
+        {"id": "0", "tray": trays},
+        {"id": "1", "tray": [{"id": str(i)} for i in range(4)]},
+    ]}}}
+    slots = parse_ams(status)
+    assert [slot["slot_number"] for slot in slots] == list(range(1, 9))
+    assert slots[0]["color_hex"] == "E8AFCFFF"
+    assert [slot["color_hex"] for slot in slots[1:]] == [None] * 7
+
+
+def test_parse_ams_keeps_a_sibling_rfid_hex_when_other_idle_trays_are_still_blank():
+    status = {"print": {"ams": {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+            {"id": "2"},
+            {"id": "3"},
+        ]},
+    ]}}}
+    assert parse_ams(status) == [
+        {"slot_number": 1, "color_hex": "E8AFCFFF", "filament_type": "PLA"},
+        {"slot_number": 2, "color_hex": "A3D8E1FF", "filament_type": "PLA"},
+        {"slot_number": 3, "color_hex": None, "filament_type": None},
+        {"slot_number": 4, "color_hex": None, "filament_type": None},
+    ]
 
 
 def test_parse_ams_loaded_black_spool_is_not_mistaken_for_empty():

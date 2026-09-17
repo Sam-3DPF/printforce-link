@@ -591,7 +591,12 @@ def test_partial_ams_with_loaded_bits_asks_the_printer_for_a_full_dump():
         },
     }])
     snapshot = printer.snapshot()
-    assert snapshot["slots"] is None
+    assert snapshot["slots"] == [
+        {"slot_number": 1, "color_hex": "E8AFCFFF", "filament_type": "PLA"},
+        {"slot_number": 2, "color_hex": None, "filament_type": None},
+        {"slot_number": 3, "color_hex": None, "filament_type": None},
+        {"slot_number": 4, "color_hex": None, "filament_type": None},
+    ]
     assert printer._client.pushall_calls == 1
 
 
