@@ -637,9 +637,9 @@ class BambuPrinter:
 
         P1-series printers only send AMS on `pushing.pushall`, not on the incremental
         reports the poll already reads. True is not an ack — the next `snapshot()`
-        that carries a `slots` list is the confirmation. Refresh also sends
-        `ams_get_rfid` for loaded trays that still have no hex; connect-time
-        pushall does not.
+        that carries a `slots` list is the confirmation. Automatic pushall
+        (connect, snapshot, print-end) and Refresh both send `ams_get_rfid`
+        when loaded trays still have no hex.
         """
         if self._client is None:
             raise RuntimeError("printer not connected")
@@ -780,11 +780,17 @@ class BambuPrinter:
         return asked
 
     def _request_ams_if_needed(self) -> None:
-        """Ask for a full dump after connect, and again while loaded trays have no hex."""
+        """Ask for a full dump after connect, and again while loaded trays have no hex.
+
+        `pushall` alone does not read idle P1 RFID. When the dump still has
+        bit-present trays with no hex, follow it with `ams_get_rfid` the same
+        way Refresh does. Print-end resets the attempt budget so a Refresh
+        that ran during the job can try again once the printer is idle.
+        """
         if self._full_status_attempts >= _MAX_FULL_STATUS_ATTEMPTS:
             return
         try:
-            if self.request_full_status(read_idle_rfid=False):
+            if self.request_full_status(read_idle_rfid=True):
                 self._full_status_attempts += 1
                 self._asked_full_status = True
         except Exception:
