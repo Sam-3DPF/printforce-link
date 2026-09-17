@@ -79,6 +79,11 @@ class FakeClient:
         self._absorb_remaining = list(self.absorb_dumps)
         return True
 
+    def publish_command(self, payload):
+        self.published = getattr(self, "published", [])
+        self.published.append(payload)
+        return True
+
     def finish_absorb(self):
         self._absorbing = False
         self._absorb_remaining = []
@@ -697,6 +702,57 @@ def test_mid_print_absorb_keeps_full_ams_when_a_delta_overwrites_mqtt_dump():
         "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
     ]
     assert snapshot["tray_exist_bits"] == "f"
+
+
+def test_mqtt_message_keeps_idle_hex_when_dump_is_already_a_stub():
+    """Live P1S-6 on 0.1.15: mqtt_dump never held idle hex. The full AMS
+    was on the MQTT message; the library `|=` replaced it before a poll."""
+    stub = {"print": {
+        "gcode_state": "FINISH",
+        "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]}]},
+    }}
+    full = {"print": {
+        "gcode_state": "FINISH",
+        "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+            {"id": "2", "tray_color": "000000FF", "tray_type": "PLA"},
+            {"id": "3", "tray_color": "FFFFFFFF", "tray_type": "PLA"},
+        ]}]},
+    }}
+    printer = _printer([stub, stub])
+    printer._ingest_status(full)
+    printer._ingest_status(stub)
+    snapshot = printer.snapshot()
+    assert [slot["color_hex"] for slot in snapshot["slots"]] == [
+        "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
+    ]
+
+
+def test_refresh_asks_ams_get_rfid_for_loaded_trays_without_hex():
+    stub = {"print": {
+        "gcode_state": "FINISH",
+        "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]}]},
+    }}
+    printer = _printer([stub], absorb_dumps=[stub, stub, stub])
+    printer.snapshot()
+    printer.request_full_status()
+    published = getattr(printer._client, "published", [])
+    commands = [item["print"] for item in published]
+    assert [cmd["command"] for cmd in commands] == [
+        "ams_get_rfid", "ams_get_rfid", "ams_get_rfid",
+    ]
+    assert [cmd["slot_id"] for cmd in commands] == [1, 2, 3]
 
 
 def test_print_end_asks_for_a_full_ams_dump_again():

@@ -173,6 +173,36 @@ def _tray_color(tray: dict):
     return None
 
 
+def idle_trays_needing_rfid(status) -> List[tuple]:
+    """(ams_id, tray_id) for trays the bitmask says are loaded with no color/type.
+
+    `ams_get_rfid` takes those two indexes. Pushall does not read idle P1 RFID;
+    this is the printer command that does.
+    """
+    units = _ams_container(status).get("ams")
+    if not isinstance(units, list):
+        return []
+    bits = parse_tray_exist_bits(status)
+    needed = []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        unit_index = as_int(unit.get("id"), default=0)
+        for tray in unit.get("tray") or []:
+            if not isinstance(tray, dict):
+                continue
+            tray_index = as_int(tray.get("id"), default=None)
+            if tray_index is None:
+                continue
+            slot_number = unit_index * TRAYS_PER_AMS + tray_index + 1
+            if clean_str(_tray_color(tray)) or clean_str(tray.get("tray_type")):
+                continue
+            if _bit_present(bits, slot_number) is False:
+                continue
+            needed.append((unit_index, tray_index))
+    return needed
+
+
 def ams_needs_pushall(status) -> bool:
     """True when a full MQTT dump is still needed to know loaded tray colours.
 

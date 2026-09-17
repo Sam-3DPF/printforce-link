@@ -10,14 +10,17 @@ entire coupling to `bambulabs_api`; everything else consumes plain dicts.
 """
 
 import copy
+import json
 import logging
 import os
+import threading
 import time
 from typing import Dict, Optional, Tuple
 
 from .ams import (
     ams_has_color,
     ams_needs_pushall,
+    idle_trays_needing_rfid,
     load_remembered_ams,
     merge_ams,
     parse_ams,
@@ -474,6 +477,7 @@ class BambuPrinter:
         self._ip = cfg.ip
         self._client = None
         self._cached: Optional[Dict] = None       # last-known merged payload
+        self._payload_lock = threading.Lock()
         self._stopwatch = stopwatch or PrintStopwatch(cfg.bambu_id)
         self._monotonic = monotonic               # injectable — staleness is otherwise untestable
         self._sleep = sleep
@@ -517,6 +521,7 @@ class BambuPrinter:
     def _connect(self, ip: str) -> None:
         import bambulabs_api as bl  # lazy: pure tests don't need the library
         self._client = bl.Printer(ip, self._cfg.access_code, self._cfg.bambu_id)
+        self._attach_mqtt_listener()
         self._client.connect()
         # Commit the address only after the client is up. If connect() raised, current_ip
         # stays at the old value, so reconcile_connections still sees a mismatch and retries
@@ -627,12 +632,14 @@ class BambuPrinter:
         """Publish stop. True is not an ack — confirm via the next gcode_state."""
         return self._mqtt_command("stop_print")
 
-    def request_full_status(self) -> bool:
+    def request_full_status(self, *, read_idle_rfid: bool = True) -> bool:
         """Ask the printer for a full MQTT dump so AMS trays land in the next snapshot.
 
         P1-series printers only send AMS on `pushing.pushall`, not on the incremental
         reports the poll already reads. True is not an ack — the next `snapshot()`
-        that carries a `slots` list is the confirmation.
+        that carries a `slots` list is the confirmation. Refresh also sends
+        `ams_get_rfid` for loaded trays that still have no hex; connect-time
+        pushall does not.
         """
         if self._client is None:
             raise RuntimeError("printer not connected")
@@ -648,39 +655,136 @@ class BambuPrinter:
             raise RuntimeError("printer client has no pushall()")
         result = pushall()
         logger.info("printer %s: pushall -> %s", self.bambu_id, result)
-        self._absorb_status_after_pushall()
+        self._absorb_status_after_pushall(read_idle_rfid=read_idle_rfid)
         return bool(result)
 
-    def _absorb_status_after_pushall(self) -> None:
-        """Merge every dump in the pushall window. A mid-print delta can overwrite
-        mqtt_dump in under 2s. One late read then stores bits without idle hex."""
+    def _absorb_status_after_pushall(self, *, read_idle_rfid: bool = False) -> None:
+        """Merge the pushall window, then ask idle trays to read RFID if still blank.
+
+        mqtt_dump is one-level-deep (`_data[k] |= v`). A P1 delta replaces `print.ams`
+        before a poll can copy it. Live messages are merged in `_ingest_status`; this
+        loop only waits for those merges and for `ams_get_rfid` replies.
+        """
         try:
-            for i in range(_ABSORB_SAMPLES):
-                if i:
-                    self._sleep(_ABSORB_SAMPLE_SECONDS)
-                try:
-                    raw = self._raw_status()
-                except Exception:
-                    continue
-                if not isinstance(raw, dict) or not raw:
-                    continue
-                if self._cached is None:
-                    self._seed_remembered_ams()
-                self._cached = merge_status_payload(self._cached, raw)
-                self._note_freshness(raw)
-                if parse_ams(self._cached) is not None:
-                    return
+            if self._absorb_until_complete():
+                return
+            if read_idle_rfid and self._request_idle_rfid():
+                self._absorb_until_complete()
         finally:
             finish = getattr(self._client, "finish_absorb", None)
             if callable(finish):
                 finish()
+
+    def _absorb_until_complete(self) -> bool:
+        for i in range(_ABSORB_SAMPLES):
+            if i:
+                self._sleep(_ABSORB_SAMPLE_SECONDS)
+            try:
+                raw = self._raw_status()
+            except Exception:
+                continue
+            self._ingest_status(raw)
+            if self._ams_complete():
+                return True
+        return self._ams_complete()
+
+    def _ams_complete(self) -> bool:
+        with self._payload_lock:
+            return parse_ams(self._cached) is not None
+
+    def _ingest_status(self, raw) -> bool:
+        """Merge one MQTT document into `_cached`. The library dump is not the source
+        of truth for AMS: it has already dropped idle-tray hex by the time we poll.
+        """
+        if not isinstance(raw, dict) or not raw:
+            return False
+        with self._payload_lock:
+            if self._cached is None:
+                self._seed_remembered_ams()
+            self._cached = merge_status_payload(self._cached, raw)
+            return self._note_freshness(raw)
+
+    def _attach_mqtt_listener(self) -> None:
+        mqtt = getattr(self._client, "mqtt_client", None) if self._client else None
+        if mqtt is None:
+            return
+        mqtt.on_message_handler = self._on_library_mqtt_message
+
+    def _on_library_mqtt_message(self, mqtt_client, client, userdata, msg) -> None:
+        try:
+            payload = getattr(msg, "payload", msg)
+            if isinstance(payload, (bytes, bytearray)):
+                doc = json.loads(payload)
+            elif isinstance(payload, str):
+                doc = json.loads(payload)
+            elif isinstance(payload, dict):
+                doc = payload
+            else:
+                return
+        except (TypeError, ValueError):
+            return
+        self._ingest_status(doc)
+
+    def _publish_command(self, payload: dict) -> bool:
+        client = self._client
+        if client is None:
+            return False
+        method = getattr(client, "publish_command", None)
+        if callable(method):
+            return bool(method(payload))
+        mqtt = getattr(client, "mqtt_client", None)
+        if mqtt is None:
+            return False
+        library_publish = getattr(mqtt, "_PrinterMQTTClient__publish_command", None)
+        if callable(library_publish):
+            return bool(library_publish(payload))
+        paho = getattr(mqtt, "_client", None)
+        topic = getattr(mqtt, "command_topic", None)
+        if paho is None or not topic:
+            return False
+        try:
+            result = paho.publish(topic, json.dumps(payload))
+        except Exception:
+            return False
+        wait = getattr(result, "wait_for_publish", None)
+        if callable(wait):
+            try:
+                wait()
+            except Exception:
+                return False
+        published = getattr(result, "is_published", None)
+        return bool(published()) if callable(published) else True
+
+    def _request_idle_rfid(self) -> bool:
+        """`ams_get_rfid` is the printer command HA uses to read one P1 tray."""
+        with self._payload_lock:
+            trays = list(idle_trays_needing_rfid(self._cached or {}))
+        if not trays:
+            return False
+        asked = False
+        for ams_id, slot_id in trays:
+            ok = self._publish_command({
+                "print": {
+                    "sequence_id": "0",
+                    "command": "ams_get_rfid",
+                    "ams_id": ams_id,
+                    "slot_id": slot_id,
+                },
+            })
+            if ok:
+                asked = True
+                logger.info(
+                    "printer %s: ams_get_rfid ams=%s slot=%s",
+                    self.bambu_id, ams_id, slot_id,
+                )
+        return asked
 
     def _request_ams_if_needed(self) -> None:
         """Ask for a full dump after connect, and again while loaded trays have no hex."""
         if self._full_status_attempts >= _MAX_FULL_STATUS_ATTEMPTS:
             return
         try:
-            if self.request_full_status():
+            if self.request_full_status(read_idle_rfid=False):
                 self._full_status_attempts += 1
                 self._asked_full_status = True
         except Exception:
@@ -791,11 +895,7 @@ class BambuPrinter:
             # itself, not on some intermediary.
             return self._go_offline("MQTT link is down")
 
-        fresh = self._note_freshness(raw)
-        if isinstance(raw, dict) and raw:
-            if self._cached is None:
-                self._seed_remembered_ams()
-            self._cached = merge_status_payload(self._cached, raw)
+        fresh = self._ingest_status(raw) if isinstance(raw, dict) and raw else False
 
         if not self._cached:
             # No MQTT push has landed yet — mqtt_dump() returns {} until the first
@@ -854,7 +954,8 @@ class BambuPrinter:
         if not self._offline:
             logger.warning("printer %s -> OFFLINE: %s", self.bambu_id, reason)
             self._offline = True
-        self._cached = None
+        with self._payload_lock:
+            self._cached = None
         self._historical_failed_streak = 0
         return self._offline_snapshot()
 
