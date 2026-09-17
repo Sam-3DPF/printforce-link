@@ -1,5 +1,6 @@
 from bridge.ams import (
     ams_needs_pushall,
+    idle_trays_needing_rfid,
     merge_ams,
     parse_ams,
     parse_tray_exist_bits,
@@ -318,6 +319,22 @@ def test_parse_tray_exist_bits_absent_or_malformed():
     assert parse_tray_exist_bits({"print": {"ams": {}}}) is None
     assert parse_tray_exist_bits({"print": "not-a-dict"}) is None
     assert parse_tray_exist_bits({"print": {"ams": {"tray_exist_bits": True}}}) is None
+
+
+def test_idle_trays_needing_rfid_skips_colored_and_empty_bits():
+    status = {"print": {"ams": {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+            {"id": "2"},
+            {"id": "3"},
+        ]},
+    ]}}}
+    assert idle_trays_needing_rfid(status) == [(0, 1), (0, 2), (0, 3)]
+    empty = {"print": {"ams": {"tray_exist_bits": "1", "ams": [
+        {"id": "0", "tray": [{"id": "0", "tray_color": "E8AFCFFF"}, {"id": "1"}]},
+    ]}}}
+    assert idle_trays_needing_rfid(empty) == []
 
 
 def test_ams_needs_pushall_when_loaded_bits_have_no_color():
