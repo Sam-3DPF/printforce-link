@@ -5,8 +5,10 @@ from bridge.app import (
     LEGACY_MARKER_MIN_AGE_SECONDS,
     LEGACY_READY_OBSERVATION_LIMIT,
     LEGACY_READY_OBSERVATION_MIN_GAP_SECONDS,
+    STARTED_MARKER_COMMANDED,
     STARTED_MARKER_CONFIRMED,
     _LegacyMarkerReadiness,
+    _cloud_send_started_path,
     _handle_cloud_sends as _handle_cloud_sends_impl,
 )
 from bridge.router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
@@ -865,7 +867,7 @@ def test_cloud_send_reuses_one_unique_tray_for_same_color_and_family(tmp_path):
     assert fleet.calls[0][2] == [0, 0]
 
 
-def test_cloud_send_fails_closed_on_ambiguous_or_unknown_live_family(tmp_path):
+def test_cloud_send_uses_cloud_mapping_when_live_family_cannot_uniquely_bind(tmp_path):
     class AmbiguousFleet(_FakeFleet):
         def by_id(self, bambu_id):
             return _SnapPrinter([
@@ -877,7 +879,7 @@ def test_cloud_send_fails_closed_on_ambiguous_or_unknown_live_family(tmp_path):
 
     fleet = AmbiguousFleet()
     _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
-    assert fleet.calls == []
+    assert fleet.starts[0][2] == [-1, -1, -1, 0, -1, -1, -1, -1, 2]
 
 
 def test_cloud_send_does_not_fall_back_when_live_snapshot_has_no_slot_info(tmp_path):
@@ -970,3 +972,122 @@ def test_cloud_send_fails_closed_when_desired_refresh_fails_after_upload(tmp_pat
     assert len(fleet.uploads) == 1
     assert fleet.starts == []
     assert fleet.calls == []
+
+
+def test_cloud_send_uses_cloud_mapping_when_live_slots_are_none(tmp_path):
+    class NoSlotsFleet(_FakeFleet):
+        def by_id(self, bambu_id):
+            return _SnapPrinter(None)
+
+    fleet = NoSlotsFleet()
+    _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
+    assert fleet.starts[0][2] == [-1, -1, -1, 0, -1, -1, -1, -1, 2]
+
+
+class _SlotsThenNoneFleet(_FakeFleet):
+    def __init__(self):
+        super().__init__()
+        self.slots = [
+            {"slot_number": 1, "color_hex": "#D3B7A7", "filament_type": "PLA"},
+            {"slot_number": 3, "color_hex": "#F99963", "filament_type": "PETG"},
+        ]
+
+    def by_id(self, bambu_id):
+        return _SnapPrinter(self.slots)
+
+    def upload(self, bambu_id, dest, remote_name=None):
+        uploaded = super().upload(bambu_id, dest, remote_name=remote_name)
+        self.slots = None
+        return uploaded
+
+
+def test_cloud_send_starts_when_post_upload_snapshot_omits_ams_units(tmp_path):
+    fleet = _SlotsThenNoneFleet()
+    _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
+    assert len(fleet.uploads) == 1
+    assert fleet.starts[0][2] == [-1, -1, -1, 0, -1, -1, -1, -1, 2]
+
+
+class _BreakAfterUploadFleet(_FakeFleet):
+    def __init__(self):
+        super().__init__()
+        self.broken = False
+
+    def by_id(self, bambu_id):
+        if self.broken:
+            class _Broken:
+                def snapshot(self):
+                    raise RuntimeError("mqtt dropped after ftps")
+            return _Broken()
+        return _SnapPrinter([
+            {"slot_number": 1, "color_hex": "#D3B7A7", "filament_type": "PLA"},
+            {"slot_number": 3, "color_hex": "#F99963", "filament_type": "PETG"},
+        ])
+
+    def upload(self, bambu_id, dest, remote_name=None):
+        uploaded = super().upload(bambu_id, dest, remote_name=remote_name)
+        self.broken = True
+        return uploaded
+
+
+def test_cloud_send_starts_when_live_snapshot_fails_after_upload(tmp_path):
+    fleet = _BreakAfterUploadFleet()
+    _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
+    assert len(fleet.uploads) == 1
+    assert fleet.starts[0][2] == [-1, -1, -1, 0, -1, -1, -1, -1, 2]
+
+
+def test_cloud_send_retries_start_while_printer_stays_idle(tmp_path):
+    import os
+    import time
+
+    key = ("B1", "P1", 2)
+    dest = tmp_path / "B1.3mf"
+    dest.write_bytes(b"3mf")
+    started_path = _cloud_send_started_path(str(tmp_path), key)
+    with open(started_path, "w") as handle:
+        handle.write(STARTED_MARKER_COMMANDED)
+    aged = time.time() - 20.0
+    os.utime(started_path, (aged, aged))
+    mtime_before = os.stat(started_path).st_mtime
+    fleet = _ConfirmFleet()
+    dpf = _FakeDpf()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), {key})
+    assert fleet.uploads == []
+    assert fleet.starts[0][2] == [-1, -1, -1, 0, -1, -1, -1, -1, 2]
+    assert fleet.starts[0][3] == 2
+    assert dpf.dispatched == []
+    assert dpf.failed == []
+    assert os.stat(started_path).st_mtime == mtime_before
+
+
+def test_idle_retry_does_not_reset_startup_grace(tmp_path):
+    clock = _FakeClock()
+    fleet = _ConfirmFleet()
+    dpf = _FakeDpf()
+    router = Router(str(tmp_path / "queue.json"))
+    started = set()
+
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert len(fleet.starts) == 1
+    assert dpf.failed == []
+
+    clock.advance(20)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert len(fleet.starts) == 2
+    assert dpf.dispatched == []
+    assert dpf.failed == []
+
+    clock.advance(ASSIGNMENT_STARTUP_GRACE_SECONDS - 20)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert len(fleet.starts) == 2
+    assert dpf.failed == [("B1", 2, "printer stayed idle after start command")]
