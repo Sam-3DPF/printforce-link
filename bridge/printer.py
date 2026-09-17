@@ -85,9 +85,10 @@ _DEFAULT_STALE_AFTER_SECONDS = 45
 # pushall is expensive on the printer. Ask a few times after connect / a partial AMS,
 # then wait for Refresh.
 _MAX_FULL_STATUS_ATTEMPTS = 3
-# mqtt_dump is one-level-deep. Wait briefly after pushall so the full AMS
-# object lands in the library dict before a later P1 delta overwrites it.
-_ABSORB_AFTER_PUSHALL_SECONDS = 2.0
+# mqtt_dump is one-level-deep. Sample across this window after pushall so a
+# mid-print delta cannot hide the full AMS behind one late read.
+_ABSORB_SAMPLES = 6
+_ABSORB_SAMPLE_SECONDS = 0.4
 # Raw firmware labels/codes cross the bridge boundary only in this bounded form.
 _MAX_FIRMWARE_TEXT = 64
 
@@ -491,6 +492,7 @@ class BambuPrinter:
         self._historical_failed_streak = 0
         self._asked_full_status = False
         self._full_status_attempts = 0
+        self._last_gcode_state: Optional[str] = None
         self._ams_cache_path = ams_cache_path
 
     @property
@@ -542,6 +544,7 @@ class BambuPrinter:
         self._last_raw = None
         self._last_fresh_monotonic = None
         self._historical_failed_streak = 0
+        self._last_gcode_state = None
         self._connect(target_ip)
 
     def disconnect(self) -> None:
@@ -649,18 +652,28 @@ class BambuPrinter:
         return bool(result)
 
     def _absorb_status_after_pushall(self) -> None:
-        """Merge the dump that pushall just asked for before the next delta lands."""
-        self._sleep(_ABSORB_AFTER_PUSHALL_SECONDS)
+        """Merge every dump in the pushall window. A mid-print delta can overwrite
+        mqtt_dump in under 2s. One late read then stores bits without idle hex."""
         try:
-            raw = self._raw_status()
-        except Exception:
-            return
-        if not isinstance(raw, dict) or not raw:
-            return
-        if self._cached is None:
-            self._seed_remembered_ams()
-        self._cached = merge_status_payload(self._cached, raw)
-        self._note_freshness(raw)
+            for i in range(_ABSORB_SAMPLES):
+                if i:
+                    self._sleep(_ABSORB_SAMPLE_SECONDS)
+                try:
+                    raw = self._raw_status()
+                except Exception:
+                    continue
+                if not isinstance(raw, dict) or not raw:
+                    continue
+                if self._cached is None:
+                    self._seed_remembered_ams()
+                self._cached = merge_status_payload(self._cached, raw)
+                self._note_freshness(raw)
+                if parse_ams(self._cached) is not None:
+                    return
+        finally:
+            finish = getattr(self._client, "finish_absorb", None)
+            if callable(finish):
+                finish()
 
     def _request_ams_if_needed(self) -> None:
         """Ask for a full dump after connect, and again while loaded trays have no hex."""
@@ -801,6 +814,18 @@ class BambuPrinter:
             self._offline = False
 
         try:
+            gcode_state = None
+            print_obj = self._cached.get("print")
+            if isinstance(print_obj, dict):
+                raw_state = print_obj.get("gcode_state")
+                if isinstance(raw_state, str):
+                    gcode_state = raw_state.strip().upper()
+            if (
+                self._last_gcode_state in _PRINT_IN_PROGRESS
+                and gcode_state in (_PRINT_ENDED | {"IDLE", "PAUSE"})
+            ):
+                self._full_status_attempts = 0
+            self._last_gcode_state = gcode_state
             if ams_needs_pushall(self._cached):
                 self._request_ams_if_needed()
             self._remember_ams()
