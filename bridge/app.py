@@ -644,8 +644,8 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     batch_id,
                 )
                 continue
-            started = fleet.start_print(
-                bambu_id, uploaded or remote_name or os.path.basename(dest),
+            started = _mqtt_start_print(
+                fleet, bambu_id, uploaded or remote_name or os.path.basename(dest),
                 ams_mapping, plate_index,
             )
         else:
@@ -1033,6 +1033,49 @@ def _legacy_marker_snapshot_allows_start(snapshot) -> bool:
     )
 
 
+def _leftover_named_file(snapshot: dict) -> bool:
+    if snapshot.get("has_active_file") is True:
+        return True
+    for key in ("gcode_file", "subtask_name", "current_file"):
+        value = snapshot.get(key)
+        if isinstance(value, str) and value.strip():
+            return True
+    return False
+
+
+def _leftover_finished_idle(snapshot) -> bool:
+    if not isinstance(snapshot, dict) or snapshot.get("status") != "IDLE":
+        return False
+    if not _leftover_named_file(snapshot):
+        return False
+    progress = snapshot.get("progress_percent")
+    stage = snapshot.get("stage")
+    return progress == 100 or stage in (255, "255")
+
+
+def _clear_leftover_finished(fleet, bambu_id: str) -> None:
+    if not _leftover_finished_idle(_live_snapshot(fleet, bambu_id)):
+        return
+    stopper = getattr(fleet, "stop_print", None)
+    if callable(stopper):
+        stopper(bambu_id)
+        return
+    apply_control = getattr(fleet, "apply_control", None)
+    if callable(apply_control):
+        apply_control(bambu_id, "stop")
+        return
+    by_id = getattr(fleet, "by_id", None)
+    printer = by_id(bambu_id) if callable(by_id) else None
+    printer_stop = getattr(printer, "stop_print", None) if printer is not None else None
+    if callable(printer_stop):
+        printer_stop()
+
+
+def _mqtt_start_print(fleet, bambu_id, remote_name, ams_mapping, plate_index):
+    _clear_leftover_finished(fleet, bambu_id)
+    return fleet.start_print(bambu_id, remote_name, ams_mapping, plate_index)
+
+
 def _printer_still_idle(fleet, bambu_id: str) -> bool:
     live = _live_snapshot(fleet, bambu_id)
     return isinstance(live, dict) and live.get("status") == "IDLE"
@@ -1060,8 +1103,8 @@ def _retry_idle_mqtt_start(send, fleet, bambu_id: str, dest: str,
     if ams_mapping is None:
         return
     remote_name = _cloud_remote_name(send)
-    fleet.start_print(
-        bambu_id, remote_name or os.path.basename(dest),
+    _mqtt_start_print(
+        fleet, bambu_id, remote_name or os.path.basename(dest),
         ams_mapping, plate_index,
     )
 
