@@ -51,6 +51,8 @@ class _FakeFleet:
         self.calls = []
         self.uploads = []
         self.starts = []
+        self.stops = []
+        self.commands = []
         self._last_dest = None
 
     def upload(self, bambu_id, dest, remote_name=None):
@@ -58,8 +60,14 @@ class _FakeFleet:
         self._last_dest = dest
         return remote_name or "file.3mf"
 
+    def stop_print(self, bambu_id):
+        self.stops.append(bambu_id)
+        self.commands.append("stop_print")
+        return True
+
     def start_print(self, bambu_id, remote_name, mapping, plate_index=1):
         self.starts.append((bambu_id, remote_name, list(mapping), plate_index))
+        self.commands.append("start_print")
         self.calls.append((bambu_id, self._last_dest, list(mapping), plate_index, remote_name))
         return True
 
@@ -1091,3 +1099,63 @@ def test_idle_retry_does_not_reset_startup_grace(tmp_path):
     )
     assert len(fleet.starts) == 2
     assert dpf.failed == [("B1", 2, "printer stayed idle after start command")]
+
+
+def _leftover_finished_snapshot(**overrides):
+    snapshot = _legacy_ready_snapshot(
+        has_active_file=True,
+        progress_percent=100,
+        stage=255,
+        gcode_file="batch-2026-09-16-mHoX7p9Y-1.3mf",
+    )
+    snapshot.update(overrides)
+    return snapshot
+
+
+def test_leftover_finished_idle_stops_before_mqtt_start(tmp_path):
+    fleet = _ConfirmFleet()
+    fleet._printer._snapshot = _leftover_finished_snapshot()
+    _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
+    assert fleet.stops == ["P1"]
+    assert fleet.commands[:2] == ["stop_print", "start_print"]
+    assert len(fleet.starts) == 1
+
+
+def test_empty_finished_idle_does_not_stop_before_start(tmp_path):
+    fleet = _ConfirmFleet()
+    fleet._printer._snapshot = _legacy_ready_snapshot(
+        has_active_file=False,
+        progress_percent=100,
+        stage=255,
+        gcode_file=None,
+    )
+    _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
+    assert fleet.stops == []
+    assert fleet.commands == ["start_print"]
+
+
+def test_idle_retry_stops_leftover_finished_before_second_start(tmp_path):
+    clock = _FakeClock()
+    fleet = _ConfirmFleet()
+    fleet._printer._snapshot = _leftover_finished_snapshot()
+    dpf = _FakeDpf()
+    router = Router(str(tmp_path / "queue.json"))
+    started = set()
+
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert fleet.stops == ["P1"]
+    assert len(fleet.starts) == 1
+
+    clock.advance(20)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert fleet.stops == ["P1", "P1"]
+    assert len(fleet.starts) == 2
+    assert fleet.commands == [
+        "stop_print", "start_print", "stop_print", "start_print",
+    ]
