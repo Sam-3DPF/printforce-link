@@ -163,13 +163,59 @@ def test_same_ip_wedged_session_is_reconnected():
 
 
 def test_absent_printer_is_not_reconnected():
-    # Offline and not seen on the LAN this scan -> leave it; the next interval scans again.
+    # Offline and not seen on the LAN this scan, and the session is not wedged:
+    # leave it. A one-second drop is still paho's.
     fleet, calls, _ = _fleet([_cfg("S1", "192.168.1.10")], discovered=[])
     p = fleet.by_id("S1")
     p.is_offline = True
     fleet.reconcile_connections()
     assert calls["count"] == 1
     assert p.reconnects == []
+
+
+def test_wedged_printer_rebuilds_when_ssdp_misses_it():
+    # v0.1.23 only rebuilt a wedged session when SSDP answered. A 5s listen was
+    # hearing nothing, so the quiet printers stayed OFFLINE at the IP we already
+    # had. A missed announcement is not proof the printer left the network.
+    factory = FakePrinterFactory()
+    fleet, calls, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[],
+        printer_factory=factory,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.needs_session_rebuild = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+    replacement = fleet.by_id("S1")
+    assert calls["count"] == 1
+    assert replacement.current_ip == "192.168.1.10"
+    assert replacement.connect_calls == 1
+    assert old.disconnect_calls == 1
+
+
+def test_wedged_printer_rebuilds_when_the_scan_fails():
+    factory = FakePrinterFactory()
+
+    def boom(_timeout):
+        raise OSError("ssdp socket unavailable")
+
+    fleet = Fleet(
+        [_cfg("S1", "192.168.8.223")],
+        printer_factory=factory,
+        discover_fn=boom,
+        monotonic=Clock(),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.needs_session_rebuild = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+    assert fleet.by_id("S1").current_ip == "192.168.8.223"
+    assert fleet.by_id("S1").connect_calls == 1
 
 
 def test_scan_is_throttled():

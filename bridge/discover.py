@@ -21,6 +21,7 @@ from typing import Dict, List, Optional
 
 SSDP_PORTS = (1990, 2021)
 SSDP_MCAST = "239.255.255.250"
+SSDP_BROADCAST = "255.255.255.255"
 
 
 @dataclass
@@ -79,6 +80,41 @@ def parse_ssdp_notify(data: bytes, src_ip: str = "") -> Optional[DiscoveredPrint
     )
 
 
+def msearch_packet(port: int) -> bytes:
+    """Ask Bambu printers to answer now, instead of waiting for a NOTIFY.
+
+    A passive listen only hears whoever happens to broadcast during the window.
+    Studio and SimplyPrint send this M-SEARCH; the reply uses the same headers
+    `parse_ssdp_notify` already reads.
+    """
+    return (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_MCAST}:{port}\r\n"
+        "MAN: \"ssdp:discover\"\r\n"
+        "MX: 1\r\n"
+        "ST: urn:bambulab-com:device:3dprinter:1\r\n"
+        "\r\n"
+    ).encode("ascii")
+
+
+def _solicit(sock: socket.socket) -> None:
+    """Best-effort. A network that drops multicast can still answer a broadcast."""
+    try:
+        port = sock.getsockname()[1]
+    except OSError:
+        return
+    packet = msearch_packet(port)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    except OSError:
+        pass
+    for dest in ((SSDP_MCAST, port), (SSDP_BROADCAST, port)):
+        try:
+            sock.sendto(packet, dest)
+        except OSError:
+            continue
+
+
 def _open_socket(port: int, iface_ip: str) -> Optional[socket.socket]:
     try:
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
@@ -100,11 +136,17 @@ def _open_socket(port: int, iface_ip: str) -> Optional[socket.socket]:
 
 
 def discover(timeout: float = 8.0, iface_ip: str = "") -> List[DiscoveredPrinter]:
-    """Listen for SSDP NOTIFY broadcasts for `timeout` seconds and return the
-    unique Bambu printers found (deduplicated by serial)."""
+    """Ask the LAN for Bambu printers, then listen for `timeout` seconds.
+
+    Sends an M-SEARCH on each SSDP port (multicast and broadcast) before the
+    listen, so a printer does not have to announce on its own during the window.
+    Results are deduplicated by serial.
+    """
     socks = [s for s in (_open_socket(p, iface_ip) for p in SSDP_PORTS) if s is not None]
     if not socks:
         return []
+    for sock in socks:
+        _solicit(sock)
 
     found: Dict[str, DiscoveredPrinter] = {}
     end = time.monotonic() + timeout
