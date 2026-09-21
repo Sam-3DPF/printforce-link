@@ -20,6 +20,7 @@ class FakePrinter:
         self.bambu_id = cfg.bambu_id
         self.current_ip = cfg.ip
         self.is_offline = False
+        self.needs_session_rebuild = False
         self.connect_calls = 0
         self.disconnect_calls = 0
         self.reconnects = []            # new_ip passed to each reconnect()
@@ -126,8 +127,8 @@ def test_reconnects_printer_that_moved_ip():
 
 
 def test_same_ip_offline_is_not_reconnected():
-    # Offline but still at the same address: paho keeps retrying, so rebuilding the
-    # client would throw away its in-progress reconnection. Do nothing.
+    # Offline but still at the same address, and the session is not wedged: paho keeps
+    # retrying, so rebuilding the client would throw away its in-progress reconnection.
     fleet, calls, _ = _fleet(
         [_cfg("S1", "192.168.1.10")],
         discovered=[DiscoveredPrinter(ip="192.168.1.10", serial="S1")],
@@ -137,6 +138,28 @@ def test_same_ip_offline_is_not_reconnected():
     fleet.reconcile_connections()
     assert calls["count"] == 1
     assert p.reconnects == []
+
+
+def test_same_ip_wedged_session_is_reconnected():
+    # P1S-9 stayed OFFLINE at the address it was already using. paho will not rebuild
+    # a socket it still considers healthy, so a wedged session has to be replaced here.
+    factory = FakePrinterFactory()
+    fleet, calls, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.10", serial="S1")],
+        printer_factory=factory,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.needs_session_rebuild = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+    replacement = fleet.by_id("S1")
+    assert calls["count"] == 1
+    assert replacement.current_ip == "192.168.1.10"
+    assert replacement.connect_calls == 1
+    assert old.disconnect_calls == 1
 
 
 def test_absent_printer_is_not_reconnected():

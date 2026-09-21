@@ -238,9 +238,13 @@ class Fleet:
         """Self-heal dropped connections (U1). A printer reports OFFLINE when it is
         unreachable — which, after a DHCP lease change, means the bridge is dialing an
         address the printer no longer holds. Re-discover offline printers by serial via
-        SSDP and, when a serial now answers at a DIFFERENT IP, rebuild its client there.
-        A same-IP outage needs nothing: paho keeps retrying the pinned host and snapshot()
-        recovers on its own.
+        SSDP and rebuild the client when that serial answers at a different IP.
+
+        A same-IP outage is left to paho while the drop is brief. If the session is
+        wedged (`needs_session_rebuild`: quiet on a socket that still looks up, or
+        down past the staleness window), rebuild at the current IP too. paho does not
+        reconnect a socket it still considers healthy, and a retry that never lands
+        used to leave the printer OFFLINE until someone restarted Link.
 
         Scans only when at least one printer is offline AND `rediscover_interval` has
         elapsed since the last scan — a healthy farm pays nothing, and a whole farm that
@@ -266,8 +270,14 @@ class Fleet:
             d = found.get(p.bambu_id)
             if d is None or not d.ip:
                 continue                      # not on the LAN right now — keep scanning
-            if d.ip == p.current_ip:
+            wedged = bool(getattr(p, "needs_session_rebuild", False))
+            if d.ip == p.current_ip and not wedged:
                 continue                      # same address; paho is already retrying it
+            if d.ip == p.current_ip:
+                logger.info(
+                    "printer %s is still at %s but its MQTT session is wedged; rebuilding",
+                    p.bambu_id, d.ip,
+                )
             self._schedule_reconnect(p, d.ip)
 
     def _schedule_reconnect(self, printer, new_ip: str) -> None:

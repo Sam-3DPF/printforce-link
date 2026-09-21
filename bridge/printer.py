@@ -85,6 +85,11 @@ _DURATION_DISAGREEMENT_SECONDS = 120
 # (`Config.stale_after_seconds` = state_interval x offline_after_stale_polls); this is
 # the fallback for a `BambuPrinter` built without one, and equals that default (15s x 3).
 _DEFAULT_STALE_AFTER_SECONDS = 45
+# A P1 that has stopped pushing still answers `pushing.start` on a live socket.
+# That is the cheap resume (not `pushall`, which lags a P1 if it is repeated).
+# Sample briefly so the reply can land in this poll; a dead printer does not answer.
+_NUDGE_SAMPLES = 3
+_NUDGE_SAMPLE_SECONDS = 0.2
 # pushall is expensive on the printer. Ask a few times after connect / a partial AMS,
 # then wait for Refresh.
 _MAX_FULL_STATUS_ATTEMPTS = 3
@@ -491,7 +496,15 @@ class BambuPrinter:
         # read that dict as new data and flap the printer back to PRINTING.
         self._last_raw: Optional[Dict] = None
         self._last_fresh_monotonic: Optional[float] = None
+        # Any MQTT report, even one whose merged dump did not change. A finished
+        # plate often republishes the same temperatures; that is still a heartbeat.
+        self._last_message_monotonic: Optional[float] = None
         self._offline = False                     # for logging the edge, not every poll
+        # Set when silence or a down socket outlasts paho's own retry. The fleet
+        # rebuilds that session even if SSDP still answers at the current IP.
+        self._needs_session_rebuild = False
+        self._link_down_monotonic: Optional[float] = None
+        self._last_nudge_monotonic: Optional[float] = None
         self._warned_no_connection_probe = False
         self._historical_failed_streak = 0
         self._asked_full_status = False
@@ -514,6 +527,17 @@ class BambuPrinter:
         """Whether the last snapshot reported this printer OFFLINE. The fleet reads this
         to decide which printers to re-discover and reconnect (U1)."""
         return self._offline
+
+    @property
+    def needs_session_rebuild(self) -> bool:
+        """The MQTT session is wedged, not merely between paho retries.
+
+        True after a printer we have heard from goes silent on a socket that still
+        looks up, or stays disconnected past the staleness window. The fleet rebuilds
+        that client even when SSDP reports the same IP. A brief drop leaves this
+        false so an in-progress paho retry is not thrown away.
+        """
+        return self._needs_session_rebuild
 
     def connect(self) -> None:
         self._connect(self._ip)
@@ -548,6 +572,10 @@ class BambuPrinter:
         self._cached = None
         self._last_raw = None
         self._last_fresh_monotonic = None
+        self._last_message_monotonic = None
+        self._needs_session_rebuild = False
+        self._link_down_monotonic = None
+        self._last_nudge_monotonic = None
         self._historical_failed_streak = 0
         self._last_gcode_state = None
         self._connect(target_ip)
@@ -723,9 +751,10 @@ class BambuPrinter:
                 return
         except (TypeError, ValueError):
             return
+        self._last_message_monotonic = self._monotonic()
         self._ingest_status(doc)
 
-    def _publish_command(self, payload: dict) -> bool:
+    def _publish_command(self, payload: dict, *, wait: bool = True) -> bool:
         client = self._client
         if client is None:
             return False
@@ -735,9 +764,13 @@ class BambuPrinter:
         mqtt = getattr(client, "mqtt_client", None)
         if mqtt is None:
             return False
-        library_publish = getattr(mqtt, "_PrinterMQTTClient__publish_command", None)
-        if callable(library_publish):
-            return bool(library_publish(payload))
+        # The library's publish waits until the broker acks. A half-open socket
+        # never acks, and that wait runs on the fleet's one reporter thread.
+        # Callers that are only nudging a quiet printer must not block on it.
+        if wait:
+            library_publish = getattr(mqtt, "_PrinterMQTTClient__publish_command", None)
+            if callable(library_publish):
+                return bool(library_publish(payload))
         paho = getattr(mqtt, "_client", None)
         topic = getattr(mqtt, "command_topic", None)
         if paho is None or not topic:
@@ -746,10 +779,12 @@ class BambuPrinter:
             result = paho.publish(topic, json.dumps(payload))
         except Exception:
             return False
-        wait = getattr(result, "wait_for_publish", None)
-        if callable(wait):
+        if not wait:
+            return True
+        wait_fn = getattr(result, "wait_for_publish", None)
+        if callable(wait_fn):
             try:
-                wait()
+                wait_fn()
             except Exception:
                 return False
         published = getattr(result, "is_published", None)
@@ -879,13 +914,18 @@ class BambuPrinter:
         printer is demonstrably still there:
 
           * **the MQTT link is up** (`_is_connected`) — authoritative, and cheap; and
-          * **the payload is still moving** (`_stale_for`) — the backstop that catches a
-            wedged printer or a half-open socket the keepalive has not timed out yet, and
-            the only signal at all if a future library drops the connection accessor.
+          * **the printer is still talking** (`_stale_for`) — a new report, or a merged
+            dump that changed. A finished plate often repeats the same temperatures, so
+            an unchanged dump is not by itself a dead printer. A socket that still looks
+            up but has gone quiet is asked once, with `pushing.start`, to resume. No
+            answer reports OFFLINE and asks the fleet to rebuild the session, including
+            at the same IP: paho will not reconnect a socket it still considers healthy.
 
-        Either one failing reports OFFLINE and drops the cache. That direction is
-        deliberate: a false OFFLINE costs a poll of dispatch (visible, and fails closed),
-        a false IDLE costs a print.
+        A link that is actually down reports OFFLINE immediately. paho is given the
+        staleness window to retry; if it is still down after that, the session is
+        rebuilt too. A printer that never answers stays OFFLINE — this does not turn a
+        frozen dump into IDLE. A false OFFLINE costs a poll of dispatch (visible, and
+        fails closed); a false IDLE costs a print.
         """
         try:
             raw = self._raw_status()
@@ -895,11 +935,16 @@ class BambuPrinter:
             # and (see the class docstring) it is not how a printer normally dies.
             return self._go_offline(f"unreadable ({type(e).__name__})")
 
-        if self._is_connected() is False:
+        connected = self._is_connected()
+        if connected is False:
             # Authoritative. In LAN mode the printer *is* the MQTT broker, so paho's
             # keepalive (60s, set by the library) is a liveness check on the printer
-            # itself, not on some intermediary.
+            # itself, not on some intermediary. A brief drop is left for paho; a socket
+            # that stays down is not actually retrying (see `_note_link_down`).
+            self._note_link_down()
             return self._go_offline("MQTT link is down")
+        if connected is True:
+            self._link_down_monotonic = None
 
         fresh = self._ingest_status(raw) if isinstance(raw, dict) and raw else False
 
@@ -909,15 +954,23 @@ class BambuPrinter:
             return self._go_offline("no MQTT payload received yet")
 
         silent_for = self._stale_for()
+        if silent_for is not None and connected is not False and self._nudge_recovered():
+            silent_for = None
         if silent_for is not None:
+            # Heard before, quiet now, and a resume request did not bring a report.
+            # The socket may still say "up". paho will not rebuild that session.
+            if self._last_fresh_monotonic is not None or self._last_message_monotonic is not None:
+                self._needs_session_rebuild = True
             return self._go_offline(
                 f"nothing new for {silent_for:.0f}s (> {self._stale_after_seconds:.0f}s) — "
-                f"the printer is gone, or wedged")
+                f"the printer is gone, or the MQTT session is wedged")
 
         if self._offline:
             # Covers both a recovery and the first payload after a bridge start.
             logger.info("printer %s: online — reporting live telemetry", self.bambu_id)
             self._offline = False
+        self._needs_session_rebuild = False
+        self._last_nudge_monotonic = None
 
         try:
             gcode_state = None
@@ -984,12 +1037,71 @@ class BambuPrinter:
         self._last_fresh_monotonic = self._monotonic()
         return True
 
+    def _heard_monotonic(self) -> Optional[float]:
+        """When this printer last proved it was talking, or None if it never has."""
+        heard = self._last_fresh_monotonic
+        message = self._last_message_monotonic
+        if heard is None:
+            return message
+        if message is None:
+            return heard
+        return max(heard, message)
+
     def _stale_for(self) -> Optional[float]:
         """Seconds of silence, if the printer has been quiet too long — else None."""
-        if self._last_fresh_monotonic is None:
+        heard = self._heard_monotonic()
+        if heard is None:
             return None                 # nothing has ever arrived; the empty cache says so
-        silent_for = self._monotonic() - self._last_fresh_monotonic
+        silent_for = self._monotonic() - heard
         return silent_for if silent_for > self._stale_after_seconds else None
+
+    def _note_link_down(self) -> None:
+        """Give paho one staleness window, then ask the fleet to rebuild the client.
+
+        A same-IP outage used to be left to paho forever. When that retry never
+        lands, the printer stays OFFLINE until someone restarts Link.
+        """
+        now = self._monotonic()
+        if self._link_down_monotonic is None:
+            self._link_down_monotonic = now
+            return
+        heard = self._heard_monotonic()
+        if heard is not None and now - self._link_down_monotonic > self._stale_after_seconds:
+            self._needs_session_rebuild = True
+
+    def _nudge_recovered(self) -> bool:
+        """Ask a quiet printer to resume reports. True only if one actually arrives.
+
+        At most once per staleness window, and only a few short samples: the reporter
+        loop is shared by the whole fleet. `pushing.start` is the documented resume
+        for a P1 that silently stopped pushing; it is not a `pushall`.
+        """
+        now = self._monotonic()
+        if (
+            self._last_nudge_monotonic is not None
+            and now - self._last_nudge_monotonic < self._stale_after_seconds
+        ):
+            return False
+        self._last_nudge_monotonic = now
+        sent = self._publish_command(
+            {"pushing": {"sequence_id": "0", "command": "start"}},
+            wait=False,
+        )
+        if not sent:
+            return False
+        logger.info("printer %s: reports went quiet; requested pushing.start", self.bambu_id)
+        for i in range(_NUDGE_SAMPLES):
+            if i:
+                self._sleep(_NUDGE_SAMPLE_SECONDS)
+            try:
+                raw = self._raw_status()
+            except Exception:
+                return False
+            if isinstance(raw, dict) and raw and self._ingest_status(raw):
+                return True
+            if self._stale_for() is None:
+                return True
+        return False
 
     def _build_snapshot(self, payload: Dict, *, fresh: bool) -> Dict:
         print_obj = payload.get("print")
