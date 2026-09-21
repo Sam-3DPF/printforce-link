@@ -1331,6 +1331,67 @@ def test_a_link_down_past_the_window_requests_a_session_rebuild():
     assert printer.needs_session_rebuild is True
 
 
+def test_a_printer_that_never_pushes_is_asked_then_rebuilt():
+    """After the 0.1.22 restart the quiet printers stayed OFFLINE. A fresh process
+    has not heard them, and a finished P1 does not push until asked. The empty
+    dump used to return before `pushing.start` and before the same-IP rebuild,
+    so SSDP seeing the current address did nothing.
+    """
+    clock = FakeClock()
+    printer = _printer([{}], monotonic=clock.now)
+    assert printer.snapshot()["status"] == "OFFLINE"
+    assert printer.needs_session_rebuild is False
+    assert getattr(printer._client, "published", []) == []
+
+    clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    snapshot = printer.snapshot()
+
+    assert snapshot["status"] == "OFFLINE"
+    assert snapshot["nozzle_temper"] is None
+    assert printer.needs_session_rebuild is True
+    assert printer._client.published[-1]["pushing"]["command"] == "start"
+
+
+def test_a_quiet_printer_that_answers_the_first_push_start_comes_online():
+    """The ask is enough when the socket is up. Do not rebuild a printer that
+    just answered, and do not leave it OFFLINE."""
+    clock = FakeClock()
+    printer = _printer([{}], monotonic=clock.now)
+    printer.snapshot()
+
+    def resume(_payload):
+        printer._client.push({
+            "print": {"gcode_state": "IDLE", "nozzle_temper": 31.0},
+        })
+
+    printer._client.on_publish = resume
+    clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    snapshot = printer.snapshot()
+
+    assert snapshot["status"] == "IDLE"
+    assert snapshot["nozzle_temper"] == 31.0
+    assert printer.needs_session_rebuild is False
+
+
+def test_a_socket_that_never_comes_up_requests_a_rebuild_after_the_window():
+    """A restart can fail the first connect and then sit on that dead client.
+    One second is still paho's. The staleness window means the session is not
+    coming up, even if this process has never heard the printer.
+    """
+    clock = FakeClock()
+    printer = _printer([{}], monotonic=clock.now, connected=False)
+    assert printer.snapshot()["status"] == "OFFLINE"
+    assert printer.needs_session_rebuild is False
+
+    clock.advance(1)
+    assert printer.snapshot()["status"] == "OFFLINE"
+    assert printer.needs_session_rebuild is False
+
+    clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    assert printer.snapshot()["status"] == "OFFLINE"
+    assert printer.needs_session_rebuild is True
+
+
 def test_a_dropped_mqtt_link_reports_offline_without_waiting_out_the_window():
     """The authoritative signal. In LAN-only mode the printer *is* the MQTT broker, so
     paho's keepalive is a liveness check on the machine itself: when it says the link is
