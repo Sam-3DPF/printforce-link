@@ -176,6 +176,52 @@ def _is_historical_failed_candidate(print_obj: Dict, fields: Dict) -> bool:
     )
 
 
+# stg_cur leftovers that still mean "no work on the machine."
+# X1 idle is -1. P1 idle is 255. A cooled P1 after a sticky FAILED often
+# keeps 0 (Bambu's "printing" id) with no file, 0% progress, and 0 targets —
+# P1S-11 on 2026-09-22. That is leftover idle, not a live fault.
+_IDLE_STG_CUR = frozenset({None, 0, -1, 255})
+_LEFTOVER_BLOCKING_HMS = frozenset({"FATAL", "SERIOUS"})
+
+
+def _is_cool_target(value) -> bool:
+    target = as_float(value, None)
+    return target is None or target == 0
+
+
+def _is_leftover_idle_failed(print_obj: Dict, fields: Dict) -> bool:
+    """Sticky FAILED after the machine is already idle.
+
+    historical_failed_ready stays a separate, stricter signal for the cloud
+    assignment gate. This remap is the farm-visible status: do not leave
+    ERROR on a cooled printer with no file, no print_error, and no HMS.
+    """
+    if (fields.get("gcode_state") or "").upper() != "FAILED":
+        return False
+    if not _is_zero_or_absent_error(print_obj.get("print_error")):
+        return False
+    if fields.get("has_active_file") is True:
+        return False
+    # Explicit 0 — a FAILED dump that omits percent is not leftover idle.
+    if as_int(print_obj.get("mc_percent"), None) != 0:
+        return False
+    if as_int(print_obj.get("stg_cur"), None) not in _IDLE_STG_CUR:
+        return False
+    if not _is_cool_target(print_obj.get("nozzle_target_temper")):
+        return False
+    if not _is_cool_target(print_obj.get("bed_target_temper")):
+        return False
+    if "hms" in print_obj:
+        hms = print_obj.get("hms")
+        if not (isinstance(hms, list) and not hms):
+            return False
+    if (fields.get("hms_count") or 0) > 0:
+        return False
+    if fields.get("hms_severity") in _LEFTOVER_BLOCKING_HMS:
+        return False
+    return True
+
+
 def is_cancel_failed(print_error=None, hms_code=None, hms=None) -> bool:
     """True when the printer is sitting on a user-cancel, not a real fail."""
     pe = _norm_error_code(print_error)
@@ -1207,23 +1253,27 @@ class BambuPrinter:
         else:
             # Duplicate/non-fresh reports and every disqualifier break consecutiveness.
             self._historical_failed_streak = 0
+        status = map_status(
+            gcode_state if isinstance(gcode_state, str) else None,
+            print_error=telemetry.get("print_error"),
+            hms_code=telemetry.get("hms_code"),
+            hms=print_obj.get("hms"),
+            user_cancelled=self._user_cancelled,
+        )
+        if status == "ERROR" and _is_leftover_idle_failed(print_obj, telemetry):
+            status = "IDLE"
         return {
             "bambu_id": self.bambu_id,
-            "status": map_status(
-                gcode_state if isinstance(gcode_state, str) else None,
-                print_error=telemetry.get("print_error"),
-                hms_code=telemetry.get("hms_code"),
-                hms=print_obj.get("hms"),
-                user_cancelled=self._user_cancelled,
-            ),
+            "status": status,
             # None — not [] — while this printer's payload carries no AMS unit list,
             # which is its normal state between connecting and the first full push. The
             # cloud DELETES slot rows to match a reported list, so an `[]` here wipes the
             # trays of a live machine that simply has not been asked yet. See `parse_ams`.
             "slots": parse_ams(payload),
             **telemetry,   # flat, not nested — see snapshot()
-            # Status intentionally remains ERROR. This separate signal lets the cloud
-            # check its own assignment state before deciding whether the failure is old.
+            # Leftover idle FAILED is remapped to IDLE above. This stricter
+            # signal still lets the cloud check assignment state on dumps that
+            # do not meet leftover-idle (file leftover, heat, HMS).
             "historical_failed_ready": self._historical_failed_streak >= 2,
             "user_cancelled": self._user_cancelled,
             "print_duration_seconds": self._stopwatch.duration_seconds,

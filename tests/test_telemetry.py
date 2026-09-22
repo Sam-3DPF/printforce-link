@@ -325,7 +325,7 @@ def test_p1s_10_historical_failed_requires_two_consecutive_fresh_observations():
     first = printer.snapshot()
     second = printer.snapshot()
 
-    assert first["status"] == second["status"] == "ERROR"
+    assert first["status"] == second["status"] == "IDLE"
     assert first["historical_failed_ready"] is False
     assert second["historical_failed_ready"] is True
     assert second["gcode_state"] == "FAILED"
@@ -400,6 +400,53 @@ def test_duplicate_historical_failed_payload_resets_the_fresh_streak():
     assert printer.snapshot()["historical_failed_ready"] is False
     assert printer.snapshot()["historical_failed_ready"] is False
     assert printer.snapshot()["historical_failed_ready"] is True
+
+
+def _p1s_11_leftover_idle(**print_overrides):
+    """P1S-11 on 2026-09-22: sticky FAILED, cooled, no file, stage 0, empty HMS."""
+    payload = {
+        "print": {
+            "gcode_state": "FAILED",
+            "print_error": 0,
+            "hms": [],
+            "gcode_file": "",
+            "subtask_name": "",
+            "mc_percent": 0,
+            "nozzle_temper": 23.75,
+            "nozzle_target_temper": 0,
+            "bed_temper": 20.41,
+            "bed_target_temper": 0,
+            "stg_cur": 0,
+        },
+    }
+    payload["print"].update(print_overrides)
+    return payload
+
+
+def test_leftover_idle_failed_is_idle_on_first_observation():
+    snapshot = _printer([_p1s_11_leftover_idle()]).snapshot()
+    assert snapshot["status"] == "IDLE"
+    assert snapshot["historical_failed_ready"] is False
+    assert snapshot["gcode_state"] == "FAILED"
+    assert snapshot["progress_percent"] == 0
+    assert snapshot["stage"] == 0
+
+
+def test_leftover_idle_failed_allows_absent_hms_and_p1_idle_stage():
+    payload = _p1s_11_leftover_idle(stg_cur=255)
+    del payload["print"]["hms"]
+    snapshot = _printer([payload]).snapshot()
+    assert snapshot["status"] == "IDLE"
+    assert snapshot["stage"] is None
+
+
+def test_leftover_idle_failed_with_file_or_heat_or_progress_stays_error():
+    assert _printer([_p1s_11_leftover_idle(gcode_file="plate.gcode")]).snapshot()["status"] == "ERROR"
+    assert _printer([_p1s_11_leftover_idle(nozzle_target_temper=220)]).snapshot()["status"] == "ERROR"
+    assert _printer([_p1s_11_leftover_idle(mc_percent=40)]).snapshot()["status"] == "ERROR"
+    assert _printer([_p1s_11_leftover_idle(print_error=12345)]).snapshot()["status"] == "ERROR"
+    assert _printer([_p1s_11_leftover_idle(stg_cur=6)]).snapshot()["status"] == "ERROR"
+    assert _printer([_p1s_11_leftover_idle(hms=[{"attr": 1, "code": 1}])]).snapshot()["status"] == "ERROR"
 
 
 def test_stage_says_why_a_print_paused():
