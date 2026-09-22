@@ -248,6 +248,40 @@ def is_cancel_failed(print_error=None, hms_code=None, hms=None) -> bool:
     return False
 
 
+def promote_live_idle(status: str, print_obj: Optional[dict]) -> str:
+    """gcode IDLE during heat-up or a moving print is still a live print.
+
+    Bambu can leave gcode_state at IDLE while the nozzle and bed are commanded
+    up for a file that is already on the machine, and again for a beat of
+    mid-print. 3DPF treats wire IDLE as a free bed and will auto-start the
+    next file. Actual temperature is not the signal: a finished plate cools
+    through the same numbers with the heaters off. Progress 100 stays IDLE
+    so a finished plate can remain uncleared in the cloud. A FAILED state
+    that map_status already folded to IDLE (user cancel, leftover fail) is
+    not promoted.
+    """
+    if status != "IDLE" or not isinstance(print_obj, dict):
+        return status
+    if (print_obj.get("gcode_state") or "").strip().upper() != "IDLE":
+        return status
+    progress = as_int(print_obj.get("mc_percent"), None)
+    if progress is not None and 0 < progress < 100:
+        return "PRINTING"
+    if progress == 100:
+        return status
+    nozzle_target = as_float(print_obj.get("nozzle_target_temper"), None) or 0
+    bed_target = as_float(print_obj.get("bed_target_temper"), None) or 0
+    if nozzle_target <= 0 and bed_target <= 0:
+        return status
+    named = (
+        _identifier_present(print_obj.get("gcode_file"))
+        or _identifier_present(print_obj.get("subtask_name"))
+    )
+    if named:
+        return "PRINTING"
+    return status
+
+
 def map_status(gcode_state: Optional[str], *, print_error=None,
                hms_code=None, hms=None, user_cancelled=False) -> str:
     """Map a Bambu gcode_state to a 3DPF printer status.
@@ -1268,6 +1302,7 @@ class BambuPrinter:
         )
         if status == "ERROR" and _is_leftover_idle_failed(print_obj, telemetry):
             status = "IDLE"
+        status = promote_live_idle(status, print_obj)
         return {
             "bambu_id": self.bambu_id,
             "status": status,

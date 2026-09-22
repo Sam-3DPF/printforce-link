@@ -1,4 +1,4 @@
-from bridge.printer import is_cancel_failed, map_status
+from bridge.printer import is_cancel_failed, map_status, promote_live_idle
 
 
 def test_map_status_known_states():
@@ -29,6 +29,38 @@ def test_map_status_unknown_and_blank_default_to_offline_never_idle():
     assert map_status(None) == "OFFLINE"
     assert map_status("WEIRD_STATE") == "OFFLINE"
     assert map_status("UNKNOWN") == "OFFLINE"    # the library's own fallback member
+
+
+def test_promote_live_idle_heatup_and_midprint_are_printing():
+    heating = {
+        "gcode_state": "IDLE",
+        "gcode_file": "batch-2026-09-22-4rnNgqiE-1.3mf",
+        "mc_percent": 0,
+        "nozzle_target_temper": 220,
+        "bed_target_temper": 45,
+    }
+    assert promote_live_idle("IDLE", heating) == "PRINTING"
+    moving = {
+        "gcode_state": "IDLE",
+        "mc_percent": 34,
+        "nozzle_target_temper": 0,
+        "bed_target_temper": 0,
+    }
+    assert promote_live_idle("IDLE", moving) == "PRINTING"
+
+
+def test_promote_live_idle_finished_plate_and_cancel_stay_idle():
+    finished = {
+        "gcode_state": "IDLE",
+        "gcode_file": "batch-2026-09-22-VI1M9oQN-1.3mf",
+        "mc_percent": 100,
+        "nozzle_target_temper": 0,
+        "bed_target_temper": 0,
+    }
+    assert promote_live_idle("IDLE", finished) == "IDLE"
+    assert promote_live_idle("IDLE", {"gcode_state": "FAILED", "mc_percent": 40}) == "IDLE"
+    assert promote_live_idle("PRINTING", {"gcode_state": "IDLE", "mc_percent": 10}) == "PRINTING"
+    assert promote_live_idle("IDLE", {"gcode_state": "IDLE", "mc_percent": 0}) == "IDLE"
 
 
 def test_map_status_cancel_failed_is_idle_not_error():
