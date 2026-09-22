@@ -34,6 +34,10 @@ _EXPLICIT = {
     "03001A0000020002": ("Nozzle clogged", "Filament is stuck in the nozzle."),
     "0300010000010007": ("Bed temperature fault", "Bed sensor may be open-circuit."),
     "03004000": ("Z-homing failed", "The printer stopped because it could not home Z."),
+    "03000A0000010005": (
+        "Bed leveling failed",
+        "The printer could not level the bed. Clear the plate and check for debris, then retry.",
+    ),
 }
 
 

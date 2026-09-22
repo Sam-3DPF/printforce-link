@@ -23,6 +23,12 @@ def test_print_error_runout_and_cancel():
     assert lookup_bambu_alert("0300_400C")["title"] == "Print canceled"
 
 
+def test_p1s3_bed_level_fatal():
+    copy = lookup_bambu_alert("0300_0A00_0001_0005")
+    assert copy["title"] == "Bed leveling failed"
+    assert "clear the plate" in copy["detail"].lower()
+
+
 def test_unknown_code_has_no_title():
     assert lookup_bambu_alert("FFFF_FFFF_0002_0001") is None
     assert describe_hms(hms_code="FFFF_FFFF_0002_0001") == {
