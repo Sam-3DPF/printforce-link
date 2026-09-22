@@ -129,11 +129,9 @@ def test_reconnects_printer_that_moved_ip():
     assert old.disconnect_calls == 1
 
 
-def test_same_ip_offline_is_reconnected_once_ssdp_sees_it():
-    # P1P-2 / P1S-9 already sit on their reserved 192.168.8.x address and are
-    # still OFFLINE. Waiting for needs_session_rebuild left them there: the
-    # 60s scan is already the paho grace, and a printer that answers SSDP
-    # while reporting OFFLINE is not in the middle of a one-second retry.
+def test_same_ip_offline_retries_stored_address():
+    # Silent at the address we already have (reserved 192.168.8.x included).
+    # Do not wait for a wedged flag — retry the stored IP on the fleet timer.
     factory = FakePrinterFactory()
     fleet, calls, _ = _fleet(
         [_cfg("S1", "192.168.8.236")],
@@ -173,15 +171,21 @@ def test_same_ip_wedged_session_is_reconnected():
     assert old.disconnect_calls == 1
 
 
-def test_absent_printer_is_not_reconnected():
-    # Offline and not seen on the LAN this scan, and the session is not wedged:
-    # leave it. A one-second drop is still paho's.
-    fleet, calls, _ = _fleet([_cfg("S1", "192.168.1.10")], discovered=[])
-    p = fleet.by_id("S1")
-    p.is_offline = True
+def test_silent_session_retries_stored_ip_without_ssdp():
+    # No announcement this pass. Still dial the address we already stored.
+    factory = FakePrinterFactory()
+    fleet, calls, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[],
+        printer_factory=factory,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
     fleet.reconcile_connections()
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
     assert calls["count"] == 1
-    assert p.reconnects == []
+    assert fleet.by_id("S1").current_ip == "192.168.1.10"
+    assert fleet.by_id("S1").connect_calls == 1
 
 
 def test_wedged_printer_rebuilds_when_ssdp_misses_it():
@@ -303,12 +307,21 @@ def test_hung_reconnect_releases_the_slot():
 
 def test_scan_is_throttled():
     clock = Clock(1000.0)
-    fleet, calls, _ = _fleet([_cfg("S1", "192.168.1.10")], discovered=[], clock=clock)
-    fleet.by_id("S1").is_offline = True
+    factory = FakePrinterFactory()
+    fleet, calls, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[],
+        clock=clock,
+        printer_factory=factory,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
     fleet.reconcile_connections()       # scans at t=1000
     fleet.reconcile_connections()       # within the interval -> no second scan
     assert calls["count"] == 1
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
     clock.t = 1000.0 + 61               # past the 60s interval
+    fleet.by_id("S1").is_offline = True
     fleet.reconcile_connections()
     assert calls["count"] == 2
 
@@ -338,13 +351,16 @@ def test_discovery_failure_is_swallowed_and_still_throttled():
         raise OSError("network down")
 
     clock = Clock(1000.0)
-    fleet = Fleet([_cfg("S1", "192.168.1.10")], printer_factory=FakePrinter,
+    factory = FakePrinterFactory()
+    fleet = Fleet([_cfg("S1", "192.168.1.10")], printer_factory=factory,
                   discover_fn=boom, rediscover_interval_seconds=60.0, monotonic=clock)
-    fleet.by_id("S1").is_offline = True
+    old = fleet.by_id("S1")
+    old.is_offline = True
     fleet.reconcile_connections()            # scan raises internally -> swallowed, not re-raised
     fleet.reconcile_connections()            # within the interval -> must NOT scan again
     assert calls["count"] == 1               # throttle timestamp advanced despite the failure
-    assert fleet.by_id("S1").reconnects == []
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+    assert fleet.by_id("S1").current_ip == "192.168.1.10"
 
 
 def test_old_object_remains_stable_during_blocked_replacement_connect():

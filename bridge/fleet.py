@@ -255,21 +255,20 @@ class Fleet:
             return [p.current_ip for p in self._printers if p.current_ip]
 
     def reconcile_connections(self) -> None:
-        """Self-heal dropped connections (U1). A printer reports OFFLINE when it is
+        """Self-heal dropped connections (U1).         A printer reports OFFLINE when it is
         unreachable — which, after a DHCP lease change, means the bridge is dialing an
         address the printer no longer holds. Re-discover offline printers by serial via
         SSDP and rebuild the client when that serial answers at a different IP.
 
-        A same-IP outage is left to paho only until the next scan (the 60s interval).
-        If that scan still sees the serial — or the session is wedged
-        (`needs_session_rebuild`) — rebuild at the current or discovered IP. paho
-        does not reconnect a socket it still considers healthy. Skipping a same-IP
-        sighting left reserved-IP printers (P1P-2, P1S-9) OFFLINE on v0.1.24.
+        A silent session is retried at the stored IP on this timer. SSDP is useful
+        when it names a new address; it is not required this pass. A quiet printer
+        often does not broadcast in a short listen, and waiting for a hit left the
+        farm OFFLINE after a restart.
 
         When multicast hears nothing, the scan still unicasts M-SEARCH to every
-        address we already have so a reserved IP on the same LAN can answer. A
-        printer SSDP cannot see stays OFFLINE unless its session is wedged, in
-        which case we retry the stored address (and time out a hung connect).
+        address we already have (and the rest of each /24) so a reserved IP on the
+        same LAN can answer. A hung connect is timed out so the serial can be
+        tried again. A newly learned IP is persisted.
 
         Scans only when at least one printer is offline AND `rediscover_interval` has
         elapsed since the last scan — a healthy farm pays nothing, and a whole farm that
@@ -297,25 +296,21 @@ class Fleet:
             found = {}
         for p in offline:
             d = found.get(p.bambu_id)
-            wedged = bool(getattr(p, "needs_session_rebuild", False))
-            if d is None or not d.ip:
-                # No announcement this scan. A brief drop is still paho's. A wedged
-                # session is rebuilt at the address we already have; waiting for
-                # SSDP never brought these printers back.
-                if wedged and p.current_ip:
-                    logger.info(
-                        "printer %s session is wedged and SSDP did not answer; "
-                        "rebuilding at %s",
-                        p.bambu_id, p.current_ip,
-                    )
-                    self._schedule_reconnect(p, p.current_ip)
+            target = d.ip if d is not None and d.ip else p.current_ip
+            if not target:
                 continue
-            if d.ip == p.current_ip:
+            if d is None or not d.ip:
+                logger.info(
+                    "printer %s is silent and SSDP did not answer; "
+                    "retrying stored address %s",
+                    p.bambu_id, target,
+                )
+            elif d.ip == p.current_ip:
                 logger.info(
                     "printer %s is still at %s and still OFFLINE; rebuilding the session",
                     p.bambu_id, d.ip,
                 )
-            self._schedule_reconnect(p, d.ip)
+            self._schedule_reconnect(p, target)
 
     def _schedule_reconnect(self, printer, new_ip: str) -> None:
         """Start at most one daemon reconnect worker for this fleet member/serial."""

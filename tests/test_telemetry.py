@@ -226,6 +226,7 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "stage_queue_empty": None,
         "print_type": None,
         "historical_failed_ready": False,
+        "user_cancelled": False,
         "print_duration_seconds": None,
         "print_duration_source": None,
     }
@@ -256,6 +257,22 @@ def test_cancel_failed_snapshot_is_idle_not_error():
     }]).snapshot()
     assert snapshot["status"] == "IDLE"
     assert snapshot["print_error"] == "50348044"
+
+
+def test_cancel_flash_latches_through_later_failed_with_cleared_error():
+    printer = _printer([
+        {"print": {"gcode_state": "RUNNING", "print_error": 0}},
+        {"print": {"gcode_state": "PAUSE", "print_error": 50348044}},
+        {"print": {"gcode_state": "FAILED", "print_error": 0, "hms": []}},
+    ])
+    assert printer.snapshot()["status"] == "PRINTING"
+    flash = printer.snapshot()
+    assert flash["user_cancelled"] is True
+    later = printer.snapshot()
+    assert later["status"] == "IDLE"
+    assert later["print_error"] is None
+    assert later["user_cancelled"] is True
+    assert later["historical_failed_ready"] is False
 
 
 def test_real_failed_snapshot_stays_error():
@@ -403,6 +420,8 @@ def test_the_no_stage_sentinel_is_null_not_a_literal_minus_one():
     """
     assert parse_telemetry({"print": {"stg_cur": -1}})["stage"] is None
     assert parse_telemetry({"print": {"stg_cur": "-1"}})["stage"] is None   # a string on the wire
+    assert parse_telemetry({"print": {"stg_cur": 255}})["stage"] is None    # P1 idle
+    assert parse_telemetry({"print": {"stg_cur": "255"}})["stage"] is None
     assert parse_telemetry({"print": {}})["stage"] is None
     assert parse_telemetry({"print": {"stg_cur": "junk"}})["stage"] is None
 

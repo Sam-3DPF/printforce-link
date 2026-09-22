@@ -45,3 +45,9 @@ def test_is_cancel_failed_reads_print_error_and_hms():
     assert is_cancel_failed(print_error="50348044")
     assert is_cancel_failed(hms_code="0300_400C")
     assert not is_cancel_failed(print_error="999")
+
+
+def test_map_status_latched_cancel_survives_cleared_print_error():
+    assert map_status("FAILED", print_error=None, user_cancelled=True) == "IDLE"
+    assert map_status("FAILED", print_error="0", user_cancelled=True) == "IDLE"
+    assert map_status("FAILED", print_error=None, user_cancelled=False) == "ERROR"

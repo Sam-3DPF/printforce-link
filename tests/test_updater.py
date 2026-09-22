@@ -62,6 +62,52 @@ def test_updater_applies_when_newer():
     assert applied == ["v0.2.0"]
 
 
+def test_updater_downloads_and_waits_while_a_printer_is_busy():
+    applied = []
+    prefetched = []
+    u = SelfUpdater(
+        "0.1.0",
+        latest_tag_fn=lambda: "v0.2.0",
+        apply_fn=applied.append,
+        monotonic=Clock(),
+        prefetch_fn=prefetched.append,
+    )
+    u.tick(printers_busy=True)
+    assert applied == []
+    assert prefetched == ["v0.2.0"]
+    assert u.metadata()["update_status"] == "scheduled"
+    assert u.metadata()["latest_version"] == "0.2.0"
+
+
+def test_scheduled_update_applies_once_printers_are_idle():
+    applied = []
+    clock = Clock()
+    u = SelfUpdater(
+        "0.1.0",
+        interval_seconds=3600,
+        latest_tag_fn=lambda: "v0.2.0",
+        apply_fn=applied.append,
+        monotonic=clock,
+    )
+    u.tick(printers_busy=True)
+    assert applied == []
+    u.tick(printers_busy=False)
+    assert applied == ["v0.2.0"]
+
+
+def test_operator_forced_update_installs_while_printers_are_busy():
+    applied = []
+    u = SelfUpdater(
+        "0.1.0",
+        latest_tag_fn=lambda: "v0.2.0",
+        apply_fn=applied.append,
+        monotonic=Clock(),
+    )
+    force = u.apply_cloud_command({"request_id": "force-1"})
+    u.tick(force=force, printers_busy=True)
+    assert applied == ["v0.2.0"]
+
+
 def test_updater_noop_when_current_is_latest():
     applied = []
     u = SelfUpdater("0.2.0", latest_tag_fn=lambda: "v0.2.0",
@@ -239,7 +285,7 @@ def test_tick_async_does_not_block_the_printer_loop(monkeypatch):
     started = threading.Event()
     release = threading.Event()
 
-    def slow_tick(force=False):
+    def slow_tick(force=False, printers_busy=False):
         started.set()
         release.wait(timeout=1)
 

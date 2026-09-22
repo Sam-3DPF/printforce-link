@@ -15,6 +15,26 @@ class _FakeResp:
         return self._json
 
 
+def test_report_state_replays_last_good_snapshots_after_an_outage(monkeypatch):
+    posts = []
+
+    def fake_post(self, url, json=None, headers=None):
+        posts.append(json)
+        if len(posts) == 2:
+            return _FakeResp(503)
+        return _FakeResp(200, {"data": {"ok": True}})
+
+    monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
+    monkeypatch.setattr(dpf_mod.time, "sleep", lambda *_a, **_k: None)
+    client = DpfClient("https://x", "tok", retries=1)
+    live = [{"bambu_id": "S1", "status": "NEEDS_CLEARING"}]
+    assert client.report_state(live)
+    assert client.report_state([{"bambu_id": "S1", "status": "OFFLINE"}]) == {}
+    replayed = client.report_state([{"bambu_id": "S1", "status": "OFFLINE"}])
+    assert replayed == {"ok": True}
+    assert posts[-1]["printers"] == live
+
+
 def test_report_state_posts_expected_shape(monkeypatch):
     captured = {}
 

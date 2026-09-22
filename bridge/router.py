@@ -35,6 +35,8 @@ def is_cancel_failed_snapshot(snap: Optional[Dict]) -> bool:
     """True when a drain snapshot is a user-cancel, not a real fail."""
     if not isinstance(snap, dict):
         return False
+    if snap.get("user_cancelled") is True:
+        return True
     return is_cancel_failed(
         print_error=snap.get("print_error"),
         hms_code=snap.get("hms_code"),

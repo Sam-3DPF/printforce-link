@@ -1,10 +1,12 @@
 from bridge.ams import (
     ams_needs_pushall,
+    ams_slot_number,
     idle_trays_needing_rfid,
     merge_ams,
     parse_ams,
     parse_tray_exist_bits,
     normalize_hex,
+    remain_percent,
     load_remembered_ams,
     save_remembered_ams,
 )
@@ -28,6 +30,44 @@ def test_normalize_hex_rejects_invalid():
     assert normalize_hex("not-a-hex") is None
     assert normalize_hex("12345") is None      # wrong length
     assert normalize_hex(0xFF6A13) is None      # non-string (a raw payload value)
+
+
+def test_ams_ht_slot_is_not_unit_times_four():
+    assert ams_slot_number(0, 0) == 1
+    assert ams_slot_number(1, 0) == 5
+    assert ams_slot_number(128, 0) == 17
+    assert ams_slot_number(129, 0) == 18
+    assert ams_slot_number(128, 0) != 128 * 4 + 1
+    status = {"print": {"ams": {"ams": [
+        {"id": "128", "tray": [{"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"}]},
+    ]}}}
+    assert parse_ams(status) == [
+        {"slot_number": 17, "color_hex": "E8AFCFFF", "filament_type": "PLA"},
+    ]
+
+
+def test_remain_unknown_is_not_empty():
+    assert remain_percent(-1) is None
+    assert remain_percent(0) is None
+    assert remain_percent("0") is None
+    assert remain_percent(45) == 45
+    status = {"print": {"ams": {"tray_exist_bits": "1", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "1A1A1AFF", "tray_type": "PLA", "remain": -1},
+        ]},
+    ]}}}
+    assert parse_ams(status) == [
+        {"slot_number": 1, "color_hex": "1A1A1AFF", "filament_type": "PLA"},
+    ]
+    calibrated = {"print": {"ams": {"tray_exist_bits": "1", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "1A1A1AFF", "tray_type": "PLA", "remain": 40},
+        ]},
+    ]}}}
+    assert parse_ams(calibrated) == [
+        {"slot_number": 1, "color_hex": "1A1A1AFF", "filament_type": "PLA",
+         "remain_percent": 40},
+    ]
 
 
 def test_parse_ams_single_unit():

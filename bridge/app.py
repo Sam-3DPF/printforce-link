@@ -240,6 +240,11 @@ def main(config_path: str = "config.toml") -> None:
         update_restart_lock.acquire()
         try:
             reports = fleet.snapshot()
+            printers_busy = any(
+                isinstance(report, dict)
+                and report.get("status") in ("PRINTING", "PAUSED")
+                for report in reports
+            )
             wire_reports = (
                 router.annotate_reports(reports)
                 if router is not None
@@ -264,7 +269,7 @@ def main(config_path: str = "config.toml") -> None:
             force_update = updater.apply_cloud_command(
                 response.get("update") if isinstance(response, dict) else None
             )
-            updater.tick_async(force=force_update)
+            updater.tick_async(force=force_update, printers_busy=printers_busy)
             desired = response.get("printers") if isinstance(response, dict) else None
             # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
             # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
@@ -316,7 +321,7 @@ def main(config_path: str = "config.toml") -> None:
                 force_update = updater.apply_cloud_command(
                     heartbeat.get("update") if isinstance(heartbeat, dict) else None
                 )
-                updater.tick_async(force=force_update)
+                updater.tick_async(force=force_update, printers_busy=printers_busy)
                 heartbeat_desired = (
                     heartbeat.get("printers") if isinstance(heartbeat, dict) else None
                 )
@@ -1052,8 +1057,8 @@ def _leftover_finished_idle(snapshot) -> bool:
     if not _leftover_named_file(snapshot):
         return False
     progress = snapshot.get("progress_percent")
-    stage = snapshot.get("stage")
-    return progress == 100 or stage in (255, "255")
+    # 255 is P1 idle "no stage", not leftover-finished. Progress 100 is the plate.
+    return progress == 100
 
 
 def _clear_leftover_finished(fleet, bambu_id: str) -> None:

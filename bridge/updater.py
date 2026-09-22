@@ -374,7 +374,8 @@ class SelfUpdater:
     def __init__(self, current_version: str,
                  interval_seconds: float = _DEFAULT_INTERVAL_SECONDS,
                  latest_tag_fn=None, apply_fn=None, monotonic=time.monotonic,
-                 state_path: Optional[str] = None, restart_lock=None):
+                 state_path: Optional[str] = None, restart_lock=None,
+                 prefetch_fn=None):
         self._current = current_version
         self._interval = interval_seconds
         self._latest_tag = latest_tag_fn or latest_release_tag
@@ -385,6 +386,7 @@ class SelfUpdater:
         self._apply = apply_fn or (
             lambda tag: _apply_update(tag, restart_lock=self._restart_lock)
         )
+        self._prefetch = prefetch_fn
         self._state_path = state_path
         self._failed_version_path = (
             os.path.join(os.path.dirname(state_path), _FAILED_VERSION_FILE)
@@ -478,11 +480,23 @@ class SelfUpdater:
             return True
         return False
 
-    def tick(self, force: bool = False) -> None:
-        """Throttled update check. Never raises."""
+    def tick(self, force: bool = False, printers_busy: bool = False) -> None:
+        """Throttled update check. Never raises.
+
+        A download that would restart Link waits while any member is PRINTING or
+        PAUSED. An operator-forced request still installs.
+        """
         now = self._monotonic()
         interval = _REQUEST_RETRY_SECONDS if self._pending_request_id else self._interval
-        if not force and self._last is not None and now - self._last < interval:
+        ready_to_apply_scheduled = (
+            self._status == APPLY_SCHEDULED and not printers_busy
+        )
+        if (
+            not force
+            and not ready_to_apply_scheduled
+            and self._last is not None
+            and now - self._last < interval
+        ):
             return
         self._last = now
         try:
@@ -519,9 +533,24 @@ class SelfUpdater:
                     self._pending_request_id = None
                 self._persist()
                 return
-            if not self._enabled and not force and not self._pending_request_id:
+            operator_forced = bool(force or self._pending_request_id)
+            if not self._enabled and not operator_forced:
                 self._status = STATUS_AVAILABLE
                 self._error = None
+                self._persist()
+                return
+            if printers_busy and not operator_forced:
+                prefetch = getattr(self, "_prefetch", None)
+                if callable(prefetch):
+                    try:
+                        prefetch(tag)
+                    except Exception:
+                        logger.debug("self-update: prefetch of %s failed; will retry", tag)
+                self._status = APPLY_SCHEDULED
+                self._error = (
+                    "Update is downloaded. Link will install it when no printer "
+                    "is printing or paused."
+                )
                 self._persist()
                 return
             self._status = STATUS_INSTALLING
@@ -543,14 +572,14 @@ class SelfUpdater:
             self._persist()
             logger.warning("self-update check failed (%s); will retry", type(e).__name__)
 
-    def tick_async(self, force: bool = False) -> None:
+    def tick_async(self, force: bool = False, printers_busy: bool = False) -> None:
         """Run network/download work off the sole printer-control reporting loop."""
         if not self._check_lock.acquire(blocking=False):
             return
 
         def run() -> None:
             try:
-                self.tick(force=force)
+                self.tick(force=force, printers_busy=printers_busy)
             finally:
                 self._check_lock.release()
 
