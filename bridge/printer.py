@@ -603,6 +603,13 @@ class BambuPrinter:
         # a cancel, not report_failed.
         self._user_cancelled = False
         self._last_print_error = ""
+        # The report loop and this printer's worker both call snapshot(). The lock
+        # keeps the stopwatch and the merged payload read on one thread at a time.
+        self._snapshot_lock = threading.Lock()
+        # None: unit tests refresh AMS inline. The fleet sets a worker submit so
+        # snapshot itself does not publish or sleep.
+        self._defer = None
+        self._deferred_pending = False
 
     @property
     def bambu_id(self) -> str:
@@ -722,8 +729,16 @@ class BambuPrinter:
             logger.debug("printer %s: closing the MQTT session raised (%s)",
                          self.bambu_id, type(e).__name__)
 
+    def set_defer(self, defer) -> None:
+        """Hand AMS refresh to ``defer`` instead of running it inside snapshot.
+
+        ``pushall`` plus the absorb window sleeps. On the report loop that stalls
+        every other printer. Unit tests leave this unset and still refresh inline.
+        """
+        self._defer = defer
+
     def upload_and_start(self, file_path: str, ams_mapping, plate_number: int = 1,
-                         remote_name: Optional[str] = None) -> bool:
+                         remote_name: Optional[str] = None, cancel=None) -> bool:
         """FTPS-upload the sliced `.3mf` and MQTT-start it (U9's dispatch primitive).
 
         `ams_mapping` is the **explicit** filament→AMS-tray mapping (R11), a `list[int]`
@@ -741,15 +756,20 @@ class BambuPrinter:
         re-queues the job rather than losing it; returns the printer's start result
         otherwise.
         """
-        name = self.upload_file(file_path, remote_name=remote_name)
+        name = self.upload_file(file_path, remote_name=remote_name, cancel=cancel)
         return self.start_print(name, ams_mapping, plate_number)
 
-    def upload_file(self, file_path: str, remote_name: Optional[str] = None) -> str:
-        """FTPS-upload only. Split from start so a live stop can abort after the push."""
+    def upload_file(self, file_path: str, remote_name: Optional[str] = None,
+                    cancel=None) -> str:
+        """FTPS-upload only. Split from start so a live stop can abort after the push.
+
+        ``cancel`` is the printer worker's event. The FTPS loop checks it between
+        blocks so removing the printer does not wait out the file.
+        """
         if self._session is None:
             raise RuntimeError("printer not connected")
         name = remote_name or os.path.basename(file_path)
-        store_on_printer(self._ip, self._cfg.access_code, file_path, name)
+        store_on_printer(self._ip, self._cfg.access_code, file_path, name, cancel=cancel)
         logger.info("printer %s: uploaded %s", self.bambu_id, name)
         return name
 
@@ -1018,6 +1038,10 @@ class BambuPrinter:
         frozen dump into IDLE. A false OFFLINE costs a poll of dispatch (visible,
         and fails closed); a false IDLE costs a print.
         """
+        with self._snapshot_lock:
+            return self._snapshot_impl()
+
+    def _snapshot_impl(self) -> Dict:
         try:
             connected = self._is_connected()
         except Exception as e:
@@ -1061,7 +1085,9 @@ class BambuPrinter:
                 self._full_status_attempts = 0
             self._last_gcode_state = gcode_state
             if ams_needs_pushall(self._cached):
-                self._request_ams_if_needed()
+                # Inline only when no worker is wired. Otherwise this publishes
+                # pushall and sleeps in the absorb window, on the report loop.
+                self._defer_or_run(self._request_ams_if_needed)
             self._remember_ams()
             return self._build_snapshot(self._cached, fresh=self._take_fresh())
         except Exception:
@@ -1075,6 +1101,27 @@ class BambuPrinter:
                 "unreachable printer. Reporting OFFLINE so nothing dispatches to it.",
                 self.bambu_id)
             return self._offline_snapshot()
+
+    def _defer_or_run(self, fn) -> None:
+        """One deferred refresh at a time. Every snapshot would otherwise queue
+        another pushall behind a long upload and fill that printer's queue."""
+        defer = self._defer
+        if defer is None:
+            fn()
+            return
+        if self._deferred_pending:
+            return
+        self._deferred_pending = True
+
+        def _run():
+            try:
+                fn()
+            finally:
+                self._deferred_pending = False
+
+        future = defer(_run)
+        if future is None or future.done():
+            self._deferred_pending = False
 
     def _go_offline(self, reason: str) -> Dict:
         """Report OFFLINE and **drop the cache**, so a recovering printer is rebuilt from

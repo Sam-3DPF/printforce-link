@@ -247,7 +247,10 @@ def main(config_path: str = "config.toml") -> None:
     last_repair_attempt = None
     started_sends = set()
     applied_controls = set()
-    legacy_marker_readiness = _LegacyMarkerReadiness()
+    # One readiness object per serial. retain() drops keys this call did not see,
+    # so a shared object would forget another printer's legacy-marker observations.
+    legacy_marker_readiness = {}
+    cloud_send_jobs = {}
     spool_dir = cfg.printhost.spool_dir if cfg.printhost else "/tmp/printforce-spool"
     os.makedirs(spool_dir, exist_ok=True)
     logger.info("Reporting every %ss; heartbeat every %ss; a printer that says nothing "
@@ -260,11 +263,6 @@ def main(config_path: str = "config.toml") -> None:
         update_restart_lock.acquire()
         try:
             reports = fleet.snapshot()
-            printers_busy = any(
-                isinstance(report, dict)
-                and report.get("status") in ("PRINTING", "PAUSED")
-                for report in reports
-            )
             wire_reports = (
                 router.annotate_reports(reports)
                 if router is not None
@@ -289,7 +287,6 @@ def main(config_path: str = "config.toml") -> None:
             force_update = updater.apply_cloud_command(
                 response.get("update") if isinstance(response, dict) else None
             )
-            updater.tick_async(force=force_update, printers_busy=printers_busy)
             desired = response.get("printers") if isinstance(response, dict) else None
             # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
             # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
@@ -299,7 +296,12 @@ def main(config_path: str = "config.toml") -> None:
             _apply_desired(
                 desired or [], fleet, dpf, spool_dir, started_sends, applied_controls,
                 router=router, legacy_marker_readiness=legacy_marker_readiness,
+                cloud_send_jobs=cloud_send_jobs,
             )
+            # After sends are queued: a worker that is mid-upload is busy even
+            # while the snapshot still says IDLE, and a restart must not kill it.
+            printers_busy = _printers_busy(reports, fleet)
+            updater.tick_async(force=force_update, printers_busy=printers_busy)
 
             # Drain queued uploads onto idle, color-matched printers, matching on THIS
             # pass's fresh reports (the KTD3 dispatch-time re-validation). U9.
@@ -345,7 +347,6 @@ def main(config_path: str = "config.toml") -> None:
                 force_update = updater.apply_cloud_command(
                     heartbeat.get("update") if isinstance(heartbeat, dict) else None
                 )
-                updater.tick_async(force=force_update, printers_busy=printers_busy)
                 heartbeat_desired = (
                     heartbeat.get("printers") if isinstance(heartbeat, dict) else None
                 )
@@ -353,7 +354,10 @@ def main(config_path: str = "config.toml") -> None:
                     heartbeat_desired or [], fleet, dpf, spool_dir, started_sends,
                     applied_controls, router=router,
                     legacy_marker_readiness=legacy_marker_readiness,
+                    cloud_send_jobs=cloud_send_jobs,
                 )
+                printers_busy = _printers_busy(reports, fleet)
+                updater.tick_async(force=force_update, printers_busy=printers_busy)
                 last_heartbeat = now
         except Exception:
             # Never let one bad iteration kill the long-running reporter — nothing
@@ -368,15 +372,107 @@ def main(config_path: str = "config.toml") -> None:
 _CONTROL_ACTIONS = frozenset({"pause", "resume", "stop", "refresh"})
 
 
+def _printers_busy(reports, fleet) -> bool:
+    """True when a self-update restart could cut a print or an in-flight send.
+
+    PRINTING and PAUSED are the steady signal. A cloud upload occupies the
+    printer worker before the status changes, so a busy worker counts too.
+    """
+    if any(
+        isinstance(report, dict) and report.get("status") in ("PRINTING", "PAUSED")
+        for report in reports
+    ):
+        return True
+    busy = getattr(fleet, "worker_busy", None)
+    if not callable(busy):
+        return False
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        serial = report.get("bambu_id")
+        if serial and busy(serial):
+            return True
+    return False
+
+
+# started_sends is one set shared by every printer worker.
+_STARTED_SENDS_LOCK = threading.Lock()
+
+
+def _send_known(started_sends, key) -> bool:
+    with _STARTED_SENDS_LOCK:
+        return key in started_sends
+
+
+def _send_mark(started_sends, key) -> None:
+    with _STARTED_SENDS_LOCK:
+        started_sends.add(key)
+
+
+def _send_drop(started_sends, key) -> None:
+    with _STARTED_SENDS_LOCK:
+        started_sends.discard(key)
+
+
+def _send_keys(started_sends):
+    with _STARTED_SENDS_LOCK:
+        return list(started_sends)
+
+
 def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
                    started_sends, applied_controls, router=None,
-                   legacy_marker_readiness=None) -> None:
-    """Apply control then cloud sends from one desired-state payload."""
+                   legacy_marker_readiness=None, cloud_send_jobs=None) -> None:
+    """Apply control on this thread, then cloud sends on each printer's worker.
+
+    Controls stay here: publish does not block, and refresh is queued inside
+    ``Fleet.apply_control``. Cloud sends do network I/O, so when the fleet has
+    ``submit`` each serial runs on its own worker. A serial whose send is still
+    queued or running is left for the next pass instead of being queued twice.
+    Fakes without ``submit`` keep the single inline call.
+    """
     _handle_desired(desired, fleet, applied_controls, spool_dir, router=router)
-    _handle_cloud_sends(
-        desired, fleet, dpf, spool_dir, started_sends, router=router,
-        legacy_marker_readiness=legacy_marker_readiness,
-    )
+    submit = getattr(fleet, "submit", None)
+    if not callable(submit):
+        _handle_cloud_sends(
+            desired, fleet, dpf, spool_dir, started_sends, router=router,
+            legacy_marker_readiness=legacy_marker_readiness,
+        )
+        return
+    if cloud_send_jobs is None:
+        cloud_send_jobs = {}
+    if not isinstance(legacy_marker_readiness, dict):
+        legacy_marker_readiness = {}
+    grouped = {}
+    order = []
+    for row in desired or []:
+        if not isinstance(row, dict) or not row.get("bambu_id"):
+            continue
+        serial = str(row["bambu_id"])
+        if serial not in grouped:
+            order.append(serial)
+            grouped[serial] = []
+        grouped[serial].append(row)
+    for serial in order:
+        inflight = cloud_send_jobs.get(serial)
+        if inflight is not None and not inflight.done():
+            continue
+        readiness = legacy_marker_readiness.get(serial)
+        if not isinstance(readiness, _LegacyMarkerReadiness):
+            readiness = _LegacyMarkerReadiness()
+            legacy_marker_readiness[serial] = readiness
+        future = submit(
+            serial,
+            _handle_cloud_sends,
+            grouped[serial],
+            fleet,
+            dpf,
+            spool_dir,
+            started_sends,
+            router=router,
+            legacy_marker_readiness=readiness,
+        )
+        if future is not None:
+            cloud_send_jobs[serial] = future
 
 
 def _control_from_row(row: dict):
@@ -599,8 +695,8 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     batch_id,
                 )
                 continue
-        if key in started_sends or os.path.exists(started_path) or assignment_matches:
-            started_sends.add(key)
+        if _send_known(started_sends, key) or os.path.exists(started_path) or assignment_matches:
+            _send_mark(started_sends, key)
             if router is not None and not assignment_matches:
                 router.record_assignment(
                     str(bambu_id), str(batch_id), plate_index,
@@ -693,7 +789,7 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 remote_name=remote_name,
             )
         if started:
-            started_sends.add(key)
+            _send_mark(started_sends, key)
             try:
                 _write_cloud_send_marker(started_path, STARTED_MARKER_COMMANDED)
             except OSError:
@@ -709,10 +805,10 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 _report_confirmed_dispatch(key, dpf, spool_dir, router)
         else:
             logger.warning("printer %s did not start batch %s", bambu_id, batch_id)
-    for key in list(started_sends):
+    for key in _send_keys(started_sends):
         _batch_id, bambu_id, _plate_index = key
         if bambu_id in seen_serials and key not in live:
-            started_sends.discard(key)
+            _send_drop(started_sends, key)
             leftover = _cloud_send_started_path(spool_dir, key)
             try:
                 os.unlink(leftover)
@@ -820,7 +916,7 @@ def _report_confirmed_dispatch(key, dpf, spool_dir: str, router) -> None:
 
 def _clear_pending_cloud_send(spool_dir: str, key, started_sends, router) -> None:
     _batch_id, bambu_id, _plate_index = key
-    started_sends.discard(key)
+    _send_drop(started_sends, key)
     leftover = _cloud_send_started_path(spool_dir, key)
     try:
         os.unlink(leftover)

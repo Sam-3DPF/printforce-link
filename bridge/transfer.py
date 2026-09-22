@@ -47,17 +47,44 @@ def prepare_download_complete(percent) -> bool:
     return value is not None and value >= 99
 
 
+class UploadCancelled(Exception):
+    """The printer was removed while STOR was still sending blocks."""
+
+
+class _CancellableReader:
+    """Raise between reads so a generic ``storbinary`` can stop without a subclass."""
+
+    def __init__(self, handle, cancel):
+        self._handle = handle
+        self._cancel = cancel
+
+    def read(self, size=-1):
+        if self._cancel is not None and self._cancel.is_set():
+            raise UploadCancelled("upload cancelled")
+        return self._handle.read(size)
+
+
 class _ShopFtps(ftplib.FTP_TLS):
     """Implicit-TLS FTPS that does not unwrap the data connection.
 
     Some P1 firmware hangs on the SSL shutdown after STOR. The bytes are
     already on disk by then; hanging the upload thread looks like a failed send.
+    ``cancel`` is checked between blocks so fleet removal does not wait out the file.
     """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._upload_cancel = None
+
+    def set_upload_cancel(self, cancel) -> None:
+        self._upload_cancel = cancel
 
     def storbinary(self, cmd, fp, blocksize=8192, callback=None, rest=None):
         self.voidcmd("TYPE I")
         with self.transfercmd(cmd, rest) as conn:
             while True:
+                if self._upload_cancel is not None and self._upload_cancel.is_set():
+                    raise UploadCancelled("upload cancelled")
                 buf = fp.read(blocksize)
                 if not buf:
                     break
@@ -88,8 +115,13 @@ def store_on_printer(
     port: int = _FTPS_PORT,
     timeout: float = 30.0,
     ftp_factory=None,
+    cancel=None,
 ) -> str:
-    """STOR `local_path` as `remote_name`. Raises if the remote size does not match."""
+    """STOR `local_path` as `remote_name`. Raises if the remote size does not match.
+
+    ``cancel`` is a ``threading.Event``. When it is set, the next block raises
+    ``UploadCancelled`` and the control connection is closed.
+    """
     if not host:
         raise ValueError("printer address is required")
     if not os.path.isfile(local_path):
@@ -97,6 +129,9 @@ def store_on_printer(
     expected = os.path.getsize(local_path)
     factory = ftp_factory or _ShopFtps
     ftp = factory()
+    setter = getattr(ftp, "set_upload_cancel", None)
+    if callable(setter):
+        setter(cancel)
     try:
         if hasattr(ftp, "ssl_version"):
             try:
@@ -116,8 +151,9 @@ def store_on_printer(
             except Exception:
                 pass
         with open(local_path, "rb") as handle:
+            source = _CancellableReader(handle, cancel) if cancel is not None else handle
             try:
-                reply = ftp.storbinary(f"STOR {remote_name}", handle)
+                reply = ftp.storbinary(f"STOR {remote_name}", source)
             except (ftplib.error_temp, ftplib.error_reply, ftplib.error_perm) as exc:
                 if "426" not in str(exc):
                     raise

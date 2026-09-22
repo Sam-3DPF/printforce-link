@@ -1,4 +1,6 @@
 """One-shot pause / resume / stop on desired-state (U3)."""
+import time
+
 from bridge.app import _handle_desired
 from bridge.fleet import Fleet
 from bridge.printer import BambuPrinter
@@ -103,6 +105,55 @@ def test_fleet_refresh_asks_the_printer_for_a_full_status(tmp_path):
         discover_fn=lambda _timeout: [],
     )
     _handle_desired(_desired("refresh"), fleet, set(), str(tmp_path))
+    deadline = time.monotonic() + 1.0
+    while printer.calls != ["request_full_status"] and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert printer.calls == ["request_full_status"]
+
+
+def test_fleet_refresh_returns_before_the_status_request_finishes(tmp_path):
+    """Refresh is queued. The report loop must not sit inside request_full_status."""
+    import threading
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class _BlockingRefresh(_FakePrinter):
+        def request_full_status(self):
+            started.set()
+            release.wait(2.0)
+            self.calls.append("request_full_status")
+            return True
+
+    printer = _BlockingRefresh()
+    cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
+    fleet = Fleet(
+        [cfg],
+        printer_factory=lambda _cfg, stale_after_seconds=None: printer,
+        discover_fn=lambda _timeout: [],
+    )
+    result = {}
+
+    def run():
+        _handle_desired(_desired("refresh"), fleet, result.setdefault("applied", set()), str(tmp_path))
+        result["done"] = True
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert started.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        while result.get("done") is not True and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert result.get("done") is True
+        assert not release.is_set()
+    finally:
+        release.set()
+        thread.join(1.0)
+    assert not thread.is_alive()
+    deadline = time.monotonic() + 1.0
+    while printer.calls != ["request_full_status"] and time.monotonic() < deadline:
+        time.sleep(0.01)
     assert printer.calls == ["request_full_status"]
 
 

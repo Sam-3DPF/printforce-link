@@ -89,6 +89,84 @@ def test_store_fails_when_remote_size_mismatches(tmp_path):
         store_on_printer("10.0.0.5", "code", str(local), "job.3mf", ftp_factory=lambda: ftp)
 
 
+def test_store_stops_between_blocks_when_cancel_is_set(tmp_path):
+    """A removed printer sets cancel. The next block must not be written."""
+    import threading
+
+    from bridge.transfer import UploadCancelled
+
+    local = tmp_path / "job.3mf"
+    local.write_bytes(b"abcdefghijklmnop")
+    cancel = threading.Event()
+    reads = {"n": 0}
+
+    class _ChunkedFtp(_FakeFtp):
+        def storbinary(self, cmd, handle):
+            chunks = []
+            while True:
+                buf = handle.read(4)
+                if not buf:
+                    break
+                reads["n"] += 1
+                if reads["n"] == 1:
+                    cancel.set()
+                chunks.append(buf)
+            self.stored = b"".join(chunks)
+            self._size = len(self.stored)
+            return "226"
+
+    ftp = _ChunkedFtp()
+    with pytest.raises(UploadCancelled):
+        store_on_printer(
+            "10.0.0.5", "code", str(local), "job.3mf",
+            ftp_factory=lambda: ftp, cancel=cancel,
+        )
+    assert reads["n"] == 1
+    assert ftp.closed
+
+
+def test_shop_ftps_stops_between_blocks_when_cancel_is_set():
+    import threading
+
+    from bridge.transfer import UploadCancelled, _ShopFtps
+
+    cancel = threading.Event()
+    reads = {"n": 0}
+    sent = []
+
+    class _Conn:
+        def sendall(self, buf):
+            sent.append(buf)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    ftp = _ShopFtps()
+    ftp.set_upload_cancel(cancel)
+    ftp.voidcmd = lambda _cmd: None
+    ftp.transfercmd = lambda _cmd, rest=None: _Conn()
+
+    def read(_size=-1):
+        reads["n"] += 1
+        if reads["n"] == 1:
+            cancel.set()
+            return b"12345678"
+        return b"more-bytes"
+
+    class _Handle:
+        pass
+
+    handle = _Handle()
+    handle.read = read
+    with pytest.raises(UploadCancelled):
+        ftp.storbinary("STOR job.3mf", handle, blocksize=8)
+    assert reads["n"] == 1
+    assert sent == [b"12345678"]
+
+
 def test_nlst_accepts_bare_name_or_path():
     assert listing_has_file(["job.3mf"], "job.3mf")
     assert listing_has_file(["/cache/job.3mf"], "job.3mf")

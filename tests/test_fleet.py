@@ -733,28 +733,17 @@ def test_blocked_printers_do_not_starve_unrelated_reconnect():
         release.set()
 
 
-def test_control_keeps_reconnect_swap_waiting_until_command_returns():
+def test_control_does_not_hold_the_fleet_lock_across_the_command():
+    """Pause publishes outside the membership lock.
+
+    A reconnect swap and the next snapshot must not wait for the command to
+    return. The command still completes on the printer it looked up.
+    """
     replacement_ready = threading.Event()
     allow_replacement_connect = threading.Event()
     replacement_connected = threading.Event()
     control_started = threading.Event()
     release_control = threading.Event()
-    swap_lock_attempted = threading.Event()
-
-    class SwapBoundaryLock:
-        def __init__(self):
-            self._lock = threading.RLock()
-            self._worker_entries = 0
-
-        def __enter__(self):
-            if threading.current_thread().name == "printer-reconnect-S1":
-                self._worker_entries += 1
-                if self._worker_entries == 2:
-                    swap_lock_attempted.set()
-            return self._lock.__enter__()
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            return self._lock.__exit__(exc_type, exc_value, traceback)
 
     class ControlPrinter(FakePrinter):
         def pause_print(self):
@@ -784,7 +773,6 @@ def test_control_keeps_reconnect_swap_waiting_until_command_returns():
         discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
         printer_factory=factory,
     )
-    fleet._lock = SwapBoundaryLock()
     old = fleet.by_id("S1")
     old.is_offline = True
     fleet.reconcile_connections()
@@ -795,13 +783,20 @@ def test_control_keeps_reconnect_swap_waiting_until_command_returns():
         target=lambda: results.append(fleet.apply_control("S1", "pause")),
     )
     control_thread.start()
+    snapshot_done = threading.Event()
+
+    def take_snapshot():
+        fleet.snapshot()
+        snapshot_done.set()
+
     try:
         assert control_started.wait(1.0)
         allow_replacement_connect.set()
         assert replacement_connected.wait(1.0)
-        assert swap_lock_attempted.wait(1.0)
-        assert fleet._printers[0] is old
-        assert old.disconnect_calls == 0
+        assert control_thread.is_alive()
+        threading.Thread(target=take_snapshot, daemon=True).start()
+        assert snapshot_done.wait(0.5), "snapshot blocked behind the in-flight command"
+        assert _wait_for(lambda: fleet.by_id("S1") is not old)
     finally:
         allow_replacement_connect.set()
         release_control.set()
@@ -809,7 +804,6 @@ def test_control_keeps_reconnect_swap_waiting_until_command_returns():
 
     assert not control_thread.is_alive()
     assert results == [True]
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
 
 
 # ---- U2: dynamic fleet membership --------------------------------------------------

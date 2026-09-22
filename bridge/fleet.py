@@ -7,9 +7,12 @@ import threading
 import time
 from typing import List, Dict, Optional
 
+from concurrent.futures import Future
+
 from .config import PrinterConfig
 from .discover import DiscoveredPrinter, discover
 from .printer import _DEFAULT_STALE_AFTER_SECONDS, BambuPrinter
+from .printer_worker import PrinterWorker
 
 logger = logging.getLogger(__name__)
 
@@ -92,8 +95,15 @@ class Fleet:
         # logic (U1/U2) is testable without the library or real SSDP.
         self._lock = threading.RLock()
         self._make_printer = printer_factory
-        self._printers = [printer_factory(c, stale_after_seconds=stale_after_seconds)
-                          for c in printer_configs]
+        self._workers = {}
+        self._printers = []
+        for cfg in printer_configs:
+            printer = printer_factory(cfg, stale_after_seconds=stale_after_seconds)
+            self._printers.append(printer)
+            # One worker per serial, kept when an IP change swaps the printer object.
+            self._workers[cfg.bambu_id] = PrinterWorker(cfg.bambu_id)
+        for printer in self._printers:
+            self._wire_defer(printer)
         self._configs = {c.bambu_id: c for c in printer_configs}
         # Every add/remove changes the serial's generation. Slow I/O may finish later,
         # but it can only commit while the generation it started under is still current.
@@ -172,26 +182,71 @@ class Fleet:
         with self._lock:
             return next((p for p in self._printers if p.bambu_id == bambu_id), None)
 
-    def apply_control(self, bambu_id: str, action: str) -> bool:
-        """Publish a control command without allowing a reconnect swap mid-command."""
+    def submit(self, bambu_id: str, fn, *args, **kwargs) -> Optional[Future]:
+        """Queue ``fn`` on this serial's worker. None when the serial is not a member.
+
+        The future is failed with ``WorkerBusy`` when that printer's queue is full.
+        The caller is not blocked, and the fleet lock is not held across the work.
+        """
         with self._lock:
-            printer = next((p for p in self._printers if p.bambu_id == bambu_id), None)
-            if printer is None:
-                logger.warning("control %s requested for unknown printer %s",
-                               action, bambu_id)
-                return False
-            if action == "pause":
-                return printer.pause_print()
-            if action == "resume":
-                if hasattr(printer, "resume_from_stage"):
-                    return printer.resume_from_stage()
-                return printer.resume_print()
-            if action == "stop":
-                return printer.stop_print()
-            if action == "refresh":
-                return printer.request_full_status()
-            logger.warning("unknown control %s requested for printer %s", action, bambu_id)
+            if not any(p.bambu_id == bambu_id for p in self._printers):
+                return None
+            worker = self._workers.get(bambu_id)
+        if worker is None:
+            return None
+        return worker.submit(fn, *args, **kwargs)
+
+    def worker_busy(self, bambu_id: str) -> bool:
+        """True when this serial has a job queued or running."""
+        with self._lock:
+            worker = self._workers.get(bambu_id)
+        if worker is None:
             return False
+        return bool(worker.busy)
+
+    def apply_control(self, bambu_id: str, action: str) -> bool:
+        """Publish pause/resume/stop, or queue refresh on the printer worker.
+
+        The membership lock is not held across the publish. Refresh sleeps inside
+        the pushall window, so it is queued and this returns True once it is queued.
+        """
+        printer = self.by_id(bambu_id)
+        if printer is None:
+            logger.warning("control %s requested for unknown printer %s",
+                           action, bambu_id)
+            return False
+        if action == "pause":
+            return printer.pause_print()
+        if action == "resume":
+            if hasattr(printer, "resume_from_stage"):
+                return printer.resume_from_stage()
+            return printer.resume_print()
+        if action == "stop":
+            return printer.stop_print()
+        if action == "refresh":
+            return self._enqueue_refresh(bambu_id)
+        logger.warning("unknown control %s requested for printer %s", action, bambu_id)
+        return False
+
+    def _enqueue_refresh(self, bambu_id: str) -> bool:
+        """True when ``request_full_status`` was queued, not when the printer answered."""
+        with self._lock:
+            worker = self._workers.get(bambu_id)
+        if worker is None or self.by_id(bambu_id) is None:
+            return False
+
+        def _refresh():
+            current = self.by_id(bambu_id)
+            if current is None:
+                return False
+            return current.request_full_status()
+
+        future = worker.submit(_refresh)
+        if future.cancelled():
+            return False
+        if future.done():
+            return future.exception() is None
+        return True
 
     def dispatch(self, bambu_id: str, file_path: str, ams_mapping, plate_number: int = 1,
                  remote_name: Optional[str] = None) -> bool:
@@ -204,32 +259,38 @@ class Fleet:
         """
         with self._lock:
             printer = next((p for p in self._printers if p.bambu_id == bambu_id), None)
-            if printer is None:
-                logger.error("dispatch requested for unknown printer %s", bambu_id)
-                return False
-            return printer.upload_and_start(
-                file_path, ams_mapping, plate_number, remote_name=remote_name,
-            )
+            cancel = self._worker_cancel_locked(bambu_id)
+        if printer is None:
+            logger.error("dispatch requested for unknown printer %s", bambu_id)
+            return False
+        return printer.upload_and_start(
+            file_path, ams_mapping, plate_number, remote_name=remote_name,
+            cancel=cancel,
+        )
 
     def upload(self, bambu_id: str, file_path: str,
                remote_name: Optional[str] = None) -> Optional[str]:
-        """FTPS-upload only. None if that printer is not in the fleet."""
+        """FTPS-upload only. None if that printer is not in the fleet.
+
+        The worker's cancel event is passed through so removal stops the transfer
+        between blocks. The membership lock is not held across the socket.
+        """
         with self._lock:
             printer = next((p for p in self._printers if p.bambu_id == bambu_id), None)
-            if printer is None:
-                logger.error("upload requested for unknown printer %s", bambu_id)
-                return None
-            return printer.upload_file(file_path, remote_name=remote_name)
+            cancel = self._worker_cancel_locked(bambu_id)
+        if printer is None:
+            logger.error("upload requested for unknown printer %s", bambu_id)
+            return None
+        return printer.upload_file(file_path, remote_name=remote_name, cancel=cancel)
 
     def start_print(self, bambu_id: str, remote_name: str, ams_mapping,
                     plate_number: int = 1) -> bool:
         """MQTT-start a file already on the printer."""
-        with self._lock:
-            printer = next((p for p in self._printers if p.bambu_id == bambu_id), None)
-            if printer is None:
-                logger.error("start_print requested for unknown printer %s", bambu_id)
-                return False
-            return printer.start_print(remote_name, ams_mapping, plate_number)
+        printer = self.by_id(bambu_id)
+        if printer is None:
+            logger.error("start_print requested for unknown printer %s", bambu_id)
+            return False
+        return printer.start_print(remote_name, ams_mapping, plate_number)
 
     def snapshot(self) -> List[Dict]:
         """One state report per printer — the bridge's wire contract with 3DPF:
@@ -266,8 +327,11 @@ class Fleet:
         telemetry rather than being omitted — a missing printer and an unreachable one
         are different facts. See `BambuPrinter.snapshot`.
         """
+        # Membership only. Each snapshot runs outside the lock so one printer's
+        # network I/O cannot stall the report for the rest of the fleet.
         with self._lock:
-            return [p.snapshot() for p in self._printers]
+            printers = list(self._printers)
+        return [printer.snapshot() for printer in printers]
 
     def add_printer(self, cfg: PrinterConfig) -> None:
         """Add a printer to a running fleet without a restart (U2) — the precondition for
@@ -300,9 +364,12 @@ class Fleet:
             if not cancelled:
                 self._printers.append(printer)
                 self._configs[bambu_id] = cfg
+                if bambu_id not in self._workers:
+                    self._workers[bambu_id] = PrinterWorker(bambu_id)
         if cancelled:
             printer.disconnect()
             return
+        self._wire_defer(printer)
         logger.info("added printer %s (%s) to the fleet", cfg.bambu_id, cfg.name)
 
     def remove_printer(self, bambu_id: str) -> None:
@@ -319,10 +386,15 @@ class Fleet:
             self._adds_in_flight.pop(bambu_id, None)
             self._reconnects_in_flight.pop(bambu_id, None)
             self._configs.pop(bambu_id, None)
+            worker = self._workers.pop(bambu_id, None)
             if printer is not None:
                 # Remove membership before network cleanup. Any late worker completion
                 # sees a different generation and may only close its replacement.
                 self._printers = [p for p in self._printers if p is not printer]
+        if worker is not None:
+            # Stop outside the lock: the in-flight job may need by_id, and cancel
+            # must be visible without waiting for a long transfer to finish.
+            worker.stop()
         if printer is not None:
             printer.disconnect()
             logger.info("removed printer %s from the fleet", bambu_id)
@@ -508,6 +580,8 @@ class Fleet:
                 replacement_cfg,
                 stale_after_seconds=self._stale_after_seconds,
             )
+            # Same worker: an IP swap must not strand queued commands on the old object.
+            self._wire_defer(replacement)
             if not self._connect_replacement(replacement, replacement_cfg.ip, bambu_id):
                 return
             with self._lock:
@@ -574,6 +648,25 @@ class Fleet:
                            bambu_id, ip, type(error[0]).__name__)
             return False
         return True
+
+    def _worker_cancel_locked(self, bambu_id: str):
+        """Caller holds ``self._lock``. The event ``stop`` sets during removal."""
+        worker = self._workers.get(bambu_id)
+        if worker is None:
+            return None
+        return worker.cancel_event
+
+    def _wire_defer(self, printer) -> None:
+        """Point snapshot's AMS refresh at this serial's worker, when the printer can."""
+        hook = getattr(printer, "set_defer", None)
+        if not callable(hook):
+            return
+        serial = printer.bambu_id
+
+        def defer(fn, *args, **kwargs):
+            return self.submit(serial, fn, *args, **kwargs)
+
+        hook(defer)
 
     def _release_reconnect_worker_slot(self, bambu_id: str) -> None:
         """Release one live-worker slot. Caller must hold ``self._lock``."""
