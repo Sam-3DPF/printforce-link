@@ -2,6 +2,7 @@
 state report the bridge POSTs to 3DPF."""
 
 import logging
+import socket
 import threading
 import time
 from typing import List, Dict, Optional
@@ -25,10 +26,42 @@ _MAX_RECONNECT_WORKERS_PER_SERIAL = 2
 # A stalled connect must not pin a serial: two hung workers used to block a
 # reserved IP from ever being tried again.
 _DEFAULT_CONNECT_TIMEOUT_SECONDS = 12.0
+# The backstop is slower than the session watchdog. It only looks at clients
+# that already had a handshake and have been quiet for five minutes.
+_RECOVERY_INTERVAL_SECONDS = 60.0
+_RECOVERY_SILENCE_SECONDS = 300.0
+_RECOVERY_COOLDOWN_SECONDS = 300.0
+
+
+def _default_tcp_probe(ip: str) -> bool:
+    """True when port 8883 accepts a TCP connection.
+
+    One second: a closed port must not sit on the caller. The fleet runs this
+    off the report loop.
+    """
+    sock = socket.create_connection((ip, 8883), timeout=1.0)
+    try:
+        return True
+    finally:
+        sock.close()
 
 
 def _default_discover(timeout: float, probe_ips=None) -> List[DiscoveredPrinter]:
     return discover(timeout=timeout, probe_ips=probe_ips)
+
+
+def _printer_had_session(printer) -> bool:
+    value = getattr(printer, "had_session", False)
+    if callable(value):
+        value = value()
+    return bool(value)
+
+
+def _printer_silent_for(printer, now):
+    fn = getattr(printer, "silent_for", None)
+    if not callable(fn):
+        return None
+    return fn(now)
 
 
 def _call_discover(discover_fn, timeout: float, probe_ips) -> List[DiscoveredPrinter]:
@@ -49,7 +82,8 @@ class Fleet:
                  discover_timeout_seconds: float = _DEFAULT_DISCOVER_TIMEOUT_SECONDS,
                  monotonic=time.monotonic,
                  on_address=None,
-                 connect_timeout_seconds: float = _DEFAULT_CONNECT_TIMEOUT_SECONDS):
+                 connect_timeout_seconds: float = _DEFAULT_CONNECT_TIMEOUT_SECONDS,
+                 tcp_probe=None):
         # `stale_after_seconds` is how long a printer may say nothing new before it is
         # presumed gone (Config.stale_after_seconds). It is per-fleet because it is
         # derived from the poll interval — see BambuPrinter.snapshot.
@@ -78,6 +112,10 @@ class Fleet:
         self._reconnect_worker_counts = {}
         self._on_address = on_address
         self._connect_timeout = connect_timeout_seconds
+        self._tcp_probe = tcp_probe if tcp_probe is not None else _default_tcp_probe
+        self._last_recovery_monotonic = None
+        self._recovery_tried_at = {}
+        self._recovery_inflight = {}
 
     def connect_all(self) -> None:
         """Connect the fleet without letting one printer hold up startup.
@@ -295,25 +333,19 @@ class Fleet:
             return [p.current_ip for p in self._printers if p.current_ip]
 
     def reconcile_connections(self) -> None:
-        """Self-heal dropped connections (U1).         A printer reports OFFLINE when it is
-        unreachable — which, after a DHCP lease change, means the bridge is dialing an
-        address the printer no longer holds. Re-discover offline printers by serial via
-        SSDP and rebuild the client when that serial answers at a different IP.
+        """Reconnect when SSDP reports a serial at a different IP.
 
-        A silent session is retried at the stored IP on this timer. SSDP is useful
-        when it names a new address; it is not required this pass. A quiet printer
-        often does not broadcast in a short listen, and waiting for a hit left the
-        farm OFFLINE after a restart.
-
-        When multicast hears nothing, the scan still unicasts M-SEARCH to every
-        address we already have (and the rest of each /24) so a reserved IP on the
-        same LAN can answer. A hung connect is timed out so the serial can be
-        tried again. A newly learned IP is persisted.
+        Same-IP silence is not a new printer. The session watchdog resets a quiet
+        client, and ``recover_dead_sessions`` probes port 8883 for one that has
+        been down for minutes. Swapping the printer object here would drop the
+        stopwatch and the cancel latch.
 
         Scans only when at least one printer is offline AND `rediscover_interval` has
         elapsed since the last scan — a healthy farm pays nothing, and a whole farm that
         is briefly down is not hammered. Each serial owns at most one daemon reconnect
-        worker, so a blocked connect cannot block the reporter or another printer."""
+        worker, so a blocked connect cannot block the reporter or another printer.
+        A newly learned IP is persisted.
+        """
         with self._lock:
             offline = [p for p in self._printers if p.is_offline]
         if not offline:
@@ -333,24 +365,88 @@ class Fleet:
         except Exception as e:
             logger.warning("re-discovery scan failed (%s); will retry next interval",
                            type(e).__name__)
-            found = {}
+            return
         for p in offline:
             d = found.get(p.bambu_id)
-            target = d.ip if d is not None and d.ip else p.current_ip
-            if not target:
+            if d is None or not d.ip or d.ip == p.current_ip:
                 continue
-            if d is None or not d.ip:
-                logger.info(
-                    "printer %s is silent and SSDP did not answer; "
-                    "retrying stored address %s",
-                    p.bambu_id, target,
+            self._schedule_reconnect(p, d.ip)
+
+    def recover_dead_sessions(self) -> None:
+        """Rebuild a client that already connected, then went silent, if 8883 answers.
+
+        At most once a minute for the fleet, and once per five minutes per printer.
+        The TCP probe runs on a daemon thread so the report loop does not wait on it.
+        A printer that has never completed a handshake is left to paho.
+        """
+        now = self._monotonic()
+        with self._lock:
+            if (self._last_recovery_monotonic is not None
+                    and now - self._last_recovery_monotonic < _RECOVERY_INTERVAL_SECONDS):
+                return
+            self._last_recovery_monotonic = now
+            due = []
+            for printer in self._printers:
+                if not _printer_had_session(printer):
+                    continue
+                silent = _printer_silent_for(printer, now)
+                if silent is None or silent <= _RECOVERY_SILENCE_SECONDS:
+                    continue
+                tried = self._recovery_tried_at.get(printer.bambu_id)
+                if tried is not None and now - tried < _RECOVERY_COOLDOWN_SECONDS:
+                    continue
+                if printer.bambu_id in self._recovery_inflight:
+                    continue
+                token = object()
+                self._recovery_inflight[printer.bambu_id] = token
+                self._recovery_tried_at[printer.bambu_id] = now
+                due.append((printer, token))
+        for printer, token in due:
+            worker = threading.Thread(
+                target=self._probe_and_rebuild,
+                args=(printer, token),
+                name=f"link-recover-{printer.bambu_id}",
+                daemon=True,
+            )
+            try:
+                worker.start()
+            except RuntimeError:
+                with self._lock:
+                    if self._recovery_inflight.get(printer.bambu_id) is token:
+                        self._recovery_inflight.pop(printer.bambu_id, None)
+                logger.warning(
+                    "printer %s recovery worker could not start; will retry",
+                    printer.bambu_id,
                 )
-            elif d.ip == p.current_ip:
-                logger.info(
-                    "printer %s is still at %s and still OFFLINE; rebuilding the session",
-                    p.bambu_id, d.ip,
-                )
-            self._schedule_reconnect(p, target)
+
+    def _probe_and_rebuild(self, printer, token) -> None:
+        """One TCP probe, then an in-place client reset if the port accepted it."""
+        bambu_id = printer.bambu_id
+        try:
+            ip = printer.current_ip
+            try:
+                answered = bool(self._tcp_probe(ip))
+            except Exception:
+                answered = False
+            if not answered:
+                return
+            with self._lock:
+                if printer not in self._printers:
+                    return
+            logger.info(
+                "printer %s silent and port 8883 accepts; rebuilding the session",
+                bambu_id,
+            )
+            printer.rebuild_session()
+        except Exception as exc:
+            logger.warning(
+                "printer %s session rebuild failed (%s)",
+                bambu_id, type(exc).__name__,
+            )
+        finally:
+            with self._lock:
+                if self._recovery_inflight.get(bambu_id) is token:
+                    self._recovery_inflight.pop(bambu_id, None)
 
     def _schedule_reconnect(self, printer, new_ip: str) -> None:
         """Start at most one daemon reconnect worker for this fleet member/serial."""

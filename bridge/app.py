@@ -331,7 +331,11 @@ def main(config_path: str = "config.toml") -> None:
             # Self-heal any printer that dropped off the network — re-discover it by
             # serial and reconnect at its new IP if DHCP moved it (U1). Throttled and only
             # when something is actually offline, so a healthy farm pays nothing.
+            # A client that already had a session and has been silent for minutes is
+            # rebuilt in place when its port still accepts TCP. That does not wait
+            # for SSDP and does not replace the printer object.
             fleet.reconcile_connections()
+            fleet.recover_dead_sessions()
 
             now = time.monotonic()
             if now - last_heartbeat >= cfg.heartbeat_interval_seconds:

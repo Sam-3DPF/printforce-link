@@ -1351,60 +1351,43 @@ _FINISHED = {"print": {
 }}
 
 
-def test_a_finished_printer_that_answers_push_start_stays_online():
-    """P1S-9, 2026-09-21: the plate was done, temperatures had settled, and the LAN
-    socket was still up. The printer had stopped pushing on its own — the same state
-    SimplyPrint was still reading — and Link called that silence OFFLINE, then never
-    asked again. `pushing.start` is how a quiet P1 resumes reports. An answer, even
-    one that only moves `sequence_id`, is a live printer and must stay NEEDS_CLEARING.
+def test_a_finished_printer_gone_quiet_reports_offline_without_publishing():
+    """A finished plate that stops talking is OFFLINE. Snapshot must not send a
+    command to keep the last temperatures looking live.
     """
     clock = FakeClock()
     printer = _printer([_FINISHED], monotonic=clock.now)
     assert printer.snapshot()["status"] == "NEEDS_CLEARING"
+    before = list(printer._session.published)
 
-    def resume(_payload):
-        printer._session.push({
-            "print": {
-                "gcode_state": "FINISH",
-                "mc_percent": 100,
-                "nozzle_temper": 29.0,
-                "bed_temper": 28.0,
-                "sequence_id": "42",
-            },
-        })
-
-    printer._session.on_publish = resume
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    slept = []
+    printer._sleep = lambda seconds: slept.append(seconds)
     snapshot = printer.snapshot()
 
-    assert snapshot["status"] == "NEEDS_CLEARING"
-    assert snapshot["nozzle_temper"] == 29.0
-    assert snapshot["progress_percent"] == 100
-    assert printer.needs_session_rebuild is False
-    # pushall may follow on the same publish path once the printer answers;
-    # the resume that kept it online is pushing.start.
-    assert any(
-        item.get("pushing", {}).get("command") == "start"
-        for item in printer._session.published
-    )
+    assert snapshot["status"] == "OFFLINE"
+    assert snapshot["nozzle_temper"] is None
+    assert snapshot["progress_percent"] is None
+    assert printer._session.published == before
+    assert slept == []
 
 
-def test_silence_on_a_live_socket_goes_offline_and_requests_a_rebuild():
-    """The nudge is not a way to keep a dead printer looking alive. If `pushing.start`
-    gets no new report, the frozen dump is still OFFLINE — and the session is marked
-    for rebuild, because paho will not reconnect a socket it still thinks is up.
+def test_silence_on_a_live_socket_reports_offline_without_publishing():
+    """Silence longer than the staleness window is OFFLINE even when the socket
+    still looks up. The frozen dump must not be replayed, and snapshot must not
+    publish while it decides that.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
     assert printer.snapshot()["status"] == "PRINTING"
+    before = list(printer._session.published)
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
     assert snapshot["progress_percent"] is None
-    assert printer.needs_session_rebuild is True
-    assert printer._session.published[-1]["pushing"]["command"] == "start"
+    assert printer._session.published == before
 
 
 def test_an_identical_report_still_counts_as_hearing_the_printer():
@@ -1420,12 +1403,11 @@ def test_an_identical_report_still_counts_as_hearing_the_printer():
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "NEEDS_CLEARING"
-    assert printer.needs_session_rebuild is False
 
 
-def test_a_link_down_past_the_window_requests_a_session_rebuild():
-    """A one-second drop is paho's to retry. A socket that is still down after the
-    staleness window is not retrying, and the fleet has to rebuild it at the same IP.
+def test_a_link_that_stays_down_does_not_publish():
+    """A dropped socket is OFFLINE on the next report. Snapshot does not publish
+    and does not sleep while it says so — recovery belongs to the session.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
@@ -1433,38 +1415,38 @@ def test_a_link_down_past_the_window_requests_a_session_rebuild():
 
     printer._session.connected = False
     clock.advance(1)
+    before = list(printer._session.published)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is False
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    slept = []
+    printer._sleep = lambda seconds: slept.append(seconds)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is True
+    assert printer._session.published == before
+    assert slept == []
 
 
-def test_a_printer_that_never_pushes_is_asked_then_rebuilt():
-    """After the 0.1.22 restart the quiet printers stayed OFFLINE. A fresh process
-    has not heard them, and a finished P1 does not push until asked. The empty
-    dump used to return before `pushing.start` and before the same-IP rebuild,
-    so SSDP seeing the current address did nothing.
+def test_a_printer_that_never_pushes_stays_offline_without_a_command():
+    """No report yet is OFFLINE. Snapshot must not invent a resume command to
+    fill that gap.
     """
     clock = FakeClock()
     printer = _printer([{}], monotonic=clock.now)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is False
-    assert getattr(printer._session, "published", []) == []
+    assert printer._session.published == []
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
     assert snapshot["nozzle_temper"] is None
-    assert printer.needs_session_rebuild is True
-    assert printer._session.published[-1]["pushing"]["command"] == "start"
+    assert printer._session.published == []
 
 
-def test_a_quiet_printer_that_answers_the_first_push_start_comes_online():
-    """The ask is enough when the socket is up. Do not rebuild a printer that
-    just answered, and do not leave it OFFLINE."""
+def test_a_quiet_socket_stays_offline_when_nothing_was_asked():
+    """An empty first dump stays OFFLINE. A publish hook that would have
+    answered a command must not run, because snapshot does not send one.
+    """
     clock = FakeClock()
     printer = _printer([{}], monotonic=clock.now)
     printer.snapshot()
@@ -1478,28 +1460,26 @@ def test_a_quiet_printer_that_answers_the_first_push_start_comes_online():
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
     snapshot = printer.snapshot()
 
-    assert snapshot["status"] == "IDLE"
-    assert snapshot["nozzle_temper"] == 31.0
-    assert printer.needs_session_rebuild is False
+    assert snapshot["status"] == "OFFLINE"
+    assert snapshot["nozzle_temper"] is None
+    assert printer._session.published == []
 
 
-def test_a_socket_that_never_comes_up_requests_a_rebuild_after_the_window():
-    """A restart can fail the first connect and then sit on that dead client.
-    One second is still paho's. The staleness window means the session is not
-    coming up, even if this process has never heard the printer.
+def test_a_socket_that_never_comes_up_stays_offline():
+    """A connect that never succeeds is OFFLINE immediately and still OFFLINE
+    after the staleness window. Snapshot does not try to repair it.
     """
     clock = FakeClock()
     printer = _printer([{}], monotonic=clock.now, connected=False)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is False
 
     clock.advance(1)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is False
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    before = list(printer._session.published)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is True
+    assert printer._session.published == before
 
 
 def test_a_dropped_mqtt_link_reports_offline_without_waiting_out_the_window():

@@ -85,11 +85,6 @@ _DURATION_DISAGREEMENT_SECONDS = 120
 # (`Config.stale_after_seconds` = state_interval x offline_after_stale_polls); this is
 # the fallback for a `BambuPrinter` built without one, and equals that default (15s x 3).
 _DEFAULT_STALE_AFTER_SECONDS = 45
-# A P1 that has stopped pushing still answers `pushing.start` on a live socket.
-# That is the cheap resume (not `pushall`, which lags a P1 if it is repeated).
-# Sample briefly so the reply can land in this poll; a dead printer does not answer.
-_NUDGE_SAMPLES = 3
-_NUDGE_SAMPLE_SECONDS = 0.2
 # pushall is expensive on the printer. Ask a few times after connect / a partial AMS,
 # then wait for Refresh.
 _MAX_FULL_STATUS_ATTEMPTS = 3
@@ -598,12 +593,6 @@ class BambuPrinter:
         # plate often republishes the same temperatures; that is still a heartbeat.
         self._last_message_monotonic: Optional[float] = None
         self._offline = False                     # for logging the edge, not every poll
-        # Set when silence or a down socket outlasts paho's own retry. The fleet
-        # rebuilds that session even if SSDP still answers at the current IP.
-        self._needs_session_rebuild = False
-        self._link_down_monotonic: Optional[float] = None
-        self._awaiting_first_report_monotonic: Optional[float] = None
-        self._last_nudge_monotonic: Optional[float] = None
         self._historical_failed_streak = 0
         self._asked_full_status = False
         self._full_status_attempts = 0
@@ -632,15 +621,51 @@ class BambuPrinter:
         return self._offline
 
     @property
-    def needs_session_rebuild(self) -> bool:
-        """The MQTT session is wedged, not merely between paho retries.
+    def connection_state(self) -> str:
+        """Session state: connecting, live, stale, commands_ignored, or offline."""
+        session = self._session
+        if session is None:
+            return "offline"
+        return getattr(session, "state", "offline")
 
-        True after a printer we have heard from goes silent on a socket that still
-        looks up, or stays disconnected past the staleness window. The fleet rebuilds
-        that client even when SSDP reports the same IP. A brief drop leaves this
-        false so an in-progress paho retry is not thrown away.
+    @property
+    def down_reason(self):
+        """Why the session is not live. None while it is connecting or live.
+
+        Not part of the state report yet. One of auth_rejected, refused,
+        unreachable, silent_session, commands_ignored.
         """
-        return self._needs_session_rebuild
+        session = self._session
+        if session is None:
+            return None
+        return getattr(session, "down_reason", None)
+
+    @property
+    def had_session(self) -> bool:
+        session = self._session
+        if session is None:
+            return False
+        return bool(getattr(session, "had_session", False))
+
+    def silent_for(self, now=None):
+        """Seconds the session has been quiet, for the fleet backstop."""
+        session = self._session
+        fn = getattr(session, "silent_for", None) if session is not None else None
+        if not callable(fn):
+            return None
+        return fn(now)
+
+    def rebuild_session(self) -> None:
+        """Replace the MQTT client in place.
+
+        The merged payload, the stopwatch, and the cancel latch belong to this
+        object. A same-IP recovery must not construct a new printer to get a
+        new client.
+        """
+        session = self._session
+        if session is None:
+            return
+        session.hard_reset()
 
     def connect(self) -> None:
         self._connect(self._ip)
@@ -678,10 +703,6 @@ class BambuPrinter:
         self._last_raw = None
         self._last_fresh_monotonic = None
         self._last_message_monotonic = None
-        self._needs_session_rebuild = False
-        self._link_down_monotonic = None
-        self._awaiting_first_report_monotonic = None
-        self._last_nudge_monotonic = None
         self._historical_failed_streak = 0
         self._last_gcode_state = None
         self._connect(target_ip)
@@ -988,19 +1009,14 @@ class BambuPrinter:
           * **the MQTT link is up** (`_is_connected`) — authoritative, and cheap; and
           * **the printer is still talking** (`_stale_for`) — a new report, or a merged
             dump that changed. A finished plate often repeats the same temperatures, so
-            an unchanged dump is not by itself a dead printer. A socket that still looks
-            up but has gone quiet is asked once, with `pushing.start`, to resume. No
-            answer reports OFFLINE and asks the fleet to rebuild the session, including
-            at the same IP: paho will not reconnect a socket it still considers healthy.
+            an unchanged dump is not by itself a dead printer.
 
-        A link that is actually down reports OFFLINE immediately. paho is given the
-        staleness window to retry; if it is still down after that, the session is
-        rebuilt too, including a session that has not heard the printer yet. A restart
-        clears that memory, and a quiet P1 does not push until asked, so "never heard"
-        used to skip the same-IP rebuild and leave the printer OFFLINE at the address
-        SSDP still reports. A printer that never answers stays OFFLINE — this does not
-        turn a frozen dump into IDLE. A false OFFLINE costs a poll of dispatch
-        (visible, and fails closed); a false IDLE costs a print.
+        A link that is down, a printer that has never reported, or silence longer
+        than the staleness window is OFFLINE. This method does not publish and does
+        not sleep: bringing the socket back is the session watchdog and the fleet
+        backstop. A printer that never answers stays OFFLINE — this does not turn a
+        frozen dump into IDLE. A false OFFLINE costs a poll of dispatch (visible,
+        and fails closed); a false IDLE costs a print.
         """
         try:
             connected = self._is_connected()
@@ -1008,40 +1024,20 @@ class BambuPrinter:
             # A session that cannot answer is unreachable. This is not how a
             # printer normally dies — the link flag is — and it is the only
             # exception read as "unreachable".
-            self._note_link_down()
             return self._go_offline(f"unreadable ({type(e).__name__})")
 
-        if connected is False:
+        if not connected:
             # Authoritative. In LAN mode the printer *is* the MQTT broker, so the
             # session keepalive is a liveness check on the printer itself, not on
-            # some intermediary. A brief drop is left for paho; a socket that stays
-            # down is not actually retrying (see `_note_link_down`).
-            self._note_link_down()
+            # some intermediary.
             return self._go_offline("MQTT link is down")
-        if connected is True:
-            self._link_down_monotonic = None
 
         if not self._cached:
             # No report yet. We know nothing about this printer, and nothing is not IDLE.
-            # A quiet P1 will not send that first push on its own. After the same
-            # window we give a dead printer, ask it to start, then rebuild the
-            # session if it still says nothing. Inside the window, leave the
-            # in-progress connect alone.
-            if connected is not False and self._first_report_overdue():
-                if not (self._nudge_recovered() and self._cached):
-                    self._needs_session_rebuild = True
-                    return self._go_offline("no MQTT payload received yet")
-            else:
-                return self._go_offline("no MQTT payload received yet")
+            return self._go_offline("no MQTT payload received yet")
 
         silent_for = self._stale_for()
-        if silent_for is not None and connected is not False and self._nudge_recovered():
-            silent_for = None
         if silent_for is not None:
-            # Heard before, quiet now, and a resume request did not bring a report.
-            # The socket may still say "up". paho will not rebuild that session.
-            if self._last_fresh_monotonic is not None or self._last_message_monotonic is not None:
-                self._needs_session_rebuild = True
             return self._go_offline(
                 f"nothing new for {silent_for:.0f}s (> {self._stale_after_seconds:.0f}s) — "
                 f"the printer is gone, or the MQTT session is wedged")
@@ -1050,9 +1046,6 @@ class BambuPrinter:
             # Covers both a recovery and the first payload after a bridge start.
             logger.info("printer %s: online — reporting live telemetry", self.bambu_id)
             self._offline = False
-        self._needs_session_rebuild = False
-        self._awaiting_first_report_monotonic = None
-        self._last_nudge_monotonic = None
 
         try:
             gcode_state = None
@@ -1135,72 +1128,6 @@ class BambuPrinter:
             return None                 # nothing has ever arrived; the empty cache says so
         silent_for = self._monotonic() - heard
         return silent_for if silent_for > self._stale_after_seconds else None
-
-    def _note_link_down(self) -> None:
-        """Give paho one staleness window, then ask the fleet to rebuild the client.
-
-        A same-IP outage used to be left to paho forever. When that retry never
-        lands, the printer stays OFFLINE until someone restarts Link. A session
-        that has never heard the printer is included: a restart forgets that the
-        printer used to answer, and paho will not replace a socket that never
-        came up if SSDP still reports the same address.
-        """
-        now = self._monotonic()
-        if self._link_down_monotonic is None:
-            self._link_down_monotonic = now
-            return
-        if now - self._link_down_monotonic > self._stale_after_seconds:
-            self._needs_session_rebuild = True
-
-    def _first_report_overdue(self) -> bool:
-        """True once a connected session has produced no MQTT message for the window.
-
-        The first poll only starts the clock, so a connect that is still receiving
-        its first push is not rebuilt. A printer we have already heard is not on
-        this path.
-        """
-        if self._heard_monotonic() is not None:
-            self._awaiting_first_report_monotonic = None
-            return False
-        now = self._monotonic()
-        started = self._awaiting_first_report_monotonic
-        if started is None:
-            self._awaiting_first_report_monotonic = now
-            return False
-        return now - started > self._stale_after_seconds
-
-    def _nudge_recovered(self) -> bool:
-        """Ask a quiet printer to resume reports. True only if one actually arrives.
-
-        At most once per staleness window, and only a few short samples: the reporter
-        loop is shared by the whole fleet. `pushing.start` is the documented resume
-        for a P1 that silently stopped pushing; it is not a `pushall`.
-        """
-        now = self._monotonic()
-        if (
-            self._last_nudge_monotonic is not None
-            and now - self._last_nudge_monotonic < self._stale_after_seconds
-        ):
-            return False
-        self._last_nudge_monotonic = now
-        # Captured before the publish: the report callback can run before
-        # publish() returns, and there is no dump left to poll afterwards.
-        heard_before = self._heard_monotonic()
-        sent = self._publish_command(
-            {"pushing": {"sequence_id": "0", "command": "start"}},
-        )
-        if not sent:
-            return False
-        logger.info("printer %s: reports went quiet; requested pushing.start", self.bambu_id)
-        for i in range(_NUDGE_SAMPLES):
-            if i:
-                self._sleep(_NUDGE_SAMPLE_SECONDS)
-            # Never-heard is also `_stale_for() is None`. Only a message that
-            # arrived during this ask counts as the printer answering.
-            heard_now = self._heard_monotonic()
-            if heard_now is not None and heard_now != heard_before:
-                return True
-        return False
 
     def _take_fresh(self) -> bool:
         with self._payload_lock:
