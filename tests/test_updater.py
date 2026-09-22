@@ -411,3 +411,43 @@ def test_download_has_a_bounded_timeout(tmp_path, monkeypatch):
 
     assert seen["timeout"] == 60
     assert destination.read_bytes() == b"release"
+
+
+def test_startup_health_marker_is_written_when_the_cloud_answers():
+    from bridge.app import _confirm_startup_health
+
+    class Cloud:
+        def heartbeat(self, link):
+            assert link["version"] == "0.1.30"
+            return {"ok": True}
+
+    class Updater:
+        def __init__(self):
+            self.confirmed = False
+
+        def metadata(self):
+            return {"version": "0.1.30"}
+
+        def confirm_running(self):
+            self.confirmed = True
+
+    updater = Updater()
+    assert _confirm_startup_health(Cloud(), updater) is True
+    assert updater.confirmed is True
+
+
+def test_startup_health_marker_waits_when_the_cloud_is_silent():
+    from bridge.app import _confirm_startup_health
+
+    class Cloud:
+        def heartbeat(self, link):
+            return {}
+
+    class Updater:
+        def metadata(self):
+            return {"version": "0.1.30"}
+
+        def confirm_running(self):
+            raise AssertionError("a silent cloud must not confirm the build")
+
+    assert _confirm_startup_health(Cloud(), Updater()) is False
