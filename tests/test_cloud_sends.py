@@ -1134,6 +1134,16 @@ def test_leftover_finished_idle_stops_before_mqtt_start(tmp_path):
     assert len(fleet.starts) == 1
 
 
+def test_needs_clearing_stops_before_mqtt_start(tmp_path):
+    """gcode FINISH is NEEDS_CLEARING, not IDLE. project_file is ignored until stop."""
+    fleet = _ConfirmFleet()
+    fleet._printer._snapshot = _leftover_finished_snapshot(status="NEEDS_CLEARING")
+    _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
+    assert fleet.stops == ["P1"]
+    assert fleet.commands[:2] == ["stop_print", "start_print"]
+    assert len(fleet.starts) == 1
+
+
 def test_empty_finished_idle_does_not_stop_before_start(tmp_path):
     fleet = _ConfirmFleet()
     fleet._printer._snapshot = _legacy_ready_snapshot(

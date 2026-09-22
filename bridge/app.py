@@ -1088,8 +1088,23 @@ def _leftover_finished_idle(snapshot) -> bool:
     return progress == 100
 
 
+def _finished_plate_blocks_start(snapshot) -> bool:
+    """True when MQTT project_file would land on a plate that is already done.
+
+    Bambu stays NEEDS_CLEARING (gcode FINISH) after a print, and also reports
+    IDLE at 100% with the filename still set. Either one ignores the next
+    start until stop clears that task. A live print is not this case.
+    """
+    if _leftover_finished_idle(snapshot):
+        return True
+    return (
+        isinstance(snapshot, dict)
+        and snapshot.get("status") == "NEEDS_CLEARING"
+    )
+
+
 def _clear_leftover_finished(fleet, bambu_id: str) -> None:
-    if not _leftover_finished_idle(_live_snapshot(fleet, bambu_id)):
+    if not _finished_plate_blocks_start(_live_snapshot(fleet, bambu_id)):
         return
     stopper = getattr(fleet, "stop_print", None)
     if callable(stopper):
