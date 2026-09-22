@@ -169,6 +169,25 @@ def test_request_full_status_uses_mqtt_client_pushall():
     assert printer._client.mqtt_client.calls == ["pushall"]
 
 
+def test_start_print_uses_p1_sdcard_url():
+    cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
+    printer = BambuPrinter(cfg)
+
+    class _Client:
+        def __init__(self):
+            self.payloads = []
+
+        def publish_command(self, payload):
+            self.payloads.append(payload)
+            return True
+
+    printer._client = _Client()
+    assert printer.start_print("batch-a.3mf", [0], 1) is True
+    payload = printer._client.payloads[0]["print"]
+    assert payload["command"] == "project_file"
+    assert payload["url"] == "file:///sdcard/batch-a.3mf"
+
+
 def test_resume_from_stage_on_real_printer_wrapper():
     cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
     printer = BambuPrinter(cfg)

@@ -516,6 +516,19 @@ def test_printer_owing_a_completion_report_is_not_re_dispatched(tmp_path):
     assert r.assignments_snapshot()["P1"]["terminal"] == "complete"  # still owed
 
 
+def test_latched_cancel_without_print_error_does_not_report_failed(tmp_path):
+    r, dpf = _dispatch_one(tmp_path)
+    d = Dispatcher(r, _FakeFleet(), dpf)
+    d.drain([_snap("P1", "PRINTING", [(1, "FF6A13FF")])])
+    snap = _snap("P1", "ERROR", [(1, "FF6A13FF")])
+    snap["print_error"] = None
+    snap["user_cancelled"] = True
+    d.drain([snap])
+    assert dpf.failed == []
+    assert dpf.completed == []
+    assert "P1" not in r.assignments_snapshot()
+
+
 def test_cancel_failed_print_error_does_not_report_failed(tmp_path):
     r, dpf = _dispatch_one(tmp_path)
     d = Dispatcher(r, _FakeFleet(), dpf)

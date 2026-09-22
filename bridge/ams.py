@@ -16,7 +16,13 @@ Bambu status shape (subset):
             ...
         ],
     }
-Slot numbers are global across AMS units: unit_index * 4 + tray_index + 1.
+Slot numbers are global across regular AMS units: unit_index * 4 + tray_index + 1.
+AMS HT units use ids 128–135 and have one tray each. Those map to slots 17–24
+(`16 + unit_offset + 1`). `unit * 4 + tray + 1` on id 128 invents slot 513.
+
+`remain` is never emptiness. Official dumps send `-1` for unread / third-party
+spools and `0` when remaining is not calibrated. Empty comes from
+`tray_exist_bits` (or metadata), not from remain.
 
 **An empty tray is a slot whose `tray_exist_bits` bit is cleared.** An `{id}`-only
 tray on a P1 is also how idle loaded trays arrive, so that shape alone is not Empty.
@@ -46,8 +52,30 @@ from typing import Dict, List, Optional
 from .coerce import as_int, clean_str
 
 TRAYS_PER_AMS = 4
+AMS_HT_ID_MIN = 128
+AMS_HT_ID_MAX = 135
+# 1-based. Regular AMS occupies 1–16; HT units occupy 17–24.
+AMS_HT_FIRST_SLOT = 17
 
 _HEX_DIGITS = set("0123456789ABCDEF")
+
+
+def ams_slot_number(unit_id: int, tray_id: int) -> int:
+    """1-based slot for a unit/tray pair. HT units are not `unit * 4 + tray`."""
+    if AMS_HT_ID_MIN <= unit_id <= AMS_HT_ID_MAX:
+        return AMS_HT_FIRST_SLOT + (unit_id - AMS_HT_ID_MIN)
+    return unit_id * TRAYS_PER_AMS + tray_id + 1
+
+
+def remain_percent(value) -> Optional[int]:
+    """Calibrated remaining percent, or None when the printer does not know.
+
+    `-1` is unread / third-party. `0` is uncalibrated. Neither is an empty tray.
+    """
+    amount = as_int(value, None)
+    if amount is None or amount <= 0 or amount > 100:
+        return None
+    return amount
 
 
 def normalize_hex(value: Optional[str]) -> Optional[str]:
@@ -134,16 +162,20 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
             tray_index = as_int(tray.get("id"), default=None)
             if tray_index is None:
                 continue  # a tray we cannot place has no slot number to report under
-            slot_number = unit_index * TRAYS_PER_AMS + tray_index + 1
+            slot_number = ams_slot_number(unit_index, tray_index)
             color_hex = clean_str(_tray_color(tray))
             filament_type = clean_str(tray.get("tray_type"))
             present = _bit_present(bits, slot_number)
             if color_hex or filament_type:
-                slots.append({
+                slot = {
                     "slot_number": slot_number,
                     "color_hex": color_hex,
                     "filament_type": filament_type,
-                })
+                }
+                remaining = remain_percent(tray.get("remain"))
+                if remaining is not None:
+                    slot["remain_percent"] = remaining
+                slots.append(slot)
             elif present is False or bits is not None:
                 # Bit-present idle trays stay on the first-connect list. Returning
                 # None here swallowed a sibling RFID hex (0.1.16).
@@ -195,7 +227,7 @@ def idle_trays_needing_rfid(status) -> List[tuple]:
             tray_index = as_int(tray.get("id"), default=None)
             if tray_index is None:
                 continue
-            slot_number = unit_index * TRAYS_PER_AMS + tray_index + 1
+            slot_number = ams_slot_number(unit_index, tray_index)
             if clean_str(_tray_color(tray)) or clean_str(tray.get("tray_type")):
                 continue
             if _bit_present(bits, slot_number) is False:
@@ -276,7 +308,7 @@ def merge_ams(previous, incoming):
             tray_index = as_int(tray.get("id"), default=None)
             if tray_index is None:
                 continue
-            slot_number = unit_index * TRAYS_PER_AMS + tray_index + 1
+            slot_number = ams_slot_number(unit_index, tray_index)
             prev_tray = prev_trays.get(tray_index)
             if (
                 not _tray_color(tray)

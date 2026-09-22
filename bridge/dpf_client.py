@@ -37,6 +37,11 @@ class DpfClient:
         # Persistent client reuses the keep-alive connection across the forever
         # report/heartbeat loop instead of a fresh TCP+TLS handshake per call.
         self._client = httpx.Client(timeout=timeout)
+        # Last farm report that reached 3DPF. After the report socket comes back,
+        # send this immediately so cards do not blink Offline waiting for the
+        # next live dump.
+        self._last_good_reports = []
+        self._report_socket_down = False
 
     def close(self) -> None:
         self._client.close()
@@ -48,11 +53,27 @@ class DpfClient:
         self.unauthorized = False
 
     def report_state(self, reports: List[Dict], link: Optional[Dict] = None) -> Dict:
-        """POST a batch of printer-state reports; returns the desired-state body."""
-        return self._post(
+        """POST a batch of printer-state reports; returns the desired-state body.
+
+        After a drop, the first successful POST replays the last good snapshots
+        so 3DPF does not ingest a farm-wide Offline blink.
+        """
+        outgoing = reports
+        if self._report_socket_down and self._last_good_reports:
+            outgoing = [dict(row) for row in self._last_good_reports]
+        result = self._post(
             "/api/bridge/printers/state",
-            {"printers": reports, "link": link or {}},
+            {"printers": outgoing, "link": link or {}},
         )
+        if result:
+            if not self._report_socket_down:
+                self._last_good_reports = [
+                    dict(row) for row in reports if isinstance(row, dict)
+                ]
+            self._report_socket_down = False
+        else:
+            self._report_socket_down = True
+        return result
 
     def heartbeat(self, link: Optional[Dict] = None) -> Dict:
         """Liveness ping; returns desired-state for all bridge-managed printers."""

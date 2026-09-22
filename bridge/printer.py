@@ -29,6 +29,7 @@ from .ams import (
 )
 from .coerce import as_float, as_int, clean_str
 from .config import PrinterConfig
+from .transfer import lan_start_url, store_on_printer
 
 logger = logging.getLogger(__name__)
 
@@ -201,7 +202,7 @@ def is_cancel_failed(print_error=None, hms_code=None, hms=None) -> bool:
 
 
 def map_status(gcode_state: Optional[str], *, print_error=None,
-               hms_code=None, hms=None) -> str:
+               hms_code=None, hms=None, user_cancelled=False) -> str:
     """Map a Bambu gcode_state to a 3DPF printer status.
 
     Unknown and blank states map to **OFFLINE, never IDLE**. IDLE is the sole
@@ -217,8 +218,9 @@ def map_status(gcode_state: Optional[str], *, print_error=None,
     Only remap ERROR — a leftover cancel code on RUNNING must not hide a live print.
     """
     mapped = _STATE_MAP.get((gcode_state or "").strip().upper(), "OFFLINE")
-    if mapped == "ERROR" and is_cancel_failed(
-        print_error=print_error, hms_code=hms_code, hms=hms,
+    if mapped == "ERROR" and (
+        user_cancelled
+        or is_cancel_failed(print_error=print_error, hms_code=hms_code, hms=hms)
     ):
         return "IDLE"
     return mapped
@@ -286,7 +288,7 @@ def parse_telemetry(status: dict) -> Dict:
         "nozzle_diameter": as_float(print_obj.get("nozzle_diameter"), None),
         # The print stage. It is the only field that says *why* a print paused
         # (6 = filament runout, 16 = user, 35 = nozzle clog) — gcode_state only ever
-        # says PAUSE. Bambu's "no stage" sentinel is -1, normalised to None here.
+        # says PAUSE. X1 sends -1 and P1 sends 255 for "no stage"; both are None.
         "stage": _valid_stage(print_obj.get("stg_cur")),
         "tray_exist_bits": parse_tray_exist_bits(status),
         # print.print_error is 0 when nothing is wrong. Persist the non-zero code so
@@ -512,6 +514,11 @@ class BambuPrinter:
         self._full_status_attempts = 0
         self._last_gcode_state: Optional[str] = None
         self._ams_cache_path = ams_cache_path
+        # User-cancel on a P1 is print_error 50348044 for about two seconds, then
+        # the code clears. Latch the rising edge so a later FAILED with 0 is still
+        # a cancel, not report_failed.
+        self._user_cancelled = False
+        self._last_print_error = ""
 
     @property
     def bambu_id(self) -> str:
@@ -633,9 +640,16 @@ class BambuPrinter:
         if self._client is None:
             raise RuntimeError("printer not connected")
         name = remote_name or os.path.basename(file_path)
-        # upload_file closes the handle itself (its `finally: file.close()`).
-        fh = open(file_path, "rb")
-        self._client.upload_file(fh, name)
+        try:
+            store_on_printer(self._ip, self._cfg.access_code, file_path, name)
+        except Exception:
+            # Shop upload owns TLS-close and SIZE. The library is a fallback when
+            # this host cannot open implicit FTPS (tests, or a missing listener).
+            library_upload = getattr(self._client, "upload_file", None)
+            if not callable(library_upload):
+                raise
+            fh = open(file_path, "rb")
+            library_upload(fh, name)
         logger.info("printer %s: uploaded %s", self.bambu_id, name)
         return name
 
@@ -643,11 +657,28 @@ class BambuPrinter:
         """MQTT-start a file already on the printer. A True return is not an ack."""
         if self._client is None:
             raise RuntimeError("printer not connected")
-        started = self._client.start_print(
-            remote_name, plate_number, use_ams=True, ams_mapping=list(ams_mapping),
-        )
-        logger.info("printer %s: started %s (plate %s, ams_mapping=%s) -> %s",
-                    self.bambu_id, remote_name, plate_number, list(ams_mapping), started)
+        url = lan_start_url(remote_name)
+        started = self._publish_command({
+            "print": {
+                "sequence_id": "0",
+                "command": "project_file",
+                "param": f"Metadata/plate_{int(plate_number)}.gcode",
+                "url": url,
+                "subtask_name": remote_name,
+                "use_ams": True,
+                "ams_mapping": list(ams_mapping),
+            },
+        })
+        if not started:
+            library_start = getattr(self._client, "start_print", None)
+            if callable(library_start):
+                started = bool(library_start(
+                    remote_name, plate_number, use_ams=True,
+                    ams_mapping=list(ams_mapping),
+                ))
+        logger.info("printer %s: started %s (plate %s, ams_mapping=%s, url=%s) -> %s",
+                    self.bambu_id, remote_name, plate_number, list(ams_mapping),
+                    url, started)
         return bool(started)
 
     def pause_print(self) -> bool:
@@ -732,7 +763,28 @@ class BambuPrinter:
             if self._cached is None:
                 self._seed_remembered_ams()
             self._cached = merge_status_payload(self._cached, raw)
+            self._note_cancel_edge(self._cached)
             return self._note_freshness(raw)
+
+    def _note_cancel_edge(self, payload) -> None:
+        """Latch user-cancel on print_error rising to 50348044.
+
+        The code lasts about two seconds. A later FAILED dump can already have
+        print_error 0. Without the latch that looks like a real fail.
+        """
+        print_obj = payload.get("print") if isinstance(payload, dict) else None
+        if not isinstance(print_obj, dict):
+            return
+        state = print_obj.get("gcode_state")
+        gcode = state.strip().upper() if isinstance(state, str) else ""
+        if gcode in {"PREPARE", "SLICING", "RUNNING"}:
+            self._user_cancelled = False
+            self._last_print_error = ""
+        current = _norm_error_code(print_obj.get("print_error"))
+        previous = self._last_print_error
+        if current in _CANCEL_PRINT_ERRORS and previous not in _CANCEL_PRINT_ERRORS:
+            self._user_cancelled = True
+        self._last_print_error = current
 
     def _attach_mqtt_listener(self) -> None:
         mqtt = getattr(self._client, "mqtt_client", None) if self._client else None
@@ -1162,6 +1214,7 @@ class BambuPrinter:
                 print_error=telemetry.get("print_error"),
                 hms_code=telemetry.get("hms_code"),
                 hms=print_obj.get("hms"),
+                user_cancelled=self._user_cancelled,
             ),
             # None — not [] — while this printer's payload carries no AMS unit list,
             # which is its normal state between connecting and the first full push. The
@@ -1172,6 +1225,7 @@ class BambuPrinter:
             # Status intentionally remains ERROR. This separate signal lets the cloud
             # check its own assignment state before deciding whether the failure is old.
             "historical_failed_ready": self._historical_failed_streak >= 2,
+            "user_cancelled": self._user_cancelled,
             "print_duration_seconds": self._stopwatch.duration_seconds,
             "print_duration_source": self._stopwatch.source,
         }
@@ -1188,6 +1242,7 @@ class BambuPrinter:
             "slots": [],
             **parse_telemetry(None),
             "historical_failed_ready": False,
+            "user_cancelled": False,
             "print_duration_seconds": None,
             "print_duration_source": None,
         }
@@ -1283,17 +1338,14 @@ def _print_error_str(value) -> Optional[str]:
 
 
 def _valid_stage(value) -> Optional[int]:
-    """`stg_cur` is Bambu's print stage, and **-1 is its "no stage" sentinel** — the
-    value every idle printer reports.
+    """`stg_cur` is Bambu's print stage. Idle sentinels are not a pause reason.
 
-    "No stage" is an absence, so it is reported as one. Persisted verbatim it becomes
-    the literal string "-1" in `printer_telemetry.stage` (a TEXT column), which reads
-    as a real stage: `stage IS NOT NULL` would be true for every idle printer in the
-    farm, and any "why did this print pause?" lookup would have to know to special-case
-    a magic string. Nulled here, at the same boundary where `_minutes_to_seconds` nulls
-    a negative ETA and `_valid_epoch` nulls a zero start time.
+    X1 sends -1. P1 sends 255. Both mean "no stage." Persisted verbatim they
+    become a fake stage in `printer_telemetry.stage` (a TEXT column): every idle
+    P1 would look paused. Nulled here, at the same boundary where a negative
+    ETA and a zero start time become None.
     """
     stage = as_int(value, None)
-    if stage is None or stage < 0:
+    if stage is None or stage < 0 or stage == 255:
         return None
     return stage
