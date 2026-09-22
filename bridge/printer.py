@@ -27,6 +27,7 @@ from .ams import (
     parse_tray_exist_bits,
     save_remembered_ams,
 )
+from .bambu_alerts import describe_hms
 from .coerce import as_float, as_int, clean_str
 from .config import PrinterConfig
 from .transfer import lan_start_url, store_on_printer
@@ -342,6 +343,10 @@ def parse_telemetry(status: dict) -> Dict:
         "print_error": _print_error_str(print_obj.get("print_error")),
     }
     telemetry.update(decode_hms(print_obj.get("hms")))
+    telemetry.update(describe_hms(
+        hms_code=telemetry.get("hms_code"),
+        print_error=telemetry.get("print_error"),
+    ))
     telemetry.update(_failed_ready_fields(print_obj))
     return telemetry
 

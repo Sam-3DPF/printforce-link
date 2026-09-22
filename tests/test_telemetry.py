@@ -216,6 +216,8 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "hms_severity": None,
         "hms_code": None,
         "hms_count": 0,
+        "hms_title": None,
+        "hms_detail": None,
         "print_error": None,
         "gcode_state": "RUNNING",
         "hms_present": True,
