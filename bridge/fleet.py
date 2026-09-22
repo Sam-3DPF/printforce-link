@@ -80,15 +80,53 @@ class Fleet:
         self._connect_timeout = connect_timeout_seconds
 
     def connect_all(self) -> None:
+        """Connect the fleet without letting one printer hold up startup.
+
+        The macOS updater keeps a new build only if this process reaches 3DPF
+        within two minutes. ``connect()`` publishes a full status dump and waits
+        for the broker to ack; a half-open socket never does. Reconnects already
+        abandon that wait after ``_connect_timeout``. Startup spends that same
+        budget once, across the whole fleet, then moves on. A printer that did
+        not answer is reported OFFLINE and retried later.
+        """
         with self._lock:
             printers = list(self._printers)
-        for p in printers:
-            try:
-                p.connect()
-            except Exception as e:
-                # A printer that won't connect is reported OFFLINE via snapshot();
-                # don't let one bad printer stop the fleet from starting.
-                logger.warning("could not connect to %s: %s", p.bambu_id, type(e).__name__)
+        if not printers:
+            return
+        pending = []
+        for printer in printers:
+            finished = threading.Event()
+            error: List[BaseException] = []
+
+            def _connect(printer=printer, finished=finished, error=error):
+                try:
+                    printer.connect()
+                except BaseException as exc:
+                    error.append(exc)
+                finally:
+                    finished.set()
+
+            threading.Thread(
+                target=_connect,
+                name=f"printer-connect-{printer.bambu_id}",
+                daemon=True,
+            ).start()
+            pending.append((printer, finished, error))
+
+        deadline = time.monotonic() + self._connect_timeout
+        for printer, finished, error in pending:
+            remaining = deadline - time.monotonic()
+            if remaining < 0 or not finished.wait(remaining):
+                logger.warning(
+                    "could not connect to %s: startup connect timed out",
+                    printer.bambu_id,
+                )
+                continue
+            if error:
+                logger.warning(
+                    "could not connect to %s: %s",
+                    printer.bambu_id, type(error[0]).__name__,
+                )
 
     def by_id(self, bambu_id: str):
         """The BambuPrinter with this serial, or None. The dispatcher (U9) needs the

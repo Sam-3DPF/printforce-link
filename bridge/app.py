@@ -95,6 +95,22 @@ class _LegacyMarkerReadiness:
         return False
 
 
+def _confirm_startup_health(dpf, updater) -> bool:
+    """Write the update-healthy marker once this process has reached 3DPF.
+
+    Returns True when the cloud answered. A miss is not fatal: the report loop
+    confirms again after the first successful state post.
+    """
+    try:
+        reached = bool(dpf.heartbeat(link=updater.metadata()))
+    except Exception:
+        logger.info("startup health check could not reach 3DPF yet")
+        return False
+    if reached:
+        updater.confirm_running()
+    return reached
+
+
 def _filament_family(value) -> Optional[str]:
     raw = value.strip().upper() if isinstance(value, str) else ""
     for family in _FILAMENT_FAMILIES:
@@ -207,8 +223,12 @@ def main(config_path: str = "config.toml") -> None:
         printer_factory=make_printer,
         on_address=store.update_ip,
     )
-    fleet.connect_all()
     dpf = DpfClient(cfg.dpf_base_url, cloud_token)
+    # The macOS swap watchdog deletes this build unless update-healthy appears
+    # within two minutes. connect_all can sit on a half-open printer socket for
+    # that whole window, so reach 3DPF before connecting printers.
+    _confirm_startup_health(dpf, updater)
+    fleet.connect_all()
     reconciler = ConfigReconciler(dpf, fleet, store)
     discovery_reporter = DiscoveryReporter(dpf)
     logger.info("%d printer(s) at startup (%d from config.toml, %d from the local store)",

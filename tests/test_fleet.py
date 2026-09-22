@@ -279,6 +279,32 @@ def test_reconnect_to_a_new_ip_remembers_the_address():
     assert remembered == [("S1", "192.168.8.246")]
 
 
+def test_startup_connect_shares_one_budget_across_hung_printers():
+    # v0.1.29's health check rolled back because connect_all waited on each
+    # printer in turn. One half-open MQTT ack ate the two-minute window before
+    # Link could tell 3DPF the new build was up.
+    started = threading.Event()
+
+    def hang(_printer):
+        started.set()
+        time.sleep(30)
+
+    factory = FakePrinterFactory(connect_hook=hang)
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.8.223"), _cfg("S2", "192.168.8.224")],
+        printer_factory=factory,
+        connect_timeout_seconds=0.05,
+    )
+    began = time.monotonic()
+    fleet.connect_all()
+    elapsed = time.monotonic() - began
+
+    assert started.wait(1.0)
+    assert elapsed < 1.0
+    assert fleet.by_id("S1").connect_calls == 1
+    assert fleet.by_id("S2").connect_calls == 1
+
+
 def test_hung_reconnect_releases_the_slot():
     # A connect that never returns used to keep the per-serial worker slot,
     # so P1P-2 / P1S-9 at a correct reserved IP were never tried again.
