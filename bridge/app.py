@@ -205,6 +205,7 @@ def main(config_path: str = "config.toml") -> None:
         printer_configs,
         stale_after_seconds=cfg.stale_after_seconds,
         printer_factory=make_printer,
+        on_address=store.update_ip,
     )
     fleet.connect_all()
     dpf = DpfClient(cfg.dpf_base_url, cloud_token)
@@ -298,7 +299,9 @@ def main(config_path: str = "config.toml") -> None:
             # Report the printers seen on the LAN so the onboarding wizard can list them
             # (U11). Scans once at startup then goes quiet; scan_requested reopens one
             # bounded on-demand burst (U7). Throttled; code-free.
-            discovery_reporter.tick(scan_requested=scan_requested)
+            discovery_reporter.tick(
+                scan_requested=scan_requested, probe_ips=fleet.known_ips(),
+            )
 
             # Self-heal any printer that dropped off the network — re-discover it by
             # serial and reconnect at its new IP if DHCP moved it (U1). Throttled and only

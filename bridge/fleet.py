@@ -22,10 +22,21 @@ _DEFAULT_DISCOVER_TIMEOUT_SECONDS = 5.0
 # A removed/re-added serial may need one current worker while one stale generation unwinds.
 # Bound those stale lifetimes so repeated config churn cannot grow threads without limit.
 _MAX_RECONNECT_WORKERS_PER_SERIAL = 2
+# bambulabs_api connect() / pushall can block on a half-open MQTT socket. Two hung
+# workers used to pin a serial so a reserved IP was never tried again.
+_DEFAULT_CONNECT_TIMEOUT_SECONDS = 12.0
 
 
-def _default_discover(timeout: float) -> List[DiscoveredPrinter]:
-    return discover(timeout=timeout)
+def _default_discover(timeout: float, probe_ips=None) -> List[DiscoveredPrinter]:
+    return discover(timeout=timeout, probe_ips=probe_ips)
+
+
+def _call_discover(discover_fn, timeout: float, probe_ips) -> List[DiscoveredPrinter]:
+    """Older test injectors only take `timeout`. Production always gets probe_ips."""
+    try:
+        return discover_fn(timeout, probe_ips)
+    except TypeError:
+        return discover_fn(timeout)
 
 
 class Fleet:
@@ -36,7 +47,9 @@ class Fleet:
                  discover_fn=None,
                  rediscover_interval_seconds: float = _DEFAULT_REDISCOVER_INTERVAL_SECONDS,
                  discover_timeout_seconds: float = _DEFAULT_DISCOVER_TIMEOUT_SECONDS,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic,
+                 on_address=None,
+                 connect_timeout_seconds: float = _DEFAULT_CONNECT_TIMEOUT_SECONDS):
         # `stale_after_seconds` is how long a printer may say nothing new before it is
         # presumed gone (Config.stale_after_seconds). It is per-fleet because it is
         # derived from the poll interval — see BambuPrinter.snapshot.
@@ -63,6 +76,8 @@ class Fleet:
         # Ownership above follows active membership generations and is deliberately
         # cleared on remove. This count follows actual thread lifetimes across generations.
         self._reconnect_worker_counts = {}
+        self._on_address = on_address
+        self._connect_timeout = connect_timeout_seconds
 
     def connect_all(self) -> None:
         with self._lock:
@@ -234,19 +249,27 @@ class Fleet:
             printer.disconnect()
             logger.info("removed printer %s from the fleet", bambu_id)
 
+    def known_ips(self) -> List[str]:
+        """LAN addresses the fleet is currently dialing — used to unicast SSDP."""
+        with self._lock:
+            return [p.current_ip for p in self._printers if p.current_ip]
+
     def reconcile_connections(self) -> None:
         """Self-heal dropped connections (U1). A printer reports OFFLINE when it is
         unreachable — which, after a DHCP lease change, means the bridge is dialing an
         address the printer no longer holds. Re-discover offline printers by serial via
         SSDP and rebuild the client when that serial answers at a different IP.
 
-        A same-IP outage is left to paho while the drop is brief. If the session is
-        wedged (`needs_session_rebuild`: quiet on a socket that still looks up, or
-        down past the staleness window), rebuild at the current IP too — even when
-        this scan heard no SSDP answer. Discovery only listens for a few seconds, and
-        a quiet printer often does not broadcast in that window. paho does not
-        reconnect a socket it still considers healthy, and waiting for SSDP left the
-        farm OFFLINE after the v0.1.23 restart.
+        A same-IP outage is left to paho only until the next scan (the 60s interval).
+        If that scan still sees the serial — or the session is wedged
+        (`needs_session_rebuild`) — rebuild at the current or discovered IP. paho
+        does not reconnect a socket it still considers healthy. Skipping a same-IP
+        sighting left reserved-IP printers (P1P-2, P1S-9) OFFLINE on v0.1.24.
+
+        When multicast hears nothing, the scan still unicasts M-SEARCH to every
+        address we already have so a reserved IP on the same LAN can answer. A
+        printer SSDP cannot see stays OFFLINE unless its session is wedged, in
+        which case we retry the stored address (and time out a hung connect).
 
         Scans only when at least one printer is offline AND `rediscover_interval` has
         elapsed since the last scan — a healthy farm pays nothing, and a whole farm that
@@ -263,7 +286,11 @@ class Fleet:
                 return
             self._last_discovery_monotonic = now
         try:
-            found = {d.serial: d for d in self._discover(self._discover_timeout)}
+            found = {
+                d.serial: d for d in _call_discover(
+                    self._discover, self._discover_timeout, self.known_ips(),
+                )
+            }
         except Exception as e:
             logger.warning("re-discovery scan failed (%s); will retry next interval",
                            type(e).__name__)
@@ -283,11 +310,9 @@ class Fleet:
                     )
                     self._schedule_reconnect(p, p.current_ip)
                 continue
-            if d.ip == p.current_ip and not wedged:
-                continue                      # same address; paho is already retrying it
             if d.ip == p.current_ip:
                 logger.info(
-                    "printer %s is still at %s but its MQTT session is wedged; rebuilding",
+                    "printer %s is still at %s and still OFFLINE; rebuilding the session",
                     p.bambu_id, d.ip,
                 )
             self._schedule_reconnect(p, d.ip)
@@ -339,6 +364,7 @@ class Fleet:
         bambu_id = printer.bambu_id
         replacement = None
         swapped = False
+        previous_ip = printer.current_ip
         try:
             with self._lock:
                 if (
@@ -351,7 +377,8 @@ class Fleet:
                 replacement_cfg,
                 stale_after_seconds=self._stale_after_seconds,
             )
-            replacement.connect()
+            if not self._connect_replacement(replacement, replacement_cfg.ip, bambu_id):
+                return
             with self._lock:
                 if (
                     self._membership_generations.get(bambu_id) == generation
@@ -375,6 +402,47 @@ class Fleet:
                 replacement.disconnect()
             if swapped:
                 printer.disconnect()
+                if (
+                    self._on_address is not None
+                    and replacement_cfg.ip
+                    and replacement_cfg.ip != previous_ip
+                ):
+                    try:
+                        self._on_address(bambu_id, replacement_cfg.ip)
+                    except Exception as e:
+                        logger.warning(
+                            "printer %s: could not persist new address %s (%s)",
+                            bambu_id, replacement_cfg.ip, type(e).__name__,
+                        )
+
+    def _connect_replacement(self, replacement, ip: str, bambu_id: str) -> bool:
+        """Run connect() with a timeout so a hung MQTT handshake cannot pin the serial."""
+        finished = threading.Event()
+        error: List[BaseException] = []
+
+        def _connect():
+            try:
+                replacement.connect()
+            except BaseException as e:
+                error.append(e)
+            finally:
+                finished.set()
+
+        worker = threading.Thread(
+            target=_connect,
+            name=f"printer-connect-{bambu_id}",
+            daemon=True,
+        )
+        worker.start()
+        if not finished.wait(self._connect_timeout):
+            logger.warning("printer %s reconnect to %s timed out; will retry",
+                           bambu_id, ip)
+            return False
+        if error:
+            logger.warning("printer %s reconnect to %s failed (%s); will retry",
+                           bambu_id, ip, type(error[0]).__name__)
+            return False
+        return True
 
     def _release_reconnect_worker_slot(self, bambu_id: str) -> None:
         """Release one live-worker slot. Caller must hold ``self._lock``."""

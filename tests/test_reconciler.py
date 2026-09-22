@@ -41,12 +41,44 @@ class FakeStore:
     def __init__(self):
         self.upserts = []
         self.removed = []
+        self.entries = {}
+        self.ip_updates = []
 
     def upsert(self, bambu_id, access_code, local_ip=None, name=""):
         self.upserts.append((bambu_id, access_code, local_ip))
+        entry = self.entries.get(bambu_id, {})
+        entry["access_code"] = access_code
+        if local_ip:
+            entry["local_ip"] = local_ip
+        if name:
+            entry["name"] = name
+        self.entries[bambu_id] = entry
+
+    def has(self, bambu_id):
+        return bambu_id in self.entries
+
+    def update_ip(self, bambu_id, local_ip):
+        self.ip_updates.append((bambu_id, local_ip))
+        if bambu_id in self.entries:
+            self.entries[bambu_id]["local_ip"] = local_ip
 
     def remove(self, bambu_id):
         self.removed.append(bambu_id)
+        self.entries.pop(bambu_id, None)
+
+    def configs(self):
+        from bridge.config import PrinterConfig
+        out = []
+        for bambu_id, entry in self.entries.items():
+            code = entry.get("access_code")
+            ip = entry.get("local_ip")
+            if not code or not ip:
+                continue
+            out.append(PrinterConfig(
+                bambu_id=bambu_id, ip=ip, access_code=code,
+                name=entry.get("name", ""),
+            ))
+        return out
 
 
 class Clock:
@@ -96,11 +128,49 @@ def test_already_in_fleet_is_rebuilt_with_the_new_code():
     assert dpf.acked
 
 
-def test_entry_without_code_is_skipped():
-    # An already-delivered printer comes back with no access_code -> nothing to do.
+def test_entry_without_code_is_skipped_when_not_stored():
+    # An already-delivered printer that this Link has never stored cannot be
+    # rebuilt from an IP-only row — the access code is not in the payload.
     r, dpf, fleet, store = _reconciler([{"printer_id": "p1", "bambu_id": "S1", "local_ip": "192.168.1.5"}])
     r.tick()
     assert store.upserts == [] and fleet.added == [] and dpf.acked == []
+
+
+def test_ip_only_refresh_moves_a_stored_printer():
+    # 3DPF already sent the code. A later reserved-IP edit still arrives as
+    # local_ip with no access_code. v0.1.24 skipped that row, so Link kept
+    # dialing 192.168.86.x after the printer moved to 192.168.8.x.
+    store = FakeStore()
+    store.upsert("S1", "CODE", "192.168.86.28")
+    fleet = FakeFleet(serials=["S1"])
+    r, dpf, fleet, store = _reconciler(
+        [{"printer_id": "p1", "bambu_id": "S1", "local_ip": "192.168.8.246"}],
+        fleet=fleet,
+        store=store,
+    )
+    r.tick()
+    assert store.ip_updates == [("S1", "192.168.8.246")]
+    assert fleet.removed == ["S1"]
+    assert [(c.bambu_id, c.ip, c.access_code) for c in fleet.added] == [
+        ("S1", "192.168.8.246", "CODE"),
+    ]
+    assert dpf.acked == []
+
+
+def test_ip_only_same_address_is_noop():
+    store = FakeStore()
+    store.upsert("S1", "CODE", "192.168.8.236")
+    fleet = FakeFleet(serials=["S1"])
+    r, dpf, fleet, store = _reconciler(
+        [{"printer_id": "p1", "bambu_id": "S1", "local_ip": "192.168.8.236"}],
+        fleet=fleet,
+        store=store,
+    )
+    r.tick()
+    assert store.ip_updates == []
+    assert fleet.removed == []
+    assert fleet.added == []
+    assert dpf.acked == []
 
 
 def test_code_without_ip_is_stored_but_not_added():
