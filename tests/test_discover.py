@@ -1,4 +1,4 @@
-from bridge.discover import DiscoveredPrinter, discover, parse_ssdp_notify
+from bridge.discover import DiscoveredPrinter, discover, msearch_packet, parse_ssdp_notify
 
 # A real Bambu P1S SSDP NOTIFY captured on the LAN (2026-07-13).
 BAMBU_NOTIFY = (
@@ -27,6 +27,23 @@ def test_ip_falls_back_to_source_when_no_location():
     assert p is not None
     assert p.ip == "192.168.86.99"          # source address of the datagram
     assert p.serial == "01P00A3A3000666"
+
+
+def test_msearch_asks_bambu_printers_to_answer():
+    packet = msearch_packet(2021).decode("ascii")
+    assert packet.startswith("M-SEARCH * HTTP/1.1\r\n")
+    assert "HOST: 239.255.255.250:2021\r\n" in packet
+    assert 'MAN: "ssdp:discover"\r\n' in packet
+    assert "ST: urn:bambulab-com:device:3dprinter:1\r\n" in packet
+
+
+def test_parse_msearch_response():
+    """A solicited reply is an HTTP 200 with the same Bambu headers as a NOTIFY."""
+    data = BAMBU_NOTIFY.replace(b"NOTIFY * HTTP/1.1\r\n", b"HTTP/1.1 200 OK\r\n")
+    p = parse_ssdp_notify(data, "192.168.8.223")
+    assert p is not None
+    assert p.serial == "01P00A3A3000666"
+    assert p.ip == "192.168.86.40"
 
 
 def test_ignores_non_bambu_ssdp():

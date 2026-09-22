@@ -242,9 +242,11 @@ class Fleet:
 
         A same-IP outage is left to paho while the drop is brief. If the session is
         wedged (`needs_session_rebuild`: quiet on a socket that still looks up, or
-        down past the staleness window), rebuild at the current IP too. paho does not
-        reconnect a socket it still considers healthy, and a retry that never lands
-        used to leave the printer OFFLINE until someone restarted Link.
+        down past the staleness window), rebuild at the current IP too — even when
+        this scan heard no SSDP answer. Discovery only listens for a few seconds, and
+        a quiet printer often does not broadcast in that window. paho does not
+        reconnect a socket it still considers healthy, and waiting for SSDP left the
+        farm OFFLINE after the v0.1.23 restart.
 
         Scans only when at least one printer is offline AND `rediscover_interval` has
         elapsed since the last scan — a healthy farm pays nothing, and a whole farm that
@@ -265,12 +267,22 @@ class Fleet:
         except Exception as e:
             logger.warning("re-discovery scan failed (%s); will retry next interval",
                            type(e).__name__)
-            return
+            found = {}
         for p in offline:
             d = found.get(p.bambu_id)
-            if d is None or not d.ip:
-                continue                      # not on the LAN right now — keep scanning
             wedged = bool(getattr(p, "needs_session_rebuild", False))
+            if d is None or not d.ip:
+                # No announcement this scan. A brief drop is still paho's. A wedged
+                # session is rebuilt at the address we already have; waiting for
+                # SSDP never brought these printers back.
+                if wedged and p.current_ip:
+                    logger.info(
+                        "printer %s session is wedged and SSDP did not answer; "
+                        "rebuilding at %s",
+                        p.bambu_id, p.current_ip,
+                    )
+                    self._schedule_reconnect(p, p.current_ip)
+                continue
             if d.ip == p.current_ip and not wedged:
                 continue                      # same address; paho is already retrying it
             if d.ip == p.current_ip:
@@ -304,7 +316,7 @@ class Fleet:
                 access_code=cfg.access_code,
                 name=cfg.name,
             )
-        logger.info("printer %s answered at %s (was %s); reconnecting asynchronously",
+        logger.info("printer %s reconnecting at %s (was %s)",
                     bambu_id, new_ip, printer.current_ip)
         worker = threading.Thread(
             target=self._run_reconnect,
