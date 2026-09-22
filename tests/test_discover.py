@@ -1,4 +1,10 @@
-from bridge.discover import DiscoveredPrinter, discover, msearch_packet, parse_ssdp_notify
+from bridge.discover import (
+    DiscoveredPrinter,
+    discover,
+    expand_probe_ips,
+    msearch_packet,
+    parse_ssdp_notify,
+)
 
 # A real Bambu P1S SSDP NOTIFY captured on the LAN (2026-07-13).
 BAMBU_NOTIFY = (
@@ -71,3 +77,22 @@ def test_discover_returns_empty_when_no_sockets(monkeypatch):
     import bridge.discover as d
     monkeypatch.setattr(d, "_open_socket", lambda port, iface_ip: None)
     assert discover(timeout=0.1) == []
+
+
+def test_expand_probe_ips_covers_the_reserved_address_on_a_known_lan():
+    # P1S-8 is already on 192.168.8.126. P1S-5 moved there (reserved .246) while
+    # Link still dials 192.168.86.28. Multicast SSDP is silent, so the sweep has
+    # to ask the rest of the known private /24.
+    probes = expand_probe_ips(["192.168.86.28", "192.168.8.126"])
+    assert "192.168.8.126" in probes
+    assert "192.168.8.246" in probes
+    assert "192.168.8.188" in probes
+    assert "192.168.86.28" in probes
+    assert "8.8.8.8" not in expand_probe_ips(["8.8.8.8", "192.168.8.126"])
+
+
+def test_expand_probe_ips_skips_network_and_broadcast():
+    probes = expand_probe_ips(["192.168.8.126"])
+    assert "192.168.8.0" not in probes
+    assert "192.168.8.255" not in probes
+    assert probes.count("192.168.8.126") == 1

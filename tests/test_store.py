@@ -72,6 +72,24 @@ def test_cloud_token_get_set_and_persist(tmp_path):
     assert PrinterStore(path).get_cloud_token() == "CLOUD-1"   # survives a restart
 
 
+def test_update_ip_keeps_the_code_and_persists(tmp_path):
+    path = str(tmp_path / "printers.json")
+    s = PrinterStore(path)
+    s.upsert("S1", "CODE1", "192.168.86.28")
+    s.update_ip("S1", "192.168.8.246")
+    assert s.configs()[0].ip == "192.168.8.246"
+    assert s.configs()[0].access_code == "CODE1"
+    reloaded = PrinterStore(path)
+    assert reloaded.configs()[0].ip == "192.168.8.246"
+    assert reloaded.configs()[0].access_code == "CODE1"
+
+
+def test_update_ip_unknown_serial_is_a_noop(tmp_path):
+    s = PrinterStore(str(tmp_path / "printers.json"))
+    s.update_ip("GHOST", "192.168.8.246")
+    assert s.configs() == []
+
+
 def test_cloud_token_and_printers_coexist(tmp_path):
     path = str(tmp_path / "printers.json")
     s = PrinterStore(path)

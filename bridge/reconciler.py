@@ -8,13 +8,15 @@ every printer the cloud is delivering a NOT-yet-delivered access code for, it:
      (so a printer added in the web wizard appears without a bridge restart, U2), then
   3. ACKs the delivery so the cloud deletes its copy of the code (courier hand-off done).
 
-Only a printer WITH an access code in the payload is acted on — once a code is delivered
-and ACKed the cloud stops sending it, so subsequent pulls list the printer without a
-code and it is skipped (already stored). The store, not this pull, is what re-connects
-stored printers after a restart (app.py builds the fleet from it at startup).
+A printer WITH an access code is stored, added, and ACKed. Once the code is
+delivered, later pulls still carry `local_ip` with no code — apply that pin
+when it changes (reserved DHCP) so Link does not keep dialing a dead address
+until someone restarts. The store, not this pull, is what re-connects stored
+printers after a restart (app.py builds the fleet from it at startup).
 """
 import logging
 import time
+from typing import Optional
 
 from .config import PrinterConfig
 
@@ -72,9 +74,14 @@ class ConfigReconciler:
         for p in printers:
             bambu_id = p.get("bambu_id")
             access_code = p.get("access_code")   # present only while the code is undelivered
-            if not bambu_id or not access_code:
+            if not bambu_id:
                 continue
             local_ip = p.get("local_ip")
+            if not access_code:
+                # Already delivered: 3DPF still sends the pinned local_ip. Apply a
+                # reserved-IP edit without waiting for a new access code or a restart.
+                self._refresh_stored_ip(bambu_id, local_ip)
+                continue
             # 1. Durably store the code first — the store is its permanent home, so we
             #    must have written it before ACKing the cloud to delete its copy.
             self._store.upsert(bambu_id, access_code, local_ip)
@@ -97,3 +104,26 @@ class ConfigReconciler:
                 acks.append({"printer_id": printer_id, "config_version": config_version})
         if acks or removed:
             self._dpf.ack_printers_config(acks, removed=removed)
+
+    def _refresh_stored_ip(self, bambu_id: str, local_ip: Optional[str]) -> None:
+        """Rebuild a stored printer when 3DPF pins a new LAN address."""
+        if not local_ip or not self._store.has(bambu_id):
+            return
+        current = None
+        for cfg in self._store.configs():
+            if cfg.bambu_id == bambu_id:
+                current = cfg
+                break
+        if current is None or current.ip == local_ip:
+            return
+        self._store.update_ip(bambu_id, local_ip)
+        if self._fleet.by_id(bambu_id) is not None:
+            self._fleet.remove_printer(bambu_id)
+        self._fleet.add_printer(PrinterConfig(
+            bambu_id=current.bambu_id,
+            ip=local_ip,
+            access_code=current.access_code,
+            name=current.name,
+        ))
+        logger.info("printer %s moved to reserved/current IP %s (was %s)",
+                    bambu_id, local_ip, current.ip)

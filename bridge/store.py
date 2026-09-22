@@ -87,6 +87,17 @@ class PrinterStore:
     def has(self, bambu_id: str) -> bool:
         return bambu_id in self._printers
 
+    def update_ip(self, bambu_id: str, local_ip: str) -> None:
+        """Move a stored printer to a newly learned LAN address. Keeps the code."""
+        if not local_ip or bambu_id not in self._printers:
+            return
+        entry = self._printers[bambu_id]
+        if entry.get("local_ip") == local_ip:
+            return
+        entry["local_ip"] = local_ip
+        self._printers[bambu_id] = entry
+        self._save()
+
     def get_cloud_token(self) -> Optional[str]:
         """The durable cloud credential from pairing (U6), or None if not yet paired."""
         return self._cloud_token

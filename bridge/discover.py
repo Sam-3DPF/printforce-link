@@ -11,13 +11,14 @@ OrcaSlicer / SimplyPrint find printers, so onboarding a printer in 3DPF becomes
 Run it standalone:  python -m bridge.discover
 """
 
+import ipaddress
 import re
 import select
 import socket
 import struct
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, Iterable, List, Optional
 
 SSDP_PORTS = (1990, 2021)
 SSDP_MCAST = "239.255.255.250"
@@ -80,6 +81,44 @@ def parse_ssdp_notify(data: bytes, src_ip: str = "") -> Optional[DiscoveredPrint
     )
 
 
+def expand_probe_ips(known_ips: Iterable[str], *, max_subnets: int = 3) -> List[str]:
+    """Unicast M-SEARCH targets: each known private address plus the rest of its /24.
+
+    Multicast/broadcast SSDP is silent on this farm (the discovery table stays
+    empty, including for printers that are already pushing). A reserved address
+    on the same LAN as a stored 192.168.8.x printer is then invisible unless we
+    ask that subnet directly. Public or malformed addresses are ignored so a
+    bad pin cannot scan the internet.
+    """
+    ordered: List[str] = []
+    seen = set()
+    prefixes: List[str] = []
+
+    def _add(ip: str) -> None:
+        if ip not in seen:
+            seen.add(ip)
+            ordered.append(ip)
+
+    for raw in known_ips:
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            addr = ipaddress.ip_address(raw.strip())
+        except ValueError:
+            continue
+        if addr.version != 4 or not addr.is_private:
+            continue
+        _add(str(addr))
+        network = ipaddress.ip_network(f"{addr}/24", strict=False)
+        prefix = str(network.network_address).rsplit(".", 1)[0]
+        if prefix in prefixes or len(prefixes) >= max_subnets:
+            continue
+        prefixes.append(prefix)
+        for host in network.hosts():
+            _add(str(host))
+    return ordered
+
+
 def msearch_packet(port: int) -> bytes:
     """Ask Bambu printers to answer now, instead of waiting for a NOTIFY.
 
@@ -97,8 +136,9 @@ def msearch_packet(port: int) -> bytes:
     ).encode("ascii")
 
 
-def _solicit(sock: socket.socket) -> None:
-    """Best-effort. A network that drops multicast can still answer a broadcast."""
+def _solicit(sock: socket.socket, probe_ips: Optional[Iterable[str]] = None) -> None:
+    """Best-effort. A network that drops multicast can still answer a broadcast
+    or a unicast M-SEARCH to an address we already know (or the rest of its /24)."""
     try:
         port = sock.getsockname()[1]
     except OSError:
@@ -108,7 +148,10 @@ def _solicit(sock: socket.socket) -> None:
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
     except OSError:
         pass
-    for dest in ((SSDP_MCAST, port), (SSDP_BROADCAST, port)):
+    destinations = [(SSDP_MCAST, port), (SSDP_BROADCAST, port)]
+    for ip in probe_ips or []:
+        destinations.append((ip, port))
+    for dest in destinations:
         try:
             sock.sendto(packet, dest)
         except OSError:
@@ -135,18 +178,22 @@ def _open_socket(port: int, iface_ip: str) -> Optional[socket.socket]:
         return None
 
 
-def discover(timeout: float = 8.0, iface_ip: str = "") -> List[DiscoveredPrinter]:
+def discover(timeout: float = 8.0, iface_ip: str = "",
+             probe_ips: Optional[Iterable[str]] = None) -> List[DiscoveredPrinter]:
     """Ask the LAN for Bambu printers, then listen for `timeout` seconds.
 
     Sends an M-SEARCH on each SSDP port (multicast and broadcast) before the
     listen, so a printer does not have to announce on its own during the window.
-    Results are deduplicated by serial.
+    When `probe_ips` is set, also unicasts to those addresses and the rest of
+    each private /24 — a reserved DHCP address on the same LAN is found even
+    when multicast is dropped. Results are deduplicated by serial.
     """
     socks = [s for s in (_open_socket(p, iface_ip) for p in SSDP_PORTS) if s is not None]
     if not socks:
         return []
+    targets = expand_probe_ips(probe_ips or [])
     for sock in socks:
-        _solicit(sock)
+        _solicit(sock, targets)
 
     found: Dict[str, DiscoveredPrinter] = {}
     end = time.monotonic() + timeout

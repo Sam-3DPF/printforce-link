@@ -74,17 +74,20 @@ def _cfg(serial, ip, name=""):
 
 
 def _fleet(configs, discovered=None, clock=None, rediscover_interval=60.0,
-           printer_factory=None):
-    calls = {"count": 0}
+           printer_factory=None, on_address=None, connect_timeout_seconds=12.0):
+    calls = {"count": 0, "probe_ips": []}
 
-    def discover_fn(timeout):
+    def discover_fn(timeout, probe_ips=None):
         calls["count"] += 1
+        calls["probe_ips"] = list(probe_ips or [])
         return list(discovered() if callable(discovered) else (discovered or []))
 
     clock = clock or Clock()
     fleet = Fleet(configs, printer_factory=printer_factory or FakePrinter,
                   discover_fn=discover_fn,
-                  rediscover_interval_seconds=rediscover_interval, monotonic=clock)
+                  rediscover_interval_seconds=rediscover_interval, monotonic=clock,
+                  on_address=on_address,
+                  connect_timeout_seconds=connect_timeout_seconds)
     return fleet, calls, clock
 
 
@@ -126,18 +129,26 @@ def test_reconnects_printer_that_moved_ip():
     assert old.disconnect_calls == 1
 
 
-def test_same_ip_offline_is_not_reconnected():
-    # Offline but still at the same address, and the session is not wedged: paho keeps
-    # retrying, so rebuilding the client would throw away its in-progress reconnection.
+def test_same_ip_offline_is_reconnected_once_ssdp_sees_it():
+    # P1P-2 / P1S-9 already sit on their reserved 192.168.8.x address and are
+    # still OFFLINE. Waiting for needs_session_rebuild left them there: the
+    # 60s scan is already the paho grace, and a printer that answers SSDP
+    # while reporting OFFLINE is not in the middle of a one-second retry.
+    factory = FakePrinterFactory()
     fleet, calls, _ = _fleet(
-        [_cfg("S1", "192.168.1.10")],
-        discovered=[DiscoveredPrinter(ip="192.168.1.10", serial="S1")],
+        [_cfg("S1", "192.168.8.236")],
+        discovered=[DiscoveredPrinter(ip="192.168.8.236", serial="S1")],
+        printer_factory=factory,
     )
-    p = fleet.by_id("S1")
-    p.is_offline = True
+    old = fleet.by_id("S1")
+    old.is_offline = True
     fleet.reconcile_connections()
+
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
     assert calls["count"] == 1
-    assert p.reconnects == []
+    assert fleet.by_id("S1").current_ip == "192.168.8.236"
+    assert fleet.by_id("S1").connect_calls == 1
+    assert old.disconnect_calls == 1
 
 
 def test_same_ip_wedged_session_is_reconnected():
@@ -199,7 +210,7 @@ def test_wedged_printer_rebuilds_when_ssdp_misses_it():
 def test_wedged_printer_rebuilds_when_the_scan_fails():
     factory = FakePrinterFactory()
 
-    def boom(_timeout):
+    def boom(_timeout, probe_ips=None):
         raise OSError("ssdp socket unavailable")
 
     fleet = Fleet(
@@ -216,6 +227,78 @@ def test_wedged_printer_rebuilds_when_the_scan_fails():
     assert _wait_for(lambda: fleet.by_id("S1") is not old)
     assert fleet.by_id("S1").current_ip == "192.168.8.223"
     assert fleet.by_id("S1").connect_calls == 1
+
+
+def test_stale_ip_reconnects_when_reserved_address_is_on_a_known_lan():
+    # P1S-5 is stored at 192.168.86.28. P1S-8 (or P1P-2) is already on
+    # 192.168.8.x. Multicast SSDP is empty — the live farm's
+    # bridge_discovered_printers table stayed empty on v0.1.24. Asking
+    # discovery for the addresses we already have must be enough for the
+    # fake LAN to return the reserved 192.168.8.246.
+    factory = FakePrinterFactory()
+    seen = {}
+
+    def discover_fn(timeout, probe_ips=None):
+        seen["probe_ips"] = list(probe_ips or [])
+        if probe_ips and "192.168.8.126" in probe_ips:
+            return [DiscoveredPrinter(ip="192.168.8.246", serial="S5", name="P1S-5")]
+        return []
+
+    fleet = Fleet(
+        [_cfg("S5", "192.168.86.28"), _cfg("S8", "192.168.8.126")],
+        printer_factory=factory,
+        discover_fn=discover_fn,
+        monotonic=Clock(),
+    )
+    old = fleet.by_id("S5")
+    old.is_offline = True
+    fleet.reconcile_connections()
+
+    assert "192.168.8.126" in seen.get("probe_ips", [])
+    assert _wait_for(lambda: fleet.by_id("S5") is not old)
+    assert fleet.by_id("S5").current_ip == "192.168.8.246"
+
+
+def test_reconnect_to_a_new_ip_remembers_the_address():
+    remembered = []
+    factory = FakePrinterFactory()
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.86.28")],
+        discovered=[DiscoveredPrinter(ip="192.168.8.246", serial="S1")],
+        printer_factory=factory,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    fleet.reconcile_connections()
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+    assert remembered == [("S1", "192.168.8.246")]
+
+
+def test_hung_reconnect_releases_the_slot():
+    # A connect that never returns used to keep the per-serial worker slot,
+    # so P1P-2 / P1S-9 at a correct reserved IP were never tried again.
+    started = threading.Event()
+
+    def hang(_printer):
+        started.set()
+        time.sleep(30)
+
+    factory = FakePrinterFactory(connect_hook=hang)
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.8.223")],
+        discovered=[],
+        printer_factory=factory,
+        connect_timeout_seconds=0.05,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.needs_session_rebuild = True
+    fleet.reconcile_connections()
+    assert started.wait(1.0)
+    assert _wait_for(lambda: fleet._reconnects_in_flight == {} and
+                     fleet._reconnect_worker_counts == {}, timeout=1.0)
+    assert fleet.by_id("S1") is old
 
 
 def test_scan_is_throttled():

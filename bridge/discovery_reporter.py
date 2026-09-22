@@ -42,8 +42,8 @@ _DEFAULT_BURST_SECONDS = 45.0
 _DEFAULT_DISCOVER_TIMEOUT_SECONDS = 8.0
 
 
-def _default_discover(timeout: float):
-    return discover(timeout=timeout)
+def _default_discover(timeout: float, probe_ips=None):
+    return discover(timeout=timeout, probe_ips=probe_ips)
 
 
 class DiscoveryReporter:
@@ -72,11 +72,13 @@ class DiscoveryReporter:
     def _in_burst(self, now: float) -> bool:
         return self._burst_until is not None and now < self._burst_until
 
-    def tick(self, scan_requested: bool = False) -> None:
+    def tick(self, scan_requested: bool = False, probe_ips=None) -> None:
         """Throttled LAN scan + report. Never raises.
 
         `scan_requested=True` opens a bounded on-demand burst (or extends one already
         open) — see the module docstring for the two scanning windows this respects.
+        `probe_ips` are addresses the fleet already knows; discover unicasts those
+        and the rest of each private /24 when multicast is silent.
         """
         now = self._monotonic()
         if self._start is None:
@@ -93,7 +95,10 @@ class DiscoveryReporter:
 
         self._last = now
         try:
-            found = self._discover(self._timeout)
+            try:
+                found = self._discover(self._timeout, probe_ips)
+            except TypeError:
+                found = self._discover(self._timeout)
             self._dpf.report_discovered([
                 {"bambu_id": d.serial, "ip": d.ip, "model": d.model, "name": d.name}
                 for d in found
