@@ -992,6 +992,7 @@ class BambuPrinter:
               "historical_failed_ready": bool,                      # separate from status
               "print_duration_seconds": int | None,                # observed, not estimated
               "print_duration_source": "bridge" | "printer" | None,
+              "local_ip": str | None,                               # address currently dialed
             }
 
         The telemetry is **flat on the report, not nested** — that is what
@@ -1283,6 +1284,7 @@ class BambuPrinter:
             "user_cancelled": self._user_cancelled,
             "print_duration_seconds": self._stopwatch.duration_seconds,
             "print_duration_source": self._stopwatch.source,
+            "local_ip": self._ip or None,
         }
 
     def _offline_snapshot(self) -> Dict:
@@ -1300,6 +1302,7 @@ class BambuPrinter:
             "user_cancelled": False,
             "print_duration_seconds": None,
             "print_duration_source": None,
+            "local_ip": self._ip or None,
         }
 
     def _raw_status(self) -> dict:

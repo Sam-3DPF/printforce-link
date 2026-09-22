@@ -228,6 +228,19 @@ def test_cloud_send_skips_dispatch_when_printer_not_idle(tmp_path):
     assert dpf.dispatched == []
 
 
+def test_cloud_send_skips_upload_when_printer_is_offline(tmp_path):
+    fleet = _LegacySnapshotFleet(_legacy_ready_snapshot(status="OFFLINE"))
+    dpf = _FakeDpf()
+    started = set()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started)
+    assert fleet.uploads == []
+    assert fleet.starts == []
+    assert fleet.calls == []
+    assert started == set()
+    assert dpf.dispatched == []
+    assert dpf.downloads == []
+
+
 def test_restart_with_started_marker_only_re_reports(tmp_path):
     fleet = _ConfirmFleet(status_after_start="PRINTING")
     dpf = _FakeDpf()

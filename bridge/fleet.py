@@ -177,6 +177,7 @@ class Fleet:
                 "print_error",
                 "gcode_state", "hms_present", "hms_empty",
                 "has_active_file", "has_active_task", "has_active_project",
+                "local_ip",
                 "stage_queue_empty", "print_type", "historical_failed_ready",
 
                 "print_duration_seconds": int | None,

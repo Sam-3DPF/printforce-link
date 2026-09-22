@@ -231,6 +231,7 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "user_cancelled": False,
         "print_duration_seconds": None,
         "print_duration_source": None,
+        "local_ip": "10.0.0.5",
     }
 
 

@@ -157,6 +157,28 @@ def test_ip_only_refresh_moves_a_stored_printer():
     assert dpf.acked == []
 
 
+def test_unchanged_cloud_pin_does_not_clobber_a_learned_ip():
+    store = FakeStore()
+    store.upsert("S1", "CODE", "192.168.86.20")
+    fleet = FakeFleet(serials=["S1"])
+    r, dpf, fleet, store = _reconciler(
+        [{"printer_id": "p1", "bambu_id": "S1", "local_ip": "192.168.86.20"}],
+        fleet=fleet,
+        store=store,
+    )
+    r.tick()
+    store.update_ip("S1", "192.168.8.188")
+    store.ip_updates.clear()
+    fleet.removed.clear()
+    fleet.added.clear()
+    r._last = None
+    r.tick()
+    assert store.ip_updates == []
+    assert fleet.removed == []
+    assert fleet.added == []
+    assert store.entries["S1"]["local_ip"] == "192.168.8.188"
+
+
 def test_ip_only_same_address_is_noop():
     store = FakeStore()
     store.upsert("S1", "CODE", "192.168.8.236")
