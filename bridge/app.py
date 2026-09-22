@@ -597,6 +597,13 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             continue
         if str(row.get("desired_status") or "IDLE") != "IDLE":
             continue
+        snapshot = _live_snapshot(fleet, str(bambu_id))
+        if isinstance(snapshot, dict) and snapshot.get("status") == "OFFLINE":
+            logger.warning(
+                "cloud send %s: printer %s is offline; not uploading",
+                batch_id, bambu_id,
+            )
+            continue
         ams_mapping = _resolve_cloud_ams_mapping(send, fleet, bambu_id)
         if ams_mapping is None:
             logger.warning(

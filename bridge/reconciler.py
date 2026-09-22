@@ -10,9 +10,10 @@ every printer the cloud is delivering a NOT-yet-delivered access code for, it:
 
 A printer WITH an access code is stored, added, and ACKed. Once the code is
 delivered, later pulls still carry `local_ip` with no code — apply that pin
-when it changes (reserved DHCP) so Link does not keep dialing a dead address
-until someone restarts. The store, not this pull, is what re-connects stored
-printers after a restart (app.py builds the fleet from it at startup).
+when it *changes* (an operator reserved-IP edit). An unchanged stale pin
+must not overwrite an address SSDP or a live session just learned. The
+store, not this pull, is what re-connects stored printers after a restart
+(app.py builds the fleet from it at startup).
 """
 import logging
 import time
@@ -35,6 +36,9 @@ class ConfigReconciler:
         self._interval = interval_seconds
         self._monotonic = monotonic
         self._last = None                       # None -> pull on the first tick
+        # Last couriered pin per serial. An unchanged stale 86.x pin must not
+        # yank a locally learned 8.x address back every 60s.
+        self._cloud_pins = {}
 
     def tick(self) -> None:
         """One reconcile pass, throttled to `interval_seconds`. Never raises — a courier
@@ -114,6 +118,10 @@ class ConfigReconciler:
             if cfg.bambu_id == bambu_id:
                 current = cfg
                 break
+        last_pin = self._cloud_pins.get(bambu_id)
+        self._cloud_pins[bambu_id] = local_ip
+        if last_pin == local_ip:
+            return
         if current is None or current.ip == local_ip:
             return
         self._store.update_ip(bambu_id, local_ip)
