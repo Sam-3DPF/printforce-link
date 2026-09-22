@@ -389,7 +389,7 @@ def test_parse_tray_exist_bits():
 
 
 def test_parse_tray_exist_bits_accepts_an_integer_bitmask():
-    """bambulabs_api can leave this as int 15. clean_str dropped that, so every
+    """Firmware can leave this as int 15. clean_str dropped that, so every
     shop printer on Main stored tray_exist_bits null and keep-hex never fired."""
     status = {"print": {"ams": {"tray_exist_bits": 15, "ams": []}}}
     assert parse_tray_exist_bits(status) == "f"

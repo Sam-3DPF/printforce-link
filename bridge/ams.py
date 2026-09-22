@@ -411,7 +411,7 @@ def save_remembered_ams(path: Optional[str], bambu_id: str, ams) -> None:
 def parse_tray_exist_bits(status: dict) -> Optional[str]:
     """The AMS's `tray_exist_bits` bitmask as a hex string (bit N == tray N is present).
 
-    Firmware and bambulabs_api may leave this as an int (15) or a hex string ("f").
+    Firmware may leave this as an int (15) or a hex string ("f").
     `clean_str` drops non-strings, which stored null bits on every shop printer and
     disabled keep-hex. Normalize both shapes here.
     """

@@ -22,8 +22,8 @@ _DEFAULT_DISCOVER_TIMEOUT_SECONDS = 5.0
 # A removed/re-added serial may need one current worker while one stale generation unwinds.
 # Bound those stale lifetimes so repeated config churn cannot grow threads without limit.
 _MAX_RECONNECT_WORKERS_PER_SERIAL = 2
-# bambulabs_api connect() / pushall can block on a half-open MQTT socket. Two hung
-# workers used to pin a serial so a reserved IP was never tried again.
+# A stalled connect must not pin a serial: two hung workers used to block a
+# reserved IP from ever being tried again.
 _DEFAULT_CONNECT_TIMEOUT_SECONDS = 12.0
 
 

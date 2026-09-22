@@ -147,43 +147,39 @@ def test_false_control_result_is_retried_without_applied_state(tmp_path):
     assert not (tmp_path / "control-c1.applied").exists()
 
 
-def test_request_full_status_uses_mqtt_client_pushall():
+def test_request_full_status_publishes_pushall():
     cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
     printer = BambuPrinter(cfg)
 
-    class _Mqtt:
+    class _Session:
         def __init__(self):
-            self.calls = []
+            self.published = []
 
-        def pushall(self):
-            self.calls.append("pushall")
+        def publish(self, payload):
+            self.published.append(payload)
             return True
 
-    class _Client:
-        def __init__(self):
-            self.mqtt_client = _Mqtt()
-
-    printer._client = _Client()
+    printer._session = _Session()
     printer._sleep = lambda _seconds: None
     assert printer.request_full_status() is True
-    assert printer._client.mqtt_client.calls == ["pushall"]
+    assert printer._session.published[0]["pushing"]["command"] == "pushall"
 
 
 def test_start_print_uses_p1_sdcard_url():
     cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
     printer = BambuPrinter(cfg)
 
-    class _Client:
+    class _Session:
         def __init__(self):
             self.payloads = []
 
-        def publish_command(self, payload):
+        def publish(self, payload):
             self.payloads.append(payload)
             return True
 
-    printer._client = _Client()
+    printer._session = _Session()
     assert printer.start_print("batch-a.3mf", [0], 1) is True
-    payload = printer._client.payloads[0]["print"]
+    payload = printer._session.payloads[0]["print"]
     assert payload["command"] == "project_file"
     assert payload["url"] == "file:///sdcard/batch-a.3mf"
 
@@ -192,21 +188,20 @@ def test_resume_from_stage_on_real_printer_wrapper():
     cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
     printer = BambuPrinter(cfg)
 
-    class _Client:
+    class _Session:
         def __init__(self):
-            self.calls = []
+            self.published = []
 
-        def retry_filament_action(self):
-            self.calls.append("retry_filament_action")
+        def publish(self, payload):
+            self.published.append(payload)
             return True
 
-        def resume_print(self):
-            self.calls.append("resume_print")
-            return True
-
-    printer._client = _Client()
+    printer._session = _Session()
     printer.resume_from_stage(6)
-    assert printer._client.calls == ["retry_filament_action", "resume_print"]
-    printer._client.calls.clear()
+    assert [item["print"]["command"] for item in printer._session.published] == [
+        "ams_control", "resume",
+    ]
+    assert printer._session.published[0]["print"]["param"] == "resume"
+    printer._session.published.clear()
     printer.resume_from_stage(16)
-    assert printer._client.calls == ["resume_print"]
+    assert [item["print"]["command"] for item in printer._session.published] == ["resume"]

@@ -39,7 +39,8 @@ jobs:
           pyinstaller --onedir --noconfirm --name printforce-link
           --paths .
           --collect-submodules bridge
-          --collect-submodules bambulabs_api
+          --collect-submodules paho
+          --hidden-import paho.mqtt.client
           --collect-data certifi
           packaging/entry.py
       - name: Smoke version (macOS)
