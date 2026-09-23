@@ -19,3 +19,6 @@ __pycache__/
 .venv/
 venv/
 .pytest_cache/
+
+# Compound Engineering local scratch (review runs, prototypes, ideation checkpoints).
+.context/compound-engineering/
