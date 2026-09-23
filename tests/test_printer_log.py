@@ -380,6 +380,7 @@ def test_printer_log_survives_rebuild_and_reconnect_and_records_commands():
     ]
     assert any(event["kind"] == "reset" for event in exported["events"])
     assert exported["serial"] == _SERIAL
+    assert isinstance(exported["findings"], list)
     assert "secret-code" not in json.dumps(exported)
 
 
@@ -436,6 +437,77 @@ def test_concurrent_records_stay_inside_the_rings():
     exported = log.export()
     assert len(exported["messages"]) == 100
     assert len(exported["events"]) == 200
+
+
+def _log(**kwargs):
+    from bridge.bambu.log import PrinterLog
+
+    defaults = {"monotonic": lambda: 5.0, "wall_clock": lambda: 1_700_000_000}
+    defaults.update(kwargs)
+    return PrinterLog("S1", **defaults)
+
+
+def test_three_stale_events_are_one_finding_and_one_is_not():
+    log = _log()
+    log.record_event("stale")
+    assert log.export()["findings"] == []
+
+    log.record_event("reset", reason="silent_session")
+    log.record_event("stale")
+    findings = log.export()["findings"]
+    assert len(findings) == 1
+    assert findings[0]["id"] == "stale_or_reset"
+    assert findings[0]["count"] == 3
+    assert findings[0]["text"].startswith("The session went stale or reset repeatedly.")
+    assert "silent_session" in findings[0]["text"]
+
+    only_stale = _log()
+    for _ in range(3):
+        only_stale.record_event("stale")
+    assert only_stale.export()["findings"] == [
+        {
+            "id": "stale_or_reset",
+            "count": 3,
+            "text": "The session went stale or reset repeatedly.",
+        }
+    ]
+
+
+def test_auth_retry_and_probe_miss_use_their_own_finding_ids():
+    log = _log()
+    for i in range(3):
+        log.record_event("auth_retry")
+        log.record_event("probe_miss", count=i + 1)
+    findings = log.export()["findings"]
+    assert [item["id"] for item in findings] == ["auth_retry", "probe_miss"]
+    assert [item["count"] for item in findings] == [3, 3]
+    assert findings[0]["text"] == "The session retried after the printer rejected the connection."
+    assert findings[1]["text"] == "Command probes went unanswered."
+
+
+def test_an_unrelated_event_kind_produces_no_finding():
+    log = _log()
+    for _ in range(4):
+        log.record_event("connect", host="10.0.0.5")
+        log.record_event("command", name="pause")
+        log.record_event("probe_sent", sequence_id="1")
+    assert log.export()["findings"] == []
+
+
+def test_finding_text_does_not_restore_a_stripped_access_code():
+    code = "abcd1234"
+    log = _log(secrets=(code,))
+    for _ in range(3):
+        log.record_event("stale", detail=f"retry {code} now")
+    exported = log.export()
+    assert code not in json.dumps(exported["events"])
+    assert exported["events"][0]["detail"] == "retry [redacted] now"
+    text = " ".join(item["text"] for item in exported["findings"])
+    assert code not in text
+    assert "[redacted]" in text
+    assert "camera" not in text
+    assert "captcha" not in text.lower()
+    assert "database" not in text.lower()
 
 
 def test_printer_log_path_sanitizes_the_serial(tmp_path):

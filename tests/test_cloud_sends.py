@@ -1219,3 +1219,21 @@ def test_idle_retry_does_not_stop_leftover_finished_before_the_second_start(tmp_
     assert fleet.stops == []
     assert len(fleet.starts) == 2
     assert fleet.commands == ["start_print", "start_print"]
+
+
+def test_cloud_map_accepts_external_and_unused_minus_one_and_rejects_a_required_one():
+    from bridge.app import _mapping_from_live_slots, _validate_sparse_ams_mapping
+
+    one = [(1, "#D3B7A7", "PLA")]
+    assert _validate_sparse_ams_mapping([254], one) == [254]
+    assert _validate_sparse_ams_mapping([255], one) == [255]
+    assert _validate_sparse_ams_mapping([-1], one) is None
+    two = [(2, "#D3B7A7", "PLA")]
+    assert _validate_sparse_ams_mapping([-1, 0], two) == [-1, 0]
+    assert _validate_sparse_ams_mapping([0, -1], two) is None
+    assert _mapping_from_live_slots(one, {"slots": [{
+        "slot_number": 17, "color_hex": "#D3B7A7", "filament_type": "PLA",
+    }]}) == [128]
+    assert _mapping_from_live_slots(one, {"slots": [{
+        "slot_number": 25, "color_hex": "#D3B7A7", "filament_type": "PLA",
+    }]}) == [24]

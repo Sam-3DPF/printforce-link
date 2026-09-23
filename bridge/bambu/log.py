@@ -5,6 +5,10 @@ The access code is a configured secret and is stripped before anything is
 stored or written; the FTPS login is not an input here. A missing log
 directory must not take down the MQTT thread or the watchdog, so file
 errors are logged and swallowed.
+
+``export`` counts repeated session trouble onto ``findings``. The catalog
+is stale or reset, auth retry, and probe miss. Camera, captcha, and
+database signatures are not counted.
 """
 
 import copy
@@ -22,6 +26,28 @@ logger = logging.getLogger(__name__)
 _REDACTED = "[redacted]"
 _MIN_SECRET_LENGTH = 4
 _EVENT_TEXT_LIMIT = 256
+_FINDING_MIN_COUNT = 2
+_FINDING_SKIP_KEYS = frozenset({"t", "at", "kind"})
+
+# One stable id per kind of repeated session trouble. Stale and reset share
+# an id because either one is the session dropping and coming back.
+_SESSION_FINDINGS = (
+    (
+        "stale_or_reset",
+        frozenset({"stale", "reset"}),
+        "The session went stale or reset repeatedly.",
+    ),
+    (
+        "auth_retry",
+        frozenset({"auth_retry"}),
+        "The session retried after the printer rejected the connection.",
+    ),
+    (
+        "probe_miss",
+        frozenset({"probe_miss"}),
+        "Command probes went unanswered.",
+    ),
+)
 
 
 def _active_secrets(secrets) -> tuple:
@@ -106,7 +132,11 @@ class PrinterLog:
             )
 
     def export(self) -> dict:
-        """Deep copy of both rings, oldest first. Safe for the caller to keep."""
+        """Deep copy of both rings, oldest first, plus counted findings.
+
+        Findings are computed from the copied events, which are already
+        redacted. Safe for the caller to keep.
+        """
         with self._lock:
             messages = copy.deepcopy(list(self._messages))
             events = copy.deepcopy(list(self._events))
@@ -118,6 +148,7 @@ class PrinterLog:
             "capacity": capacity,
             "messages": messages,
             "events": events,
+            "findings": _session_findings(events),
         }
 
     def _append(self, record_type, ring, record) -> None:
@@ -189,6 +220,47 @@ class PrinterLog:
             os.replace(path, f"{path}.1")
         except OSError:
             pass
+
+
+def _session_findings(events) -> list:
+    """Count repeated session trouble on an already-exported event list.
+
+    A kind needs ``_FINDING_MIN_COUNT`` hits still on the ring. Text is the
+    fixed sentence plus string fields from those events, which were stripped
+    before they were stored.
+    """
+    grouped = {finding_id: [] for finding_id, _kinds, _sentence in _SESSION_FINDINGS}
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+        kind = event.get("kind")
+        for finding_id, kinds, _sentence in _SESSION_FINDINGS:
+            if kind in kinds:
+                grouped[finding_id].append(event)
+    findings = []
+    for finding_id, _kinds, sentence in _SESSION_FINDINGS:
+        matched = grouped[finding_id]
+        if len(matched) < _FINDING_MIN_COUNT:
+            continue
+        findings.append({
+            "id": finding_id,
+            "count": len(matched),
+            "text": _finding_text(sentence, matched),
+        })
+    return findings
+
+
+def _finding_text(sentence, matched) -> str:
+    seen = []
+    for event in matched:
+        for key, value in event.items():
+            if key in _FINDING_SKIP_KEYS or not isinstance(value, str) or not value:
+                continue
+            if value not in seen:
+                seen.append(value)
+    if not seen:
+        return sentence
+    return sentence + " " + " ".join(seen)
 
 
 def _json_safe(value, depth=0):

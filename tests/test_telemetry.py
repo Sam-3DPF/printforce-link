@@ -250,6 +250,31 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "subtask_name": "dragon_v3",
         "nozzle_diameter": 0.4,
         "stage": None,                  # stg_cur -1 is "no stage" — an absence, not a stage
+        "stage_name": None,
+        "spd_lvl": None,
+        "cooling_fan_percent": None,
+        "big_fan1_percent": None,
+        "big_fan2_percent": None,
+        "heatbreak_fan_percent": None,
+        "door_open": None,
+        "sdcard": None,
+        "chamber_light": None,
+        "wifi_signal": None,
+        "wifi_wired": None,
+        "store_to_sdcard": None,
+        "lights_report": None,
+        "airduct": None,
+        "tray_now": None,
+        "tray_tar": None,
+        "tray_pre": None,
+        "ams_status": None,
+        "dry_time": None,
+        "dry_status": None,
+        "dry_sf_reason": None,
+        "drying_unit": None,
+        "firmware_version": None,
+        "unit_versions": None,
+        "external_spool": None,
         "tray_exist_bits": "f",
         "hms_severity": None,
         "hms_code": None,
@@ -1593,3 +1618,105 @@ def test_an_absent_printer_is_a_warning_not_a_bridge_bug(caplog):
 def test_the_pure_logic_imports_without_the_vendor_library():
     """Parsing and status stay importable with no vendor MQTT stack in `sys.modules`."""
     assert "bambulabs_api" not in sys.modules
+
+
+def test_live_report_fields_and_offline_nulls():
+    door = 1 << 23
+    payload = {"print": {
+        "gcode_state": "PAUSE",
+        "stg_cur": 6,
+        "spd_lvl": 2,
+        "cooling_fan_speed": 15,
+        "big_fan1_speed": 15,
+        "big_fan2_speed": 0,
+        "heatbreak_fan_speed": 15,
+        "stat": door,
+        "sdcard": True,
+        "wifi_signal": -90,
+        "home_flag": 1 << 11,
+        "lights_report": [{"node": "chamber_light", "mode": "on"}],
+        "device": {"airduct": {"modeId": 1}},
+        "ams": {
+            "tray_now": "1",
+            "tray_tar": "5",
+            "tray_pre": "0",
+            "ams_status": 8,
+            "ams": [{
+                "id": "128",
+                "dry_time": 4,
+                "dry_status": 1,
+                "dry_sf_reason": "0",
+                "tray": [{"id": "0", "tray_color": "FF6A13FF", "tray_type": "PLA"}],
+            }],
+            "vt_tray": {"id": "254", "tray_type": "PETG"},
+        },
+    }, "info": {"command": "get_version", "module": [
+        {"name": "ota", "sw_ver": "01.08.02.00"},
+        {"name": "ams/0", "sw_ver": "00.00.06.49"},
+    ]}}
+    snapshot = _printer([payload]).snapshot()
+    assert snapshot["spd_lvl"] == 2
+    assert snapshot["cooling_fan_percent"] == 100
+    assert snapshot["big_fan1_percent"] == 100
+    assert snapshot["heatbreak_fan_percent"] == 100
+    assert snapshot["door_open"] is True
+    assert snapshot["sdcard"] is True
+    assert snapshot["chamber_light"] is True
+    assert snapshot["wifi_signal"] == -90
+    assert snapshot["wifi_wired"] is True
+    assert snapshot["store_to_sdcard"] is True
+    assert snapshot["lights_report"][0]["node"] == "chamber_light"
+    assert snapshot["airduct"] == {"modeId": 1}
+    assert snapshot["tray_now"] == 1
+    assert snapshot["tray_tar"] == 5
+    assert snapshot["tray_pre"] == 0
+    assert snapshot["ams_status"] == 8
+    assert snapshot["dry_time"] == 4
+    assert snapshot["dry_status"] == 1
+    assert snapshot["dry_sf_reason"] == "0"
+    assert snapshot["drying_unit"] == "128"
+    assert snapshot["stage"] == 6
+    assert "runout" in snapshot["stage_name"]
+    assert snapshot["firmware_version"] == "01.08.02.00"
+    assert snapshot["unit_versions"]["ams/0"] == "00.00.06.49"
+    assert snapshot["external_spool"]["tray_type"] == "PETG"
+    assert snapshot["slots"] == [{"slot_number": 17, "color_hex": "FF6A13FF", "filament_type": "PLA"}]
+    assert all(slot.get("filament_type") != "PETG" for slot in snapshot["slots"])
+    assert "job_id" not in snapshot
+    assert "subtask_id" not in snapshot
+
+    printer = _printer([payload])
+    live = printer.snapshot()
+    assert live["firmware_version"] == "01.08.02.00"
+    printer._session.connected = False
+    offline = printer.snapshot()
+    assert offline["connection"] == "offline"
+    for key in (
+        "spd_lvl", "cooling_fan_percent", "door_open", "sdcard", "chamber_light",
+        "wifi_signal", "store_to_sdcard", "lights_report", "airduct", "tray_now",
+        "dry_time", "dry_status", "dry_sf_reason", "drying_unit", "firmware_version",
+        "unit_versions", "external_spool", "stage", "stage_name",
+    ):
+        assert offline[key] is None, key
+    assert offline["slots"] is None
+
+
+def test_stage_sentinels_stay_null_and_zero_stays_zero():
+    assert parse_telemetry({"print": {"stg_cur": -1}})["stage_name"] is None
+    assert parse_telemetry({"print": {"stg_cur": 255}})["stage"] is None
+    assert parse_telemetry({"print": {"stg_cur": 255}})["stage_name"] is None
+    assert parse_telemetry({"print": {"stg_cur": 0}})["stage"] == 0
+
+
+def test_vir_slot_is_the_external_spool_and_not_a_slot_row():
+    payload = {"print": {
+        "gcode_state": "IDLE",
+        "ams": {
+            "ams": [],
+            "vir_slot": {"id": "255", "tray_type": "ABS"},
+            "vt_tray": {"id": "254", "tray_type": "PLA"},
+        },
+    }}
+    snapshot = _printer([payload]).snapshot()
+    assert snapshot["external_spool"]["id"] == "255"
+    assert snapshot["slots"] == []

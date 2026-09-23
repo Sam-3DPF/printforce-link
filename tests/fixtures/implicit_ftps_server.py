@@ -20,7 +20,9 @@ class ImplicitFtpsServer:
     def __init__(self, certfile, keyfile, *, require_session_reuse=False,
                  dele_reply="550 No such file.", stor_final_reply="226 Transfer complete.",
                  size_override=None, plaintext=False, stall_seconds=0.0,
-                 password="access-code", hold_before_reply=None):
+                 password="access-code", hold_before_reply=None,
+                 dele_existing_reply=None, require_prot_c=False,
+                 retr_reply=None, retr_short=None):
         self._certfile = certfile
         self._keyfile = keyfile
         self.require_session_reuse = require_session_reuse
@@ -31,6 +33,13 @@ class ImplicitFtpsServer:
         self.stall_seconds = stall_seconds
         self.password = password
         self.hold_before_reply = hold_before_reply
+        # When set, DELE of a name that is already stored returns this and
+        # leaves the bytes. A missing name still uses ``dele_reply``.
+        self.dele_existing_reply = dele_existing_reply
+        self.require_prot_c = require_prot_c
+        self.retr_reply = retr_reply
+        self.retr_short = retr_short
+        self.prot = "P"
         self.stor_blocked = threading.Event()
         self._stop = threading.Event()
         self._lock = threading.Lock()
@@ -40,6 +49,7 @@ class ImplicitFtpsServer:
         self._accepted_at = []
         self._closed_at = []
         self._reused = []
+        self._data_tls = []
         self._listen = None
         self._thread = None
         self.port = None
@@ -85,6 +95,7 @@ class ImplicitFtpsServer:
                 "accepted_at": list(self._accepted_at),
                 "closed_at": list(self._closed_at),
                 "reused": list(self._reused),
+                "data_tls": list(self._data_tls),
             }
 
     def _accept_loop(self):
@@ -148,17 +159,24 @@ class ImplicitFtpsServer:
                 elif verb == "PBSZ":
                     self._reply(control, "200 PBSZ=0")
                 elif verb == "PROT":
+                    self.prot = (arg or "P").strip().upper()[:1] or "P"
                     self._reply(control, "200 Protection set")
                 elif verb == "TYPE":
                     self._reply(control, "200 Type set")
                 elif verb == "DELE":
-                    self._reply(control, self.dele_reply)
+                    self._dele(control, arg)
                 elif verb == "PASV":
                     _close(pasv)
                     pasv, text = _passive_listener()
                     self._reply(control, text)
                 elif verb == "STOR":
                     self._stor(control, pasv, arg)
+                    pasv = None
+                elif verb == "RETR":
+                    self._retr(control, pasv, arg)
+                    pasv = None
+                elif verb == "LIST":
+                    self._list(control, pasv)
                     pasv = None
                 elif verb == "SIZE":
                     self._size(control, arg)
@@ -172,42 +190,79 @@ class ImplicitFtpsServer:
         finally:
             _close(pasv)
 
-    def _stor(self, control, pasv, name):
+    def _reject_prot(self, control, pasv):
+        if self.require_prot_c and self.prot != "C":
+            _close(pasv)
+            self._reply(control, "522 PROT C required")
+            return True
+        return False
+
+    def _accept_data(self, control, pasv):
+        """Accept PASV, send 150, then wrap only when the data channel is private."""
         if pasv is None:
             self._reply(control, "425 Use PASV first")
-            return
+            return None
         try:
             data, _addr = pasv.accept()
         except OSError:
             self._reply(control, "425 No data connection")
-            return
+            return None
         finally:
             _close(pasv)
+        _nodelay(data)
+        data.settimeout(30)
+        # 150 before the data handshake. The client wraps only after it
+        # has read that preliminary reply.
+        self._reply(control, "150 Opening data connection")
+        cleartext = self.plaintext or self.prot == "C"
+        if cleartext:
+            with self._lock:
+                self._data_tls.append(False)
+            return data
         try:
-            _nodelay(data)
-            data.settimeout(30)
-            # 150 before the data handshake. The client wraps only after it
-            # has read that preliminary reply.
-            self._reply(control, "150 Opening data connection")
-            if not self.plaintext:
-                try:
-                    data = self._ctx.wrap_socket(data, server_side=True)
-                except ssl.SSLError:
-                    self._reply(control, "425 TLS handshake failed")
-                    return
-                reused = bool(data.session_reused)
-                with self._lock:
-                    self._reused.append(reused)
-                if self.require_session_reuse and not reused:
-                    self._reply(control, "425 TLS session was not reused")
-                    return
+            data = self._ctx.wrap_socket(data, server_side=True)
+        except ssl.SSLError:
+            self._reply(control, "425 TLS handshake failed")
+            _close(data)
+            return None
+        reused = bool(data.session_reused)
+        with self._lock:
+            self._reused.append(reused)
+            self._data_tls.append(True)
+        if self.require_session_reuse and not reused:
+            self._reply(control, "425 TLS session was not reused")
+            _close(data)
+            return None
+        return data
+
+    def _dele(self, control, name):
+        key = _file_key(name)
+        with self._lock:
+            exists = key in self._files
+        if exists and self.dele_existing_reply is not None:
+            self._reply(control, self.dele_existing_reply)
+            return
+        if exists:
+            with self._lock:
+                self._files.pop(key, None)
+            self._reply(control, "250 Deleted")
+            return
+        self._reply(control, self.dele_reply)
+
+    def _stor(self, control, pasv, name):
+        if self._reject_prot(control, pasv):
+            return
+        data = self._accept_data(control, pasv)
+        if data is None:
+            return
+        try:
             if self.stall_seconds:
                 self._stop.wait(self.stall_seconds)
             payload = _read_all(data)
         finally:
             _close(data)
         with self._lock:
-            self._files[name] = payload
+            self._files[_file_key(name)] = payload
         self.stor_blocked.set()
         if self.hold_before_reply is not None:
             deadline = time.monotonic() + 30
@@ -219,12 +274,56 @@ class ImplicitFtpsServer:
             return
         self._reply(control, self.stor_final_reply)
 
+    def _retr(self, control, pasv, name):
+        if self.retr_reply is not None:
+            _close(pasv)
+            self._reply(control, self.retr_reply)
+            return
+        if self._reject_prot(control, pasv):
+            return
+        key = _file_key(name)
+        with self._lock:
+            payload = self._files.get(key)
+        if payload is None:
+            _close(pasv)
+            self._reply(control, "550 No such file")
+            return
+        data = self._accept_data(control, pasv)
+        if data is None:
+            return
+        body = payload if self.retr_short is None else payload[:self.retr_short]
+        try:
+            if body:
+                data.sendall(body)
+        finally:
+            _close(data)
+        self._reply(control, "226 Transfer complete.")
+
+    def _list(self, control, pasv):
+        if self._reject_prot(control, pasv):
+            return
+        data = self._accept_data(control, pasv)
+        if data is None:
+            return
+        try:
+            with self._lock:
+                items = list(self._files.items())
+            lines = [
+                f"-rw-r--r-- 1 owner group {len(payload)} Jan 01 00:00 {name}\r\n"
+                for name, payload in items
+            ]
+            if lines:
+                data.sendall("".join(lines).encode("utf-8"))
+        finally:
+            _close(data)
+        self._reply(control, "226 Transfer complete.")
+
     def _size(self, control, name):
         if self.size_override is not None:
             self._reply(control, f"213 {int(self.size_override)}")
             return
         with self._lock:
-            payload = self._files.get(name)
+            payload = self._files.get(_file_key(name))
         if payload is None:
             self._reply(control, "550 No such file")
             return
@@ -238,6 +337,13 @@ class ImplicitFtpsServer:
             sock.sendall(text.encode("utf-8") + b"\r\n")
         except OSError:
             pass
+
+
+def _file_key(name):
+    text = str(name).strip()
+    if text.startswith("/"):
+        text = text[1:]
+    return text
 
 
 def _passive_listener():

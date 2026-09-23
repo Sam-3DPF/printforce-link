@@ -182,6 +182,9 @@ class Fleet:
         # Every add/remove changes the serial's generation. Slow I/O may finish later,
         # but it can only commit while the generation it started under is still current.
         self._membership_generations = {c.bambu_id: 0 for c in printer_configs}
+        # Serials whose upload_file is on the stack. A print stop sets that
+        # worker's cancel event; PrinterWorker.stop() is the removal path.
+        self._uploads_in_flight = set()
         self._adds_in_flight = {}
         self._discover = discover_fn if discover_fn is not None else _default_discover
         self._rediscover_interval = rediscover_interval_seconds
@@ -281,11 +284,12 @@ class Fleet:
             return False
         return bool(worker.busy)
 
-    def apply_control(self, bambu_id: str, action: str) -> bool:
-        """Publish pause/resume/stop, or queue refresh on the printer worker.
+    def apply_control(self, bambu_id: str, action: str, params=None) -> bool:
+        """Publish a control, or queue refresh on the printer worker.
 
         The membership lock is not held across the publish. Refresh sleeps inside
         the pushall window, so it is queued and this returns True once it is queued.
+        A print stop cancels an in-flight upload and does not stop the worker.
         """
         printer = self.by_id(bambu_id)
         if printer is None:
@@ -299,9 +303,13 @@ class Fleet:
                 return printer.resume_from_stage()
             return printer.resume_print()
         if action == "stop":
+            self._cancel_inflight_upload(bambu_id)
             return printer.stop_print()
         if action == "refresh":
             return self._enqueue_refresh(bambu_id)
+        handle = getattr(printer, "handle_control", None)
+        if callable(handle):
+            return bool(handle(action, params or {}))
         logger.warning("unknown control %s requested for printer %s", action, bambu_id)
         return False
 
@@ -354,11 +362,25 @@ class Fleet:
         """
         with self._lock:
             printer = next((p for p in self._printers if p.bambu_id == bambu_id), None)
-            cancel = self._worker_cancel_locked(bambu_id)
+            worker = self._workers.get(bambu_id)
+            cancel = worker.cancel_event if worker is not None else None
         if printer is None:
             logger.error("upload requested for unknown printer %s", bambu_id)
             return None
-        return printer.upload_file(file_path, remote_name=remote_name, cancel=cancel)
+        with self._lock:
+            self._uploads_in_flight.add(bambu_id)
+        try:
+            return printer.upload_file(file_path, remote_name=remote_name, cancel=cancel)
+        finally:
+            with self._lock:
+                self._uploads_in_flight.discard(bambu_id)
+                # A real removal sets _stop and must keep the cancel it asked for.
+                if (
+                    worker is not None
+                    and cancel is not None
+                    and not worker._stop.is_set()
+                ):
+                    cancel.clear()
 
     def start_print(self, bambu_id: str, remote_name: str, ams_mapping,
                     plate_number: int = 1) -> bool:
@@ -393,6 +415,14 @@ class Fleet:
                 # until 3DPF reads hms_faults, user_cancelled, or lifecycle events.
                 # Offline reports send None for all three (no information).
                 "hms_faults", "fault_print_error", "commands_rejected",
+                "spd_lvl", "cooling_fan_percent", "big_fan1_percent",
+                "big_fan2_percent", "heatbreak_fan_percent", "door_open",
+                "sdcard", "chamber_light", "wifi_signal", "wifi_wired",
+                "store_to_sdcard", "lights_report", "airduct",
+                "tray_now", "tray_tar", "tray_pre", "ams_status",
+                "dry_time", "dry_status", "dry_sf_reason", "drying_unit",
+                "stage_name", "firmware_version", "unit_versions",
+                "external_spool",
                 "gcode_state", "hms_present", "hms_empty",
                 "has_active_file", "has_active_task", "has_active_project",
                 "local_ip",
@@ -902,6 +932,20 @@ class Fleet:
                            bambu_id, ip, type(error[0]).__name__)
             return False
         return True
+
+    def _cancel_inflight_upload(self, bambu_id: str) -> None:
+        """Set the upload cancel event while a transfer is on the stack.
+
+        A stop after the upload has returned does not set it. This does not
+        call ``PrinterWorker.stop()``.
+        """
+        with self._lock:
+            if bambu_id not in self._uploads_in_flight:
+                return
+            worker = self._workers.get(bambu_id)
+            if worker is None:
+                return
+            worker.cancel_event.set()
 
     def _worker_cancel_locked(self, bambu_id: str):
         """Caller holds ``self._lock``. The event ``stop`` sets during removal."""

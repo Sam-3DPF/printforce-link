@@ -19,28 +19,32 @@ Bambu status shape (subset):
 Slot numbers are global across regular AMS units: unit_index * 4 + tray_index + 1.
 AMS HT units use ids 128–135 and have one tray each. Those map to slots 17–24
 (`16 + unit_offset + 1`). `unit * 4 + tray + 1` on id 128 invents slot 513.
+A2L physical unit 16 is read as unit 6 before slot numbers and exist bits, so
+its four trays are slots 25–28 and tray 0 uses bit 24, not bit 64.
 
 `remain` is never emptiness. Official dumps send `-1` for unread / third-party
 spools and `0` when remaining is not calibrated. Empty comes from
-`tray_exist_bits` (or metadata), not from remain.
+`tray_exist_bits` (or a regular AMS state other than loaded), not from remain.
 
-**An empty tray is a slot whose `tray_exist_bits` bit is cleared.** An `{id}`-only
-tray on a P1 is also how idle loaded trays arrive, so that shape alone is not Empty.
-We emit null color/type only when the bitmask says the spool is gone. When the
+**An empty tray is a slot whose `tray_exist_bits` bit is cleared.** A clear bit
+blanks type, color, and remain even when the tray object still carries them.
+An `{id}`-only tray on a P1 is also how idle loaded trays arrive, so that shape
+alone is not Empty. A regular AMS update of `{id, state}` is empty when state
+is anything other than 11 (loaded). AMS-HT state 9 stays occupied. When the
 bits say the spool is in, we still emit that tray (null hex) so Refresh sends the
 same full list first-connect would. A mixed filled-plus-blank dump with no bits
 is incomplete: `parse_ams` returns None so the cloud does not store Empty.
 
 Never infer "empty" from an all-zero color. A loaded black spool whose RFID read
 failed still reports a color, and conflating the two is precisely the failure mode
-the manual slot override exists to fix. Emitting exactly what the tray carries gets
-this right for free: the empty tray is the one with nothing to emit.
+the manual slot override exists to fix. A clear exist bit is what blanks that
+tray, including when the object still carries a stale color.
 
-The external spool (`vt_tray`) is deliberately NOT parsed. It sits outside the `ams`
-array at global index 254, and the cloud's slot upsert keys on
+The external spool (`vt_tray` / `vir_slot`) is deliberately NOT parsed. It sits
+outside the `ams` array at global index 254, and the cloud's slot upsert keys on
 (printer_id, slot_number) with no notion of a non-AMS slot — so it would persist as
 a phantom swatch in the AMS strip and become a candidate slot for routing, where
-tray 254 does not exist.
+tray 254 does not exist. Neither object is appended to `slots`.
 """
 
 import copy
@@ -56,14 +60,26 @@ AMS_HT_ID_MIN = 128
 AMS_HT_ID_MAX = 135
 # 1-based. Regular AMS occupies 1–16; HT units occupy 17–24.
 AMS_HT_FIRST_SLOT = 17
+# A2L Lite's physical unit id. Exist bits and reported slots use unit 6.
+A2L_PHYSICAL_UNIT_ID = 16
+A2L_NORMALIZED_UNIT_ID = 6
+# Regular AMS. 11 is loaded. Anything else on an `{id, state}` update is empty.
+REGULAR_AMS_LOADED_STATE = 11
+_LOADED_TRAY_FIELDS = ("tray_color", "cols", "tray_type", "remain")
 
 _HEX_DIGITS = set("0123456789ABCDEF")
 
 
 def ams_slot_number(unit_id: int, tray_id: int) -> int:
-    """1-based slot for a unit/tray pair. HT units are not `unit * 4 + tray`."""
+    """1-based slot for a unit/tray pair. HT units are not `unit * 4 + tray`.
+
+    A2L physical unit 16 is numbered as unit 6 (slots 25–28). The exist-bit
+    index is that slot minus one, so tray 0 is bit 24 rather than bit 64.
+    """
     if AMS_HT_ID_MIN <= unit_id <= AMS_HT_ID_MAX:
         return AMS_HT_FIRST_SLOT + (unit_id - AMS_HT_ID_MIN)
+    if unit_id == A2L_PHYSICAL_UNIT_ID:
+        unit_id = A2L_NORMALIZED_UNIT_ID
     return unit_id * TRAYS_PER_AMS + tray_id + 1
 
 
@@ -163,9 +179,18 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
             if tray_index is None:
                 continue  # a tray we cannot place has no slot number to report under
             slot_number = ams_slot_number(unit_index, tray_index)
+            present = _bit_present(bits, slot_number)
+            if present is False or _regular_state_unloaded(unit_index, tray):
+                # A clear exist bit, or a regular state other than loaded,
+                # wins over a stale color, type, or remain.
+                slots.append({
+                    "slot_number": slot_number,
+                    "color_hex": None,
+                    "filament_type": None,
+                })
+                continue
             color_hex = clean_str(_tray_color(tray))
             filament_type = clean_str(tray.get("tray_type"))
-            present = _bit_present(bits, slot_number)
             if color_hex or filament_type:
                 slot = {
                     "slot_number": slot_number,
@@ -176,7 +201,7 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
                 if remaining is not None:
                     slot["remain_percent"] = remaining
                 slots.append(slot)
-            elif present is False or bits is not None:
+            elif bits is not None:
                 # Bit-present idle trays stay on the first-connect list. Returning
                 # None here swallowed a sibling RFID hex (0.1.16).
                 slots.append({
@@ -228,6 +253,8 @@ def idle_trays_needing_rfid(status) -> List[tuple]:
             if tray_index is None:
                 continue
             slot_number = ams_slot_number(unit_index, tray_index)
+            if _regular_state_unloaded(unit_index, tray):
+                continue
             if clean_str(_tray_color(tray)) or clean_str(tray.get("tray_type")):
                 continue
             if _bit_present(bits, slot_number) is False:
@@ -253,8 +280,11 @@ def merge_ams(previous, incoming):
     Incremental `print.ams` payloads still carry `tray_exist_bits` and a full tray
     list, but idle trays arrive as `{id}` only, or as RFID identity without hex.
     Replacing the AMS object wholesale then blanks hex the printer already sent.
-    Keep the last colour unless the bitmask clears that slot. A missing bitmask
-    is not an unload. Persist bits onto the outgoing object so a later delta that
+    Keep the last colour unless the bitmask clears that slot, or a regular AMS
+    tray arrives as `{id, state}` with a state other than loaded (11). A clear
+    bit blanks type, color, and remain on the stored tray even when the object
+    still carries them. AMS-HT state 9 stays occupied. A missing bitmask is not
+    an unload. Persist bits onto the outgoing object so a later delta that
     omits them does not store null.
     """
     if not isinstance(incoming, dict):
@@ -264,6 +294,7 @@ def merge_ams(previous, incoming):
         bits = _normalize_tray_exist_bits(incoming.get("tray_exist_bits"))
         if bits:
             incoming["tray_exist_bits"] = bits
+        _blank_unloaded_trays(incoming, bits)
         return incoming
     incoming_units = incoming.get("ams")
     bits = (
@@ -286,6 +317,7 @@ def merge_ams(previous, incoming):
     if not isinstance(previous_units, list):
         if bits:
             incoming["tray_exist_bits"] = bits
+        _blank_unloaded_trays(incoming, bits)
         return incoming
     prev_by_id = {}
     for unit in previous_units:
@@ -311,8 +343,13 @@ def merge_ams(previous, incoming):
             slot_number = ams_slot_number(unit_index, tray_index)
             prev_tray = prev_trays.get(tray_index)
             if (
+                _bit_present(bits, slot_number) is False
+                or _regular_state_unloaded(unit_index, tray)
+            ):
+                trays.append(_blank_loaded_fields(tray))
+            elif (
                 not _tray_color(tray)
-                and _bit_present(bits, slot_number) is not False
+                and not _regular_state_unloaded(unit_index, tray)
                 and isinstance(prev_tray, dict)
                 and _tray_color(prev_tray)
             ):
@@ -345,6 +382,56 @@ def ams_has_color(ams) -> bool:
             if isinstance(tray, dict) and _tray_color(tray):
                 return True
     return False
+
+
+def _regular_state_unloaded(unit_id: int, tray: dict) -> bool:
+    """True when a regular AMS `{id, state}` update is not the loaded state.
+
+    State 11 keeps a remembered color. AMS-HT is excluded: a loaded HT tray
+    reports state 9, and treating that as an unload would blank a present spool.
+    """
+    if AMS_HT_ID_MIN <= unit_id <= AMS_HT_ID_MAX:
+        return False
+    if "state" not in tray:
+        return False
+    return as_int(tray.get("state"), default=None) != REGULAR_AMS_LOADED_STATE
+
+
+def _blank_loaded_fields(tray: dict) -> dict:
+    """Drop type, color, and remain. An unload makes those stale."""
+    blanked = copy.deepcopy(tray)
+    for key in _LOADED_TRAY_FIELDS:
+        blanked.pop(key, None)
+    return blanked
+
+
+def _blank_unloaded_trays(ams_obj: dict, bits: Optional[str]) -> None:
+    """Blank unloaded trays on a payload that has no previous unit list."""
+    units = ams_obj.get("ams")
+    if not isinstance(units, list):
+        return
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        unit_index = as_int(unit.get("id"), default=0)
+        trays = []
+        for tray in unit.get("tray") or []:
+            if not isinstance(tray, dict):
+                trays.append(tray)
+                continue
+            tray_index = as_int(tray.get("id"), default=None)
+            if tray_index is None:
+                trays.append(tray)
+                continue
+            slot_number = ams_slot_number(unit_index, tray_index)
+            if (
+                _bit_present(bits, slot_number) is False
+                or _regular_state_unloaded(unit_index, tray)
+            ):
+                trays.append(_blank_loaded_fields(tray))
+            else:
+                trays.append(tray)
+        unit["tray"] = trays
 
 
 def _tray_has_reading(tray: dict) -> bool:

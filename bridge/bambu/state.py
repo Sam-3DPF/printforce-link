@@ -138,7 +138,8 @@ class LifecycleTracker:
     file after a known non-RUNNING state in this session — or silently on the
     first RUNNING of a session, which is a print already under way. A
     different print identity while RUNNING opens a new cycle with its own
-    start. PAUSE and back is the same cycle. The cycle closes on exactly one
+    start and drops the previous print's ``hms`` list when that frame did not
+    include one. PAUSE and back is the same cycle. The cycle closes on exactly one
     terminal: FINISH or FAILED after RUNNING was seen this session, FAILED
     straight from PREPARE or SLICING, or IDLE straight from RUNNING
     (``print_cancelled``; a FAILED that carries the user-cancel latch is a
@@ -195,8 +196,30 @@ class LifecycleTracker:
     def print_origin(self) -> Optional[str]:
         return self._print_origin
 
-    def observe(self, payload, *, user_cancelled: bool = False) -> None:
-        """One merged payload. Caller holds the state lock."""
+    def _is_new_print(self, print_obj: dict) -> bool:
+        """True when this frame opens a print cycle. Does not mutate.
+
+        The first RUNNING of a session is a print already under way. A
+        different identity while RUNNING is a new cycle, as is RUNNING with a
+        file after a known non-RUNNING state. PAUSE and back is not.
+        """
+        state = _gcode_state(print_obj)
+        identity = _print_identity(print_obj)
+        if not (state == "RUNNING" and _has_file(print_obj) and identity):
+            return False
+        if self._active_identity is None:
+            return self._prev_state is not None and self._prev_state != "RUNNING"
+        return identity != self._active_identity
+
+    def observe(self, payload, *, user_cancelled: bool = False,
+                frame_includes_hms: bool = False) -> None:
+        """One merged payload. Caller holds the state lock.
+
+        ``frame_includes_hms`` is about the raw frame, not the merged object.
+        A new print clears ``hms`` only when the frame left the key out, so a
+        list the merge carried forward does not survive and a list the frame
+        sent still does.
+        """
         print_obj = payload.get("print") if isinstance(payload, dict) else None
         if not isinstance(print_obj, dict):
             return
@@ -204,18 +227,17 @@ class LifecycleTracker:
         if not state:
             return
         identity = _print_identity(print_obj)
+        new_print = self._is_new_print(print_obj)
         origin, submission_id = self._classify(print_obj)
         self._print_origin = None if state == "IDLE" else origin
         prev = self._prev_state
 
+        if new_print:
+            self._enqueue("print_started", origin, submission_id, print_obj)
         if state == "RUNNING" and _has_file(print_obj) and identity:
-            if self._active_identity is None:
-                if prev is not None and prev != "RUNNING":
-                    self._enqueue("print_started", origin, submission_id, print_obj)
-                self._active_identity = identity
-            elif identity != self._active_identity:
-                self._enqueue("print_started", origin, submission_id, print_obj)
-                self._active_identity = identity
+            self._active_identity = identity
+        if new_print and not frame_includes_hms:
+            print_obj["hms"] = []
 
         terminal = None
         if state == "FINISH" and (prev == "RUNNING" or self._seen_running):
@@ -332,6 +354,11 @@ class PrinterState:
         ``now`` is the caller's monotonic clock. The report age and the
         freshness baseline have to share it, or a test clock and the default
         clock disagree about how long the printer has been quiet.
+
+        An explicit ``total_layer_num`` of 0 does not replace a positive total
+        while this is still the same print. The firmware sends that 0 when the
+        plate is done. A new print stores the total on that frame, including 0.
+        A frame that omits the key keeps the previous total.
         """
         if not isinstance(doc, dict):
             return False
@@ -344,10 +371,24 @@ class PrinterState:
                 return False
             if self._payload is None:
                 self._seed_remembered_ams()
+            incoming_print = doc.get("print") if isinstance(doc.get("print"), dict) else None
+            previous_print = _print_obj(self._payload)
+            prospective = dict(previous_print)
+            if incoming_print is not None:
+                prospective.update(incoming_print)
+            new_print = self._lifecycle._is_new_print(prospective)
+            previous_total = previous_print.get("total_layer_num")
             self._payload = merge_status_payload(self._payload, doc)
+            self._keep_finished_layer_total(
+                new_print, incoming_print, previous_total,
+            )
             self._note_cancel_edge(self._payload)
             self._note_session_gcode(doc)
-            self._lifecycle.observe(self._payload, user_cancelled=self._user_cancelled)
+            self._lifecycle.observe(
+                self._payload,
+                user_cancelled=self._user_cancelled,
+                frame_includes_hms=incoming_print is not None and "hms" in incoming_print,
+            )
             fresh = self._note_freshness(doc, now)
             if fresh:
                 self._pending_fresh = True
@@ -456,6 +497,25 @@ class PrinterState:
                 return None
             return print_obj.get("gcode_state"), print_obj.get("gcode_start_time")
 
+    def _keep_finished_layer_total(self, new_print, incoming_print, previous_total) -> None:
+        """Keep a positive layer total when the same print reports 0.
+
+        Caller holds ``self._lock``. A new print's explicit 0 is that print's
+        total and is left as the merge stored it.
+        """
+        if new_print or not isinstance(incoming_print, dict):
+            return
+        if "total_layer_num" not in incoming_print:
+            return
+        if not _layer_total_is_zero(incoming_print.get("total_layer_num")):
+            return
+        if not _layer_total_is_positive(previous_total):
+            return
+        merged_print = _print_obj(self._payload)
+        if not merged_print:
+            return
+        merged_print["total_layer_num"] = previous_total
+
     def _note_session_gcode(self, doc) -> None:
         """Record that this session has seen a report carrying ``gcode_state``.
 
@@ -527,6 +587,18 @@ class PrinterState:
         self._last_raw = copy.deepcopy(raw)
         self._last_fresh_monotonic = now
         return True
+
+
+def _layer_total_is_zero(value) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value == 0
+
+
+def _layer_total_is_positive(value) -> bool:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    return value > 0
 
 
 def _print_obj(payload) -> dict:

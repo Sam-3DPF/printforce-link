@@ -434,3 +434,23 @@ def test_real_session_down_under_60s_is_stale_and_past_it_is_offline():
     assert back["nozzle_temper"] == 24.0
     assert back["progress_percent"] == 0
     assert back["slots"] == [_SLOT]
+
+
+def test_the_report_loop_helper_cancels_the_previous_dump_when_it_rearms(monkeypatch):
+    import bridge.app as app_module
+
+    calls = []
+    monkeypatch.setattr(
+        app_module.faulthandler, "cancel_dump_traceback_later",
+        lambda: calls.append("cancel"),
+    )
+    monkeypatch.setattr(
+        app_module.faulthandler, "dump_traceback_later",
+        lambda timeout, exit=False: calls.append(("dump", timeout, exit)),
+    )
+    app_module.arm_report_loop_dump()
+    app_module.arm_report_loop_dump()
+    assert calls == [
+        "cancel", ("dump", 30.0, False),
+        "cancel", ("dump", 30.0, False),
+    ]
