@@ -3,8 +3,12 @@
 The checks run in a fixed order. A closed port 8883 skips the MQTT checks;
 FTPS and the subnet check still run. FTPS is a TLS handshake on 990 and
 nothing after it — an FTP login here would be a second client beside the
-uploader. MQTT uses a fresh temporary session so the printer's live client
-keeps its subscription and its unacked commands.
+uploader. The handshake uses the uploader's TLS 1.2 floor.
+
+A printer session that has already CONNACKed is read in place. That client
+is not started again and is not disconnected. ``proves_serial``, and a
+printer that has never connected, still open a temporary session and always
+close it.
 
 The access code is the MQTT password. It is not copied into the result.
 """
@@ -15,6 +19,7 @@ import socket
 import ssl
 import time
 
+from .hms import commands_rejected as _hms_commands_rejected
 from .session import COMMAND_PROBE_ENABLED, LinkSession
 
 logger = logging.getLogger(__name__)
@@ -32,6 +37,15 @@ _MQTT_SKIPPED = (
     "Skipped because port 8883 did not accept a connection, so MQTT was not checked."
 )
 _AUTH_SKIPPED = "Skipped because the MQTT login did not succeed."
+# Bit 0x20000000 set means Developer Mode is off. Clear means it is on.
+_DEV_MODE_OFF_BIT = 0x20000000
+_ACCESS_CODE_TOGGLES = (
+    "The access code changes when LAN Only or Developer Mode is toggled."
+)
+_AUTH_REJECTED_CAUSE = (
+    "The printer rejected the access code (MQTT authentication failed). "
+    + _ACCESS_CODE_TOGGLES
+)
 
 
 def _check(check_id, result, cause, **detail):
@@ -104,6 +118,7 @@ def _tls_handshake(sock, timeout):
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
     sock.settimeout(timeout)
     wrapped = ctx.wrap_socket(sock, do_handshake_on_connect=False)
     try:
@@ -262,6 +277,92 @@ def _commands_from_flag(printer):
     return None
 
 
+def _auth_rejected_check():
+    return _check(
+        "mqtt_auth",
+        "fail",
+        _AUTH_REJECTED_CAUSE,
+        reason="auth_rejected",
+    )
+
+
+def _merged_print(printer):
+    """The merged ``print`` object, or None when this printer has no payload."""
+    if printer is None:
+        return None
+    state = getattr(printer, "state", None)
+    view = getattr(state, "view", None)
+    if not callable(view):
+        return None
+    try:
+        snapshot = view()
+    except Exception:
+        return None
+    if not isinstance(snapshot, dict):
+        return None
+    payload = snapshot.get("payload")
+    if not isinstance(payload, dict):
+        return None
+    printed = payload.get("print")
+    return printed if isinstance(printed, dict) else None
+
+
+def _command_rejection(printer) -> bool:
+    """HMS ``0500050000010007`` wins, including when Developer Mode looks on."""
+    if _rejected_flag(printer) is True:
+        return True
+    printed = _merged_print(printer)
+    if not isinstance(printed, dict) or "hms" not in printed:
+        return False
+    return _hms_commands_rejected(printed.get("hms"))
+
+
+def _developer_mode_off(printer):
+    """None when ``fun`` is absent. True when bit ``0x20000000`` is set.
+
+    A clear bit means Developer Mode is on.
+    """
+    printed = _merged_print(printer)
+    if not isinstance(printed, dict) or "fun" not in printed:
+        return None
+    try:
+        value = int(printed.get("fun"))
+    except (TypeError, ValueError):
+        return None
+    return bool(value & _DEV_MODE_OFF_BIT)
+
+
+def _has_connack(session) -> bool:
+    """True once this client has received a CONNACK, success or refusal."""
+    if getattr(session, "had_session", False):
+        return True
+    if getattr(session, "connected", False):
+        return True
+    if getattr(session, "connack_at", None) is not None:
+        return True
+    return getattr(session, "last_connect_error", None) in ("auth_rejected", "refused")
+
+
+def _connacked_session(printer):
+    """The printer's own session after CONNACK, or None.
+
+    A missing session, and a session that has never connected, stay None so
+    the caller still opens a temporary client.
+    """
+    if printer is None:
+        return None
+    session = getattr(printer, "_session", None)
+    if session is None or not _has_connack(session):
+        return None
+    return session
+
+
+def _session_is_up(session) -> bool:
+    if getattr(session, "connected", False):
+        return True
+    return getattr(session, "state", None) in ("live", "stale", "commands_ignored")
+
+
 def _is_probe_reply(doc) -> bool:
     info = doc.get("info") if isinstance(doc, dict) else None
     return isinstance(info, dict) and info.get("command") == "get_version"
@@ -283,12 +384,7 @@ def _await_connack(session, monotonic, sleep):
         )
     error = getattr(session, "last_connect_error", None)
     if error == "auth_rejected":
-        return _check(
-            "mqtt_auth",
-            "fail",
-            "The printer rejected the access code (MQTT authentication failed).",
-            reason="auth_rejected",
-        )
+        return _auth_rejected_check()
     if error == "refused":
         return _check(
             "mqtt_auth",
@@ -397,11 +493,35 @@ def _await_probe(session, probe_replies, monotonic, sleep):
     )
 
 
-def _commands_check(printer, session, probe_enabled, probe_replies, monotonic, sleep):
+def _commands_check(printer, session, probe_enabled, probe_replies, monotonic, sleep,
+                    *, allow_probe=True):
+    if _command_rejection(printer):
+        return _check(
+            "commands",
+            "fail",
+            "The printer is rejecting commands.",
+            reason="commands_rejected",
+        )
+    mode_off = _developer_mode_off(printer)
+    if mode_off is True:
+        return _check(
+            "commands",
+            "fail",
+            "Developer Mode is off, so the printer is dropping commands. "
+            "Enable Developer Mode and restart the printer.",
+            reason="developer_mode",
+        )
+    if mode_off is False:
+        return _check(
+            "commands",
+            "pass",
+            "The printer is accepting commands.",
+            reason="ok",
+        )
     flagged = _commands_from_flag(printer)
     if flagged is not None:
         return flagged
-    if not probe_enabled:
+    if not allow_probe or not probe_enabled:
         return _check(
             "commands",
             "skip",
@@ -409,6 +529,66 @@ def _commands_check(printer, session, probe_enabled, probe_replies, monotonic, s
             reason="unavailable",
         )
     return _await_probe(session, probe_replies, monotonic, sleep)
+
+
+def _checks_from_live_session(session, printer):
+    """MQTT results from the session that already CONNACKed.
+
+    Does not start a client and does not disconnect this one.
+    """
+    error = getattr(session, "last_connect_error", None)
+    if error == "auth_rejected":
+        auth = _auth_rejected_check()
+    elif error == "refused":
+        auth = _check(
+            "mqtt_auth",
+            "fail",
+            "The printer refused the MQTT connection.",
+            reason="refused",
+        )
+    elif _session_is_up(session):
+        auth = _check(
+            "mqtt_auth",
+            "pass",
+            "The printer accepted the MQTT login.",
+            reason="ok",
+        )
+    else:
+        auth = _check(
+            "mqtt_auth",
+            "fail",
+            "The live session is not connected.",
+            reason="no_connack",
+        )
+    if auth["result"] != "pass":
+        commands = _commands_check(
+            printer, None, False, [], None, None, allow_probe=False,
+        )
+        if commands["result"] == "skip":
+            commands = _skipped("commands", _AUTH_SKIPPED, "mqtt_auth")
+        return (
+            auth,
+            _skipped("reports", _AUTH_SKIPPED, "mqtt_auth"),
+            commands,
+        )
+    if getattr(session, "last_message_at", None) is not None:
+        report = _check(
+            "reports",
+            "pass",
+            "A status report has arrived on the live session.",
+            reason="ok",
+        )
+    else:
+        report = _check(
+            "reports",
+            "fail",
+            "No status report has arrived on the live session.",
+            reason="no_reports",
+        )
+    commands = _commands_check(
+        printer, None, False, [], None, None, allow_probe=False,
+    )
+    return auth, report, commands
 
 
 def _mqtt_checks(ip, serial, access_code, *, printer, port_open, session_factory,
@@ -419,6 +599,10 @@ def _mqtt_checks(ip, serial, access_code, *, printer, port_open, session_factory
             _skipped("reports", _MQTT_SKIPPED, "port_mqtt"),
             _skipped("commands", _MQTT_SKIPPED, "port_mqtt"),
         )
+
+    live = _connacked_session(printer)
+    if live is not None:
+        return _checks_from_live_session(live, printer)
 
     reports = []
     probe_replies = []
@@ -522,8 +706,9 @@ def run_connection_diagnostic(ip, serial, access_code, *, printer=None,
     """Run the checks and return the roll-up for one printer.
 
     ``overall`` is ``problems`` when any check fails, ``warnings`` when any
-    warns, and ``ok`` otherwise. A skip is neither. The live session on
-    ``printer`` is left running; this opens its own and always closes it.
+    warns, and ``ok`` otherwise. A skip is neither. A session that has
+    already CONNACKed is read in place and is not disconnected. A printer
+    that has never connected still opens a temporary session and closes it.
     """
     tcp_connect = tcp_connect or _tcp_connect
     tls_handshake = tls_handshake or _tls_handshake

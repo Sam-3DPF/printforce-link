@@ -70,6 +70,41 @@ class _ProdSession:
         self.disconnects += 1
 
 
+class _LiveSession:
+    """A printer session the diagnostic can read without dialing again."""
+
+    def __init__(self, *, connected=True, error=None, reported=True, had_session=None):
+        self.connected = connected
+        self.last_connect_error = error
+        self.last_message_at = 1.0 if reported else None
+        self.had_session = (
+            connected if had_session is None and error is None else bool(had_session)
+        )
+        self.state = "live" if connected else "offline"
+        self.connack_at = 0.0 if self.had_session or error else None
+        self.starts = 0
+        self.disconnects = 0
+
+    def start(self):
+        self.starts += 1
+
+    def disconnect(self):
+        self.disconnects += 1
+
+
+class _Merged:
+    def __init__(self, printed):
+        self._printed = printed
+
+    def view(self):
+        return {"payload": {"print": self._printed}}
+
+
+_REJECT_HMS = {"attr": 0x05000500, "code": 0x00010007}
+_DEV_MODE_OFF = 0x20000000
+_TOGGLE = "The access code changes when LAN Only or Developer Mode is toggled."
+
+
 class FakeSession:
     """CONNACK, reports, and probe replies follow the injected clock."""
 
@@ -363,6 +398,8 @@ def test_connack_135_fails_mqtt_auth_as_auth_rejected():
     checks = _by_id(result)
     assert checks["mqtt_auth"]["result"] == "fail"
     assert checks["mqtt_auth"]["detail"]["reason"] == "auth_rejected"
+    assert _TOGGLE in checks["mqtt_auth"]["cause"]
+    assert _SECRET not in checks["mqtt_auth"]["cause"]
     assert checks["reports"]["result"] == "skip"
     assert clock.now < 1
     assert closed == [True]
@@ -506,6 +543,7 @@ def test_overall_rolls_up_ok_warnings_or_problems():
 def test_the_diagnostic_never_sends_ftp_user_or_pass(monkeypatch):
     writes = []
     handshakes = []
+    floors = []
 
     class Raw(_Sock):
         def send(self, data):
@@ -539,6 +577,7 @@ def test_the_diagnostic_never_sends_ftp_user_or_pass(monkeypatch):
         assert do_handshake_on_connect is False
         assert self.verify_mode == ssl.CERT_NONE
         assert self.check_hostname is False
+        floors.append(self.minimum_version)
         return Wrapped()
 
     monkeypatch.setattr(ssl.SSLContext, "wrap_socket", wrap)
@@ -551,6 +590,7 @@ def test_the_diagnostic_never_sends_ftp_user_or_pass(monkeypatch):
     checks = _by_id(result)
     assert checks["port_ftps"]["result"] == "pass"
     assert handshakes == [True]
+    assert floors == [ssl.TLSVersion.TLSv1_2]
     blob = b"".join(writes)
     assert b"USER" not in blob
     assert b"PASS" not in blob
@@ -920,3 +960,113 @@ def test_proves_serial_uses_a_temporary_session_without_a_watchdog(monkeypatch):
     ) is True
     assert captured["kwargs"]["watchdog_interval"] is None
     assert captured["disconnected"] is True
+
+
+def test_a_connacked_session_is_read_without_a_second_client():
+    printer = _printer()
+    live = _LiveSession()
+    printer._session = live
+    printer.commands_rejected = False
+    result, clock, extra = _diagnose(printer=printer)
+    checks = _by_id(result)
+    assert checks["mqtt_auth"]["result"] == "pass"
+    assert checks["reports"]["result"] == "pass"
+    assert checks["commands"]["result"] == "pass"
+    assert extra["sessions"] == []
+    assert live.starts == 0
+    assert live.disconnects == 0
+    assert clock.now < 1
+    assert result["overall"] == "ok"
+
+
+def test_a_printer_with_no_session_still_opens_a_temporary_one():
+    printer = _printer()
+    printer._session = None
+    result, _clock, extra = _diagnose(printer=printer)
+    checks = _by_id(result)
+    assert checks["mqtt_auth"]["result"] == "pass"
+    assert extra["sessions"]
+    assert extra["sessions"][0][0].disconnected is True
+
+
+def test_a_session_that_has_not_connacked_still_uses_a_temporary_one():
+    printer = _printer()
+    quiet = _LiveSession(connected=False, error=None, reported=False, had_session=False)
+    printer._session = quiet
+    result, _clock, extra = _diagnose(printer=printer)
+    checks = _by_id(result)
+    assert checks["mqtt_auth"]["result"] == "pass"
+    assert extra["sessions"]
+    assert extra["sessions"][0][0].disconnected is True
+    assert quiet.starts == 0
+    assert quiet.disconnects == 0
+
+
+def test_a_down_session_that_already_connacked_is_not_dialed_again():
+    printer = _printer()
+    live = _LiveSession(connected=False, error=None, reported=True, had_session=True)
+    live.state = "offline"
+    printer._session = live
+    result, clock, extra = _diagnose(printer=printer)
+    checks = _by_id(result)
+    assert extra["sessions"] == []
+    assert live.starts == 0
+    assert live.disconnects == 0
+    assert checks["mqtt_auth"]["result"] == "fail"
+    assert checks["mqtt_auth"]["detail"]["reason"] == "no_connack"
+    assert clock.now < 1
+    assert result["overall"] == "problems"
+
+
+def test_live_auth_rejection_names_the_toggle_and_does_not_open_a_session():
+    printer = _printer()
+    live = _LiveSession(connected=False, error="auth_rejected", reported=False, had_session=False)
+    printer._session = live
+    result, _clock, extra = _diagnose(printer=printer)
+    checks = _by_id(result)
+    assert checks["mqtt_auth"]["result"] == "fail"
+    assert checks["mqtt_auth"]["detail"]["reason"] == "auth_rejected"
+    assert _TOGGLE in checks["mqtt_auth"]["cause"]
+    assert _SECRET not in checks["mqtt_auth"]["cause"]
+    assert checks["reports"]["result"] == "skip"
+    assert extra["sessions"] == []
+    assert live.starts == 0
+    assert live.disconnects == 0
+    assert result["overall"] == "problems"
+
+
+def test_hms_rejection_fails_commands_when_developer_mode_is_on():
+    printer = _printer()
+    printer.state = _Merged({
+        "hms": [_REJECT_HMS],
+        "fun": 0,
+    })
+    result, _clock, _extra = _diagnose(printer=printer)
+    checks = _by_id(result)
+    assert checks["commands"]["result"] == "fail"
+    assert checks["commands"]["detail"]["reason"] == "commands_rejected"
+    assert result["overall"] == "problems"
+
+
+def test_developer_mode_bit_set_fails_commands_when_hms_is_absent():
+    printer = _printer()
+    printer.commands_rejected = False
+    printer.state = _Merged({"fun": _DEV_MODE_OFF})
+    result, _clock, _extra = _diagnose(printer=printer)
+    checks = _by_id(result)
+    assert checks["commands"]["result"] == "fail"
+    assert checks["commands"]["detail"]["reason"] == "developer_mode"
+    assert "Developer Mode" in checks["commands"]["cause"]
+    assert _SECRET not in checks["commands"]["cause"]
+    assert result["overall"] == "problems"
+
+
+def test_missing_fun_keeps_today_when_commands_are_not_rejected():
+    printer = _printer()
+    printer.commands_rejected = False
+    printer.state = _Merged({"gcode_state": "IDLE"})
+    result, _clock, _extra = _diagnose(printer=printer)
+    checks = _by_id(result)
+    assert checks["commands"]["result"] == "pass"
+    assert checks["commands"]["detail"]["reason"] == "ok"
+    assert result["overall"] == "ok"
