@@ -1,3 +1,7 @@
+import ipaddress
+import socket
+import time
+
 from bridge.discover import (
     DiscoveredPrinter,
     discover,
@@ -73,10 +77,254 @@ def test_garbage_datagram_returns_none():
 
 
 def test_discover_returns_empty_when_no_sockets(monkeypatch):
-    # When neither SSDP port can be bound, discover() degrades to [] (never raises).
+    # Privileged ports and the ephemeral fallback can all fail. discover()
+    # still returns [] and does not raise.
     import bridge.discover as d
-    monkeypatch.setattr(d, "_open_socket", lambda port, iface_ip: None)
+    monkeypatch.setattr(d, "_open_socket", lambda *args, **kwargs: None)
+    monkeypatch.setattr(d, "_open_ephemeral_socket", lambda *args, **kwargs: None)
     assert discover(timeout=0.1) == []
+
+
+def test_virtual_printer_serial_is_dropped_and_neighbor_is_kept():
+    virtual = BAMBU_NOTIFY.replace(b"USN: 01P00A3A3000666\r\n", b"USN: 01P00A391800001\r\n")
+    assert parse_ssdp_notify(virtual, "192.168.8.10") is None
+    neighbor = BAMBU_NOTIFY.replace(b"USN: 01P00A3A3000666\r\n", b"USN: 01P00A391800002\r\n")
+    kept = parse_ssdp_notify(neighbor, "192.168.8.10")
+    assert kept is not None
+    assert kept.serial == "01P00A391800002"
+
+
+def test_both_privileged_binds_failing_sends_from_an_ephemeral_port(monkeypatch):
+    import bridge.discover as d
+
+    sent = []
+
+    class Spy(socket.socket):
+        def sendto(self, data, *args):
+            addr = args[0] if args else None
+            sent.append((bytes(data), addr, self.getsockname()[1]))
+            return len(data)
+
+    monkeypatch.setattr(d, "_open_socket", lambda *args, **kwargs: None)
+    monkeypatch.setattr(d, "_private_scan_hosts", lambda: [])
+    monkeypatch.setattr(d.socket, "socket", Spy)
+    discover(timeout=0.2)
+    assert sent, "expected an M-SEARCH from an ephemeral socket"
+    assert {src for _, _, src in sent}.isdisjoint({1990, 2021})
+    dest_ports = {addr[1] for _, addr, _ in sent if addr is not None}
+    assert {1990, 2021} <= dest_ports
+    assert any(data.startswith(b"M-SEARCH ") for data, _, _ in sent)
+
+
+def test_no_iface_joins_private_address_and_skips_loopback(monkeypatch):
+    import bridge.discover as d
+
+    joined = []
+
+    class Spy(socket.socket):
+        def setsockopt(self, level, opt, value):
+            if opt == socket.IP_ADD_MEMBERSHIP and isinstance(value, (bytes, bytearray)) and len(value) >= 8:
+                joined.append(socket.inet_ntoa(value[4:8]))
+            return super().setsockopt(level, opt, value)
+
+    monkeypatch.setattr(
+        d,
+        "_interface_ipv4s",
+        lambda: ["127.0.0.1", "169.254.8.8", "192.168.4.20", "192.168.5.20"],
+    )
+    monkeypatch.setattr(d, "_private_scan_hosts", lambda: [])
+    monkeypatch.setattr(d.socket, "socket", Spy)
+    discover(timeout=0.15, probe_ips=["192.168.4.9"])
+    assert "192.168.4.20" in joined
+    assert "192.168.5.20" in joined
+    assert "127.0.0.1" not in joined
+    assert "169.254.8.8" not in joined
+
+
+def test_search_repeats_during_the_listen(monkeypatch):
+    import bridge.discover as d
+
+    monkeypatch.setattr(d, "_SEARCH_REPEAT_SECONDS", 0.05)
+    times = []
+    real = d._solicit
+
+    def wrapped(sock, probe_ips=None):
+        times.append(time.monotonic())
+        return real(sock, probe_ips)
+
+    monkeypatch.setattr(d, "_solicit", wrapped)
+    discover(timeout=0.2, probe_ips=["10.1.1.1"])
+    assert times
+    assert max(times) - min(times) >= 0.05
+
+
+def test_silent_cold_listen_probes_private_8883_then_unicasts(monkeypatch):
+    import bridge.discover as d
+
+    private_ips = [ip for ip in d._interface_ipv4s() if d._is_private_unicast(ip)]
+    assert private_ips, "need a private IPv4 on this host to accept TCP 8883"
+    private_ip = private_ips[0]
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind((private_ip, 8883))
+    server.listen(1)
+    probed = []
+    unicasts = []
+
+    class Spy(socket.socket):
+        def connect(self, addr):
+            probed.append(tuple(addr))
+            return super().connect(addr)
+
+        def sendto(self, data, *args):
+            if args:
+                unicasts.append(args[0])
+            return super().sendto(data, *args)
+
+    monkeypatch.setattr(d, "_private_scan_hosts", lambda: [private_ip, "8.8.8.8"])
+    monkeypatch.setattr(d.socket, "socket", Spy)
+    timeout = 1.0
+    started = time.monotonic()
+    try:
+        discover(timeout=timeout)
+    finally:
+        server.close()
+    elapsed = time.monotonic() - started
+    assert elapsed < timeout + 0.35
+    assert (private_ip, 8883) in probed
+    assert not any(addr[0] == "8.8.8.8" for addr in probed)
+    assert any(
+        isinstance(addr, tuple) and addr[0] == private_ip and addr[1] in (1990, 2021)
+        for addr in unicasts
+    )
+
+
+def test_sweep_keeps_a_reply_that_arrives_after_the_budget(monkeypatch):
+    import bridge.discover as d
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.setblocking(False)
+    found = {}
+
+    def probe(_hosts, _deadline, on_accept=None):
+        if on_accept is not None:
+            on_accept("192.168.8.40")
+        sock.sendto(BAMBU_NOTIFY, sock.getsockname())
+        return ["192.168.8.40"]
+
+    monkeypatch.setattr(d, "_unicast_search", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(d, "_probe_8883", probe)
+    try:
+        d._sweep_private_8883([sock], found, time.monotonic() - 1)
+    finally:
+        sock.close()
+    assert "01P00A3A3000666" in found
+
+
+def test_sweep_selects_for_a_reply_that_arrives_after_the_probe(monkeypatch):
+    import bridge.discover as d
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.setblocking(False)
+    found = {}
+    sent = {"n": 0}
+    real_select = d.select.select
+
+    def select_then_deliver(reads, writes, errors, timeout=None):
+        if sock in reads and sent["n"] == 0:
+            sent["n"] = 1
+            sock.sendto(BAMBU_NOTIFY, sock.getsockname())
+            return real_select(reads, writes, errors, 0)
+        return real_select(reads, writes, errors, timeout)
+
+    def probe(_hosts, _deadline, on_accept=None):
+        return ["192.168.8.40"]
+
+    monkeypatch.setattr(d, "_unicast_search", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(d, "_probe_8883", probe)
+    monkeypatch.setattr(d.select, "select", select_then_deliver)
+    try:
+        d._sweep_private_8883([sock], found, time.monotonic() + 0.25)
+    finally:
+        sock.close()
+    assert sent["n"] == 1
+    assert "01P00A3A3000666" in found
+
+
+def test_cold_listen_that_hears_a_printer_does_not_sweep(monkeypatch):
+    import threading
+
+    import bridge.discover as d
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.setblocking(False)
+
+    handed = {"used": False}
+
+    def open_socket(_port, _iface_ips):
+        if handed["used"]:
+            return None
+        handed["used"] = True
+        return sock
+
+    def hosts():
+        raise AssertionError("cold sweep host list was built")
+
+    def deliver():
+        time.sleep(0.05)
+        sender = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sender.sendto(BAMBU_NOTIFY, sock.getsockname())
+        finally:
+            sender.close()
+
+    monkeypatch.setattr(d, "_open_socket", open_socket)
+    monkeypatch.setattr(d, "_open_ephemeral_socket", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(d, "_private_scan_hosts", hosts)
+    thread = threading.Thread(target=deliver)
+    thread.start()
+    try:
+        found = discover(timeout=0.35)
+    finally:
+        thread.join(1)
+    assert any(printer.serial == "01P00A3A3000666" for printer in found)
+
+
+def test_known_private_probe_does_not_sweep(monkeypatch):
+    import bridge.discover as d
+
+    def hosts():
+        raise AssertionError("cold sweep host list was built")
+
+    monkeypatch.setattr(d, "_private_scan_hosts", hosts)
+    discover(timeout=0.15, probe_ips=["192.168.8.20"])
+
+
+def test_public_probe_ip_does_not_open_the_cold_sweep(monkeypatch):
+    import bridge.discover as d
+
+    def hosts():
+        raise AssertionError("cold sweep host list was built")
+
+    monkeypatch.setattr(d, "_private_scan_hosts", hosts)
+    discover(timeout=0.1, probe_ips=["8.8.8.8"])
+
+
+def test_public_interface_range_is_not_a_scan_target(monkeypatch):
+    import bridge.discover as d
+
+    monkeypatch.setattr(d, "_interface_ipv4s", lambda: ["8.8.8.8", "203.0.113.4", "192.168.9.4"])
+    hosts = d._private_scan_hosts()
+    assert "192.168.9.40" in hosts
+    assert "192.168.9.4" not in hosts
+    assert "8.8.8.8" not in hosts
+    assert "203.0.113.4" not in hosts
+    assert "192.168.9.0" not in hosts
+    assert "192.168.9.255" not in hosts
+    assert all(ipaddress.ip_address(host).is_private for host in hosts)
 
 
 def test_expand_probe_ips_covers_the_reserved_address_on_a_known_lan():
