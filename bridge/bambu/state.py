@@ -18,13 +18,11 @@ from typing import Dict, List, Optional
 
 from ..ams import load_remembered_ams, merge_ams
 from ..coerce import clean_str
+from .hms import CANCEL_PRINT_ERRORS as _CANCEL_PRINT_ERRORS
+from .hms import _norm_error_code
 
 logger = logging.getLogger(__name__)
 
-# User-cancel on a P1S often lands as FAILED plus one of these, not IDLE.
-# 50348044 is print.print_error. The code is gone again in about two seconds,
-# so the rising edge has to be latched on the merged payload.
-_CANCEL_PRINT_ERRORS = frozenset({"50348044", "0300400C"})
 # Raw firmware labels/codes cross the bridge boundary only in this bounded form.
 _MAX_FIRMWARE_TEXT = 64
 # Unacked lifecycle events and recent submission ids.
@@ -32,14 +30,6 @@ _MAX_FIRMWARE_TEXT = 64
 _MAX_LIFECYCLE_EVENTS = 50
 _MAX_REMEMBERED_SUBMISSIONS = 50
 _PREPARE_FAIL_STATES = frozenset({"PREPARE", "SLICING"})
-
-
-def _norm_error_code(value) -> str:
-    if value is None:
-        return ""
-    return (
-        str(value).strip().upper().replace("0X", "").replace("_", "").replace("-", "")
-    )[:_MAX_FIRMWARE_TEXT]
 
 
 def merge_status_payload(cached: Optional[dict], incoming: Optional[dict]) -> Dict:

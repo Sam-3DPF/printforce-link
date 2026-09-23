@@ -389,6 +389,10 @@ class Fleet:
                 "nozzle_diameter", "stage", "tray_exist_bits",
                 "hms_severity", "hms_code", "hms_count", "hms_title", "hms_detail",
                 "print_error",
+                # Additive. Legacy hms_* / print_error still carry cancel echoes
+                # until 3DPF reads hms_faults, user_cancelled, or lifecycle events.
+                # Offline reports send None for all three (no information).
+                "hms_faults", "fault_print_error", "commands_rejected",
                 "gcode_state", "hms_present", "hms_empty",
                 "has_active_file", "has_active_task", "has_active_project",
                 "local_ip",

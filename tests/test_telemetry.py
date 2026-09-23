@@ -257,6 +257,10 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "hms_title": None,
         "hms_detail": None,
         "print_error": None,
+        # Additive. Legacy hms_* / print_error still carry cancel echoes.
+        "hms_faults": [],
+        "fault_print_error": None,
+        "commands_rejected": False,
         "gcode_state": "RUNNING",
         "hms_present": True,
         "hms_empty": True,
@@ -325,11 +329,16 @@ def test_cancel_flash_latches_through_later_failed_with_cleared_error():
 
 
 def test_real_failed_snapshot_stays_error():
+    """FAILED without a cancel code stays ERROR.
+
+    12345 is 0x3039. A low word below 0x4000 is a status indicator, so the
+    wire field is empty. The gcode state is still a real fail.
+    """
     snapshot = _printer([{
         "print": {"gcode_state": "FAILED", "print_error": 12345},
     }]).snapshot()
     assert snapshot["status"] == "ERROR"
-    assert snapshot["print_error"] == "12345"
+    assert snapshot["print_error"] is None
 
 
 _P1S_10_HISTORICAL_FAILED = {

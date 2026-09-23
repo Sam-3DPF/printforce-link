@@ -24,9 +24,16 @@ from .ams import (
 from .bambu.log import PrinterLog
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.session import LinkSession
+from .bambu.hms import (
+    commands_rejected as hms_commands_rejected,
+    decode_hms,
+    fault_print_error,
+    hms_faults,
+    is_cancel_failed,
+    reported_print_error,
+)
 from .bambu.state import (
     PrinterState,
-    _CANCEL_PRINT_ERRORS,
     _MAX_FIRMWARE_TEXT,
     _norm_error_code,
     merge_status_payload,
@@ -54,10 +61,6 @@ _STATE_MAP = {
     "FAILED": "ERROR",
 }
 
-# HMS severity is the high half of `code`. Lower is worse.
-_HMS_SEVERITY = {1: "FATAL", 2: "SERIOUS", 3: "COMMON", 4: "INFO"}
-_HMS_UNKNOWN_RANK = 99  # rank unrecognized severities last so a real FATAL still wins
-
 # gcode_states in which a print is on the machine and its clock should be running...
 _PRINT_IN_PROGRESS = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
 # ...and the ones that end it.
@@ -66,12 +69,6 @@ _PRINT_ENDED = frozenset({"FINISH", "FAILED"})
 # printing on the poll before the print began. Assert, never assume — a blank or
 # unknown prior state is not evidence of an idle machine.
 _PRINT_START_EVIDENCE = frozenset({"IDLE", "FINISH", "FAILED"})
-
-# User-cancel on a P1S often lands as FAILED plus one of these, not IDLE. Mapped to
-# IDLE so the next Start is not blocked and the router does not report_failed.
-# 0300_400C / 0500_400E are HMS index codes. The print_error half of the latch
-# lives on PrinterState, which sees the code for about two seconds.
-_CANCEL_HMS_CODES = frozenset({"0300400C", "0500400E"})
 
 # stg_cur values that need retry_filament_action before resume_print (KTD6).
 # 6 = runout, 17/20 = load, 21 = unload / AMS, 24 = AMS lost, 35 = clog.
@@ -234,31 +231,6 @@ def _is_leftover_idle_failed(print_obj: Dict, fields: Dict) -> bool:
     return True
 
 
-def is_cancel_failed(print_error=None, hms_code=None, hms=None) -> bool:
-    """True when the printer is sitting on a user-cancel, not a real fail."""
-    pe = _norm_error_code(print_error)
-    if pe in _CANCEL_PRINT_ERRORS:
-        return True
-    candidates = []
-    if hms_code is not None:
-        candidates.append(hms_code)
-    if isinstance(hms, str):
-        candidates.append(hms)
-    elif isinstance(hms, list):
-        for item in hms:
-            if isinstance(item, dict):
-                candidates.append(item.get("code"))
-            else:
-                candidates.append(item)
-    for raw in candidates:
-        normalized = _norm_error_code(raw)
-        if not normalized:
-            continue
-        if normalized in _CANCEL_HMS_CODES or any(code in normalized for code in _CANCEL_HMS_CODES):
-            return True
-    return False
-
-
 def promote_live_idle(status: str, print_obj: Optional[dict]) -> str:
     """gcode IDLE during heat-up or a moving print is still a live print.
 
@@ -318,42 +290,6 @@ def map_status(gcode_state: Optional[str], *, print_error=None,
     return mapped
 
 
-def decode_hms(hms) -> Dict:
-    """Reduce Bambu's `hms` array to the worst active alarm plus a count.
-
-    Each entry is {"attr": int, "code": int}; severity is `code >> 16` (1 fatal,
-    2 serious, 3 common, 4 info). The detail page needs to know *is something wrong,
-    how bad, and how many* — not the whole array — so that is all we report.
-
-    `hms_code` is the 4-group hex code Bambu publishes its error index under (the two
-    halves of `attr`, then the two halves of `code`), so the UI can name the fault.
-    """
-    alarms = []
-    for entry in hms or []:
-        if not isinstance(entry, dict):
-            continue
-        attr = as_int(entry.get("attr"), None)
-        code = as_int(entry.get("code"), None)
-        if attr is None or code is None:
-            continue
-        alarms.append((code >> 16, attr, code))
-
-    if not alarms:
-        return {"hms_severity": None, "hms_code": None, "hms_count": 0}
-
-    # Rank by the severity NUMBER (lower is worse), not by its name. `severity` is the
-    # top 16 bits of an arbitrary int, so a value outside 1-4 is entirely possible and
-    # must sort last rather than crash the poll.
-    severity, attr, code = min(
-        alarms, key=lambda a: a[0] if a[0] in _HMS_SEVERITY else _HMS_UNKNOWN_RANK)
-    return {
-        "hms_severity": _HMS_SEVERITY.get(severity, "UNKNOWN"),
-        "hms_code": (f"{(attr >> 16) & 0xFFFF:04X}_{attr & 0xFFFF:04X}_"
-                     f"{(code >> 16) & 0xFFFF:04X}_{code & 0xFFFF:04X}"),
-        "hms_count": len(alarms),
-    }
-
-
 def parse_telemetry(status: dict) -> Dict:
     """Extract the live telemetry the printer already reports.
 
@@ -383,16 +319,27 @@ def parse_telemetry(status: dict) -> Dict:
         # says PAUSE. X1 sends -1 and P1 sends 255 for "no stage"; both are None.
         "stage": _valid_stage(print_obj.get("stg_cur")),
         "tray_exist_bits": parse_tray_exist_bits(status),
-        # print.print_error is 0 when nothing is wrong. Persist the non-zero code so
-        # ingest can tell a user-cancel (50348044) from a real fail.
+        # 0 and a low word below 0x4000 are status, not a fault. Cancel codes
+        # stay so an older ingest can still tell 50348044 from a real fail.
         "print_error": _print_error_str(print_obj.get("print_error")),
     }
-    telemetry.update(decode_hms(print_obj.get("hms")))
+    raw_hms = print_obj.get("hms")
+    telemetry.update(decode_hms(raw_hms))
     telemetry.update(describe_hms(
         hms_code=telemetry.get("hms_code"),
         print_error=telemetry.get("print_error"),
     ))
     telemetry.update(_failed_ready_fields(print_obj))
+    # No merged document: these are "no information", same as an offline report.
+    # A real payload with nothing wrong is an empty fault list and false.
+    if isinstance(status, dict):
+        telemetry["hms_faults"] = hms_faults(raw_hms)
+        telemetry["fault_print_error"] = fault_print_error(print_obj.get("print_error"))
+        telemetry["commands_rejected"] = hms_commands_rejected(raw_hms)
+    else:
+        telemetry["hms_faults"] = None
+        telemetry["fault_print_error"] = None
+        telemetry["commands_rejected"] = None
     return telemetry
 
 
@@ -570,6 +517,8 @@ class BambuPrinter:
             secrets=(cfg.access_code,) if isinstance(cfg.access_code, str) else (),
             file_path=log_path,
         )
+        # Last commands_rejected answer. None until a payload has been merged.
+        self._command_acceptance = None
 
     @property
     def bambu_id(self) -> str:
@@ -620,6 +569,24 @@ class BambuPrinter:
     def log(self):
         """MQTT and session ring for this serial. It outlives the client."""
         return self._log
+
+    @property
+    def commands_rejected(self):
+        """True when the merged HMS list contains MQTT command verification failed.
+
+        False when a payload has been merged and that code is absent. None
+        when no payload has been merged — absence is not acceptance. An
+        offline report sends None for this field even if a payload is still
+        retained; this property keeps answering from the payload, which is
+        what the connection check reads. Queries still answer while the code
+        is present; ``project_file`` is dropped by the printer.
+        """
+        payload = self.state.view().get("payload")
+        if not isinstance(payload, dict):
+            return None
+        print_obj = payload.get("print")
+        hms = print_obj.get("hms") if isinstance(print_obj, dict) else None
+        return hms_commands_rejected(hms)
 
     def collect_log(self) -> Dict:
         """Both rings, oldest first, for the collect_log upload."""
@@ -868,6 +835,30 @@ class BambuPrinter:
         self._note_session_boundary()
         self.state.ingest(doc, self._monotonic())
         self._observe_stopwatch()
+        self._note_command_acceptance()
+
+    def _note_command_acceptance(self) -> None:
+        """Log when the printer starts or stops refusing commands.
+
+        The first merged payload that is not refusing is not an edge: there
+        was no previous answer. A later report whose merged ``hms`` no longer
+        contains the code is ``commands_accepted``.
+        """
+        current = self.commands_rejected
+        if not isinstance(current, bool):
+            return
+        previous = self._command_acceptance
+        self._command_acceptance = current
+        if previous is current or (previous is None and current is False):
+            return
+        log = self._log
+        if log is None:
+            return
+        kind = "commands_rejected" if current else "commands_accepted"
+        try:
+            log.record_event(kind)
+        except Exception:
+            logger.debug("printer %s: command acceptance was not recorded", self.bambu_id)
 
     def _note_session_boundary(self) -> None:
         """A new CONNACK forgets previous-state knowledge, not queued events.
@@ -1049,6 +1040,22 @@ class BambuPrinter:
         yet, or this report is `offline` and is not claiming to see the AMS.
         `[]` means the printer said the AMS has no units. An offline report that
         sent `[]` would make the cloud delete every slot row. See `parse_ams`.
+
+        `hms_severity`, `hms_code`, `hms_count`, `hms_title`, `hms_detail`, and
+        `print_error` are the legacy HMS fields. Severity 0, and a `print_error`
+        whose low 16 bits are below 0x4000, are dropped. Cancel echoes stay in
+        those fields (`0300_400C`, `0500_400E`, print_error `50348044`) until
+        3DPF reads `hms_faults`, `user_cancelled`, or the lifecycle events.
+
+        `hms_faults`, `fault_print_error`, and `commands_rejected` are additive.
+        `hms_faults` is real faults only (severity 0 and cancel echoes removed),
+        worst first, at most 10, each `{"code", "severity"}` with `code` all
+        16 hex digits. `fault_print_error` is `print_error` with cancel codes
+        removed too. `commands_rejected` is true when HMS contains
+        `0500050000010007`. On a live or stale report these are a reading of
+        the merged payload (`hms_faults: []` and `commands_rejected: false`
+        when nothing is wrong). On an offline report all three are None: no
+        information, same rule as `slots: None`.
 
         A message from before this session's CONNACK is not `live`. Replaying it
         as a fresh print is how a printer that just reconnected looked busy, or
@@ -1370,6 +1377,10 @@ class BambuPrinter:
             "print_duration_seconds": None,
             "print_duration_source": None,
             "local_ip": self._ip or None,
+            # No HMS reading. None, not [] — same rule as slots.
+            "hms_faults": None,
+            "fault_print_error": None,
+            "commands_rejected": None,
         }
         report.update(self._lifecycle_fields(view))
         report.update(self._contract_fields(view, "offline"))
@@ -1413,11 +1424,12 @@ def _valid_epoch(value) -> Optional[int]:
 
 
 def _print_error_str(value) -> Optional[str]:
-    """`print_error` is 0 when nothing is wrong. That is an absence, not a code."""
-    code = _norm_error_code(value)
-    if not code or not code.strip("0"):
-        return None
-    return code
+    """0 and a low word below 0x4000 are not faults.
+
+    Cancel codes stay in this field. 3DPF still detects a user cancel from
+    ``50348044`` / ``0300400C`` here until it reads ``hms_faults``.
+    """
+    return reported_print_error(value)
 
 
 def _valid_stage(value) -> Optional[int]:
