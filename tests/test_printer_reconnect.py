@@ -68,16 +68,20 @@ def test_reconnect_without_new_ip_keeps_the_ip(sessions):
 
 
 def test_reconnect_clears_cached_payload_and_freshness(sessions):
+    """An address change drops the merged payload. It described the old
+    address and must not be merged into the new one."""
     p = _printer(sessions)
     p.connect()
-    p._cached = {"print": {"gcode_state": "RUNNING"}}
-    p._last_raw = {"print": {}}
-    p._last_fresh_monotonic = 123.0
+    p._on_mqtt_report({"print": {"gcode_state": "RUNNING"}})
+    assert p.state.view()["payload"]["print"]["gcode_state"] == "RUNNING"
+    assert p.state.view()["last_fresh_monotonic"] is not None
+    assert p.state.view()["last_raw"] is not None
     p._historical_failed_streak = 1
     p.reconnect(new_ip="192.168.1.55")
-    assert p._cached is None            # old address's state must not leak into the new one
-    assert p._last_raw is None
-    assert p._last_fresh_monotonic is None
+    cleared = p.state.view()
+    assert cleared["payload"] is None
+    assert cleared["last_raw"] is None
+    assert cleared["last_fresh_monotonic"] is None
     assert p._historical_failed_streak == 0
 
 

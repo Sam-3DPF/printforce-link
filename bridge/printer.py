@@ -7,7 +7,6 @@ published to `device/{serial}/request`. The session opens no camera socket.
 without a printer.
 """
 
-import copy
 import logging
 import os
 import threading
@@ -18,8 +17,6 @@ from .ams import (
     ams_has_color,
     ams_needs_pushall,
     idle_trays_needing_rfid,
-    load_remembered_ams,
-    merge_ams,
     parse_ams,
     parse_tray_exist_bits,
     save_remembered_ams,
@@ -27,7 +24,13 @@ from .ams import (
 from .bambu.log import PrinterLog
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.session import LinkSession
-from .bambu.state import net_info_ips
+from .bambu.state import (
+    PrinterState,
+    _CANCEL_PRINT_ERRORS,
+    _MAX_FIRMWARE_TEXT,
+    _norm_error_code,
+    merge_status_payload,
+)
 from .bambu_alerts import describe_hms
 from .coerce import as_float, as_int, clean_str
 from .config import PrinterConfig
@@ -66,8 +69,8 @@ _PRINT_START_EVIDENCE = frozenset({"IDLE", "FINISH", "FAILED"})
 
 # User-cancel on a P1S often lands as FAILED plus one of these, not IDLE. Mapped to
 # IDLE so the next Start is not blocked and the router does not report_failed.
-# 50348044 is print.print_error; 0300_400C / 0500_400E are HMS index codes.
-_CANCEL_PRINT_ERRORS = frozenset({"50348044", "0300400C"})
+# 0300_400C / 0500_400E are HMS index codes. The print_error half of the latch
+# lives on PrinterState, which sees the code for about two seconds.
 _CANCEL_HMS_CODES = frozenset({"0300400C", "0500400E"})
 
 # stg_cur values that need retry_filament_action before resume_print (KTD6).
@@ -95,8 +98,6 @@ _MAX_FULL_STATUS_ATTEMPTS = 3
 # so the full AMS has time to arrive on the report callback.
 _ABSORB_SAMPLES = 6
 _ABSORB_SAMPLE_SECONDS = 0.4
-# Raw firmware labels/codes cross the bridge boundary only in this bounded form.
-_MAX_FIRMWARE_TEXT = 64
 
 _MQTT_COMMANDS = {
     "pause_print": {"print": {"command": "pause"}},
@@ -119,14 +120,6 @@ def _mqtt_command_name(payload) -> str:
                 if isinstance(command, str) and command.strip():
                     return command.strip()[:64]
     return "command"
-
-
-def _norm_error_code(value) -> str:
-    if value is None:
-        return ""
-    return (
-        str(value).strip().upper().replace("0X", "").replace("_", "").replace("-", "")
-    )[:_MAX_FIRMWARE_TEXT]
 
 
 def _bounded_text(value, *, upper: bool = False) -> Optional[str]:
@@ -403,48 +396,6 @@ def parse_telemetry(status: dict) -> Dict:
     return telemetry
 
 
-def merge_status_payload(cached: Optional[dict], incoming: Optional[dict]) -> Dict:
-    """Merge a (possibly partial) Bambu MQTT payload into the last-known one.
-
-    Most Bambu reports are partial deltas — only a `pushall` carries the whole object —
-    so without this, a poll that lands between deltas blanks the temperatures and the
-    ETA.
-
-    The merge is deliberately **shallow at the `print` level**:
-
-      * scalars merge key-by-key, so a delta that omits `nozzle_temper` keeps the last
-        known value rather than blanking it;
-      * `ams` is merged by `merge_ams`: a P1 print delta that only details the
-        active tray must not blank RFID colours on trays `tray_exist_bits` still
-        marks loaded. A real unload (bit cleared, or no bits and an id-only tray)
-        still replaces.
-
-    Nothing from `incoming` is ever stored by reference. The report callback runs
-    on the MQTT thread, which can keep the dict it just handed us, so caching it
-    without copying would alias it and "last known" would silently become
-    "current". `cached` needs only a shallow copy: it is a previous return value of
-    this function, so everything reachable from it is already a bridge-owned copy
-    that nothing mutates in place.
-    """
-    merged = dict(cached) if isinstance(cached, dict) else {}
-    if not isinstance(incoming, dict):
-        return merged
-
-    for key, value in incoming.items():
-        if key == "print" and isinstance(value, dict):
-            previous = merged.get("print")
-            print_obj = dict(previous) if isinstance(previous, dict) else {}
-            incoming_print = copy.deepcopy(value)
-            if "ams" in incoming_print:
-                previous_ams = previous.get("ams") if isinstance(previous, dict) else None
-                incoming_print["ams"] = merge_ams(previous_ams, incoming_print.get("ams"))
-            print_obj.update(incoming_print)
-            merged["print"] = print_obj             # rebuilt, so cached["print"] is untouched
-        else:
-            merged[key] = copy.deepcopy(value)
-    return merged
-
-
 class PrintStopwatch:
     """How long the print on this machine actually ran, measured rather than estimated.
 
@@ -586,47 +537,29 @@ class BambuPrinter:
         self._ip = cfg.ip
         self._session = None
         self._session_factory = session_factory or _default_session_factory
-        self._cached: Optional[Dict] = None       # last-known merged payload
-        # Set when a report's merged payload actually changed, consumed by snapshot().
-        self._pending_fresh = False
-        self._payload_lock = threading.Lock()
+        # Merged payload, freshness, cancel latch, and net.info live here. The
+        # report loop reads a copy; it does not share the MQTT thread's dict.
+        self.state = PrinterState(
+            cfg.bambu_id, ams_cache_path=ams_cache_path, monotonic=monotonic,
+        )
         self._stopwatch = stopwatch or PrintStopwatch(cfg.bambu_id)
         self._monotonic = monotonic               # injectable — staleness is otherwise untestable
         self._sleep = sleep
         self._stale_after_seconds = stale_after_seconds
 
-        # Liveness of `_cached`. `_last_raw` is the last payload the printer actually
-        # sent, and `_last_fresh_monotonic` is when it changed — the pair is what tells
-        # a live printer apart from a frozen one. **Neither is cleared when the printer
-        # goes OFFLINE** (`_cached` is): a dead printer keeps handing back the same dict,
-        # so resetting the freshness baseline on the way out would make the next poll
-        # read that dict as new data and flap the printer back to PRINTING.
-        self._last_raw: Optional[Dict] = None
-        self._last_fresh_monotonic: Optional[float] = None
-        # Any MQTT report, even one whose merged dump did not change. A finished
-        # plate often republishes the same temperatures; that is still a heartbeat.
-        self._last_message_monotonic: Optional[float] = None
         self._offline = False                     # for logging the edge, not every poll
         self._historical_failed_streak = 0
         self._asked_full_status = False
         self._full_status_attempts = 0
         self._last_gcode_state: Optional[str] = None
         self._ams_cache_path = ams_cache_path
-        # User-cancel on a P1 is print_error 50348044 for about two seconds, then
-        # the code clears. Latch the rising edge so a later FAILED with 0 is still
-        # a cancel, not report_failed.
-        self._user_cancelled = False
-        self._last_print_error = ""
         # The report loop and this printer's worker both call snapshot(). The lock
-        # keeps the stopwatch and the merged payload read on one thread at a time.
+        # keeps the stopwatch and the report built on one thread at a time.
         self._snapshot_lock = threading.Lock()
         # None: unit tests refresh AMS inline. The fleet sets a worker submit so
         # snapshot itself does not publish or sleep.
         self._defer = None
         self._deferred_pending = False
-        # Last usable print.net.info addresses. A status delta that omits `net`
-        # must not wipe them; only a later net block replaces the list.
-        self._net_info_ips: list = []
         # One ring for the life of this object. rebuild_session and reconnect
         # replace the client and keep this log.
         self._log = PrinterLog(
@@ -663,7 +596,9 @@ class BambuPrinter:
     def down_reason(self):
         """Why the session is not live. None while it is connecting or live.
 
-        Not part of the state report yet. One of auth_rejected, refused,
+        This is the report's ``connect_error``, except a live report forces
+        None: a reason left over from the previous gap must not mark a report
+        whose ``connection`` is live. One of auth_rejected, refused,
         unreachable, silent_session, commands_ignored.
         """
         session = self._session
@@ -689,8 +624,7 @@ class BambuPrinter:
 
     def address_candidates(self) -> list:
         """IPs from the last ``print.net.info`` block. A report with no net block leaves them."""
-        with self._payload_lock:
-            return list(self._net_info_ips)
+        return self.state.address_candidates()
 
     def proves_serial_at(self, ip: str) -> bool:
         """True when a temporary session at ``ip`` is this printer.
@@ -764,7 +698,7 @@ class BambuPrinter:
 
     def reconnect(self, new_ip: Optional[str] = None) -> None:
         """Rebuild the MQTT client, optionally at a new IP after the printer's DHCP lease
-        moved (U1). Closes the old client best-effort, drops the cached payload and its
+        moved (U1). Closes the old client best-effort, drops the merged payload and its
         freshness baseline (they described the old address), then connects fresh. The next
         snapshot rebuilds live state and flips the printer back online on its own — so this
         does not reset the `_offline` flag, leaving snapshot() to log the real recovery.
@@ -774,11 +708,7 @@ class BambuPrinter:
         next reconcile retries rather than silently stranding it."""
         target_ip = new_ip or self._ip
         self.disconnect()
-        self._cached = None
-        self._pending_fresh = False
-        self._last_raw = None
-        self._last_fresh_monotonic = None
-        self._last_message_monotonic = None
+        self.state.clear()
         self._historical_failed_streak = 0
         self._last_gcode_state = None
         self._connect(target_ip)
@@ -915,69 +845,12 @@ class BambuPrinter:
         return self._ams_complete()
 
     def _ams_complete(self) -> bool:
-        with self._payload_lock:
-            return not ams_needs_pushall(self._cached or {})
-
-    def _ingest_status(self, raw) -> bool:
-        """Merge one MQTT document into `_cached`.
-
-        Idle-tray hex lives on the report itself. A later delta can already have
-        replaced it, which is why the merge keeps colours the bits still say are loaded.
-        """
-        if not isinstance(raw, dict) or not raw:
-            return False
-        with self._payload_lock:
-            if self._cached is None:
-                self._seed_remembered_ams()
-            self._cached = merge_status_payload(self._cached, raw)
-            self._note_cancel_edge(self._cached)
-            fresh = self._note_freshness(raw)
-            if fresh:
-                self._pending_fresh = True
-            return fresh
-
-    def _note_cancel_edge(self, payload) -> None:
-        """Latch user-cancel on print_error rising to 50348044.
-
-        The code lasts about two seconds. A later FAILED dump can already have
-        print_error 0. Without the latch that looks like a real fail.
-        """
-        print_obj = payload.get("print") if isinstance(payload, dict) else None
-        if not isinstance(print_obj, dict):
-            return
-        state = print_obj.get("gcode_state")
-        gcode = state.strip().upper() if isinstance(state, str) else ""
-        if gcode in {"PREPARE", "SLICING", "RUNNING"}:
-            self._user_cancelled = False
-            self._last_print_error = ""
-        current = _norm_error_code(print_obj.get("print_error"))
-        previous = self._last_print_error
-        if current in _CANCEL_PRINT_ERRORS and previous not in _CANCEL_PRINT_ERRORS:
-            self._user_cancelled = True
-        self._last_print_error = current
+        payload = self.state.view()["payload"] or {}
+        return not ams_needs_pushall(payload)
 
     def _on_mqtt_report(self, doc) -> None:
         """Ingest one report. Runs on the paho network thread."""
-        if not isinstance(doc, dict):
-            return
-        self._remember_net_info(doc)
-        self._last_message_monotonic = self._monotonic()
-        self._ingest_status(doc)
-
-    def _remember_net_info(self, doc) -> None:
-        """Keep the last explicit interface list. Absence is not an empty list."""
-        print_obj = doc.get("print")
-        if not isinstance(print_obj, dict):
-            return
-        net = print_obj.get("net")
-        info = net.get("info") if isinstance(net, dict) else None
-        # Only a real list replaces the last interfaces. A missing or broken
-        # block is not evidence that the printer has no address.
-        if not isinstance(info, list):
-            return
-        ips = net_info_ips(doc)
-        with self._payload_lock:
-            self._net_info_ips = ips
+        self.state.ingest(doc, self._monotonic())
 
     def _publish_command(self, payload: dict) -> bool:
         session = self._session
@@ -1005,8 +878,7 @@ class BambuPrinter:
 
     def _request_idle_rfid(self) -> bool:
         """`ams_get_rfid` is the printer command HA uses to read one P1 tray."""
-        with self._payload_lock:
-            trays = list(idle_trays_needing_rfid(self._cached or {}))
+        trays = list(idle_trays_needing_rfid(self.state.view()["payload"] or {}))
         if not trays:
             return False
         asked = False
@@ -1044,17 +916,11 @@ class BambuPrinter:
         except Exception:
             logger.info("printer %s: full AMS dump not available yet", self.bambu_id)
 
-    def _seed_remembered_ams(self) -> None:
-        if self._cached is not None:
-            return
-        remembered = load_remembered_ams(self._ams_cache_path, self.bambu_id)
-        if remembered:
-            self._cached = {"print": {"ams": remembered}}
-
     def _remember_ams(self) -> None:
-        if not isinstance(self._cached, dict):
+        payload = self.state.view()["payload"]
+        if not isinstance(payload, dict):
             return
-        print_obj = self._cached.get("print")
+        print_obj = payload.get("print")
         ams = print_obj.get("ams") if isinstance(print_obj, dict) else None
         if ams_has_color(ams):
             save_remembered_ams(self._ams_cache_path, self.bambu_id, ams)
@@ -1101,42 +967,48 @@ class BambuPrinter:
               "print_duration_seconds": int | None,                # observed, not estimated
               "print_duration_source": "bridge" | "printer" | None,
               "local_ip": str | None,                               # address currently dialed
+              "connection": "live" | "stale" | "offline",
+              "last_message_age_seconds": float | None,             # None if no report yet
+              "connect_error": str | None,                          # session down_reason; None when live
+              "session_started_at": str | None,                     # ISO-8601 UTC of this CONNACK
             }
 
         The telemetry is **flat on the report, not nested** — that is what
         `bridge_state_service.ingest_printer_state` reads
-        (`{bambu_id, status, slots, plus the telemetry fields}`). `status` and `slots`
-        keep their existing shape, so an older ingest keeps working and the new fields
-        are purely additive; unknown keys are ignored on the far side.
+        (`{bambu_id, status, slots, plus the telemetry fields}`). `status` keeps
+        today's mapping, so an older ingest keeps working. `connection` and the
+        three stamps beside it are additive; unknown keys are ignored on the far side.
 
-        **`slots` is None while this printer has reported no AMS unit list**, which is
-        its normal state from connecting until the first full Bambu push lands. `[]`
-        would claim the AMS is empty and make the cloud delete every slot row for a
-        live printer; None says "no information" and leaves them alone. See `parse_ams`.
+        **`connection` and `status` are different facts.** `live` means the socket
+        is up and a report on this session arrived within `stale_after_seconds`.
+        `status` is then `map_status` of `gcode_state`, unchanged. `stale` means
+        a merged payload exists but that report is not live: the socket is up and
+        quiet past the window, the session is `stale` / `commands_ignored` /
+        `connecting`, or the socket has been down only long enough that the
+        session has not yet called it unreachable. `status` on that report stays
+        OFFLINE — IDLE is still the only authorization for dispatch — and the
+        telemetry and `slots` are the last merged payload, not a fresh reading.
+        `offline` means there is no merged payload, or the session is `offline`
+        (socket down past its unreachable window, `unreachable`, `auth_rejected`,
+        or `refused` with nothing recent). Telemetry is null and `slots` is None.
 
-        **The cache is bounded by liveness, and that is a safety property.** A printer
-        that dies after connecting does not make anything raise: reports simply stop,
-        and `_cached` still holds the last merged payload. Replaying that on the
-        strength of "nothing threw" would report a printer
-        that is PRINTING at 47%, 220°C, forever; a printer that was IDLE when it died
-        would report IDLE forever, and IDLE is the sole authorization for dispatch, so
-        the next job would be sent to an unplugged machine and its filament deducted.
-        Both of the obvious liveness signals lie about this together — the payload never
-        changes, so `reported_at` freezes, while the farm's `last_seen_at` stays green
-        because the *bridge* is alive. So the last payload is only believed while the
-        printer is demonstrably still there:
+        **`slots` is None in two different cases, and `[]` is neither of them.**
+        None means "no AMS information": the printer has not reported a unit list
+        yet, or this report is `offline` and is not claiming to see the AMS.
+        `[]` means the printer said the AMS has no units. An offline report that
+        sent `[]` would make the cloud delete every slot row. See `parse_ams`.
 
-          * **the MQTT link is up** (`_is_connected`) — authoritative, and cheap; and
-          * **the printer is still talking** (`_stale_for`) — a new report, or a merged
-            dump that changed. A finished plate often repeats the same temperatures, so
-            an unchanged dump is not by itself a dead printer.
+        A message from before this session's CONNACK is not `live`. Replaying it
+        as a fresh print is how a printer that just reconnected looked busy, or
+        IDLE, on data from the previous connection. The merged payload is kept
+        either way, so the next report merges onto it; `reconnect()` is what
+        drops that payload, because an address change is a different machine
+        until the serial is proved again.
 
-        A link that is down, a printer that has never reported, or silence longer
-        than the staleness window is OFFLINE. This method does not publish and does
-        not sleep: bringing the socket back is the session watchdog and the fleet
-        backstop. A printer that never answers stays OFFLINE — this does not turn a
-        frozen dump into IDLE. A false OFFLINE costs a poll of dispatch (visible,
-        and fails closed); a false IDLE costs a print.
+        This method does not publish and does not sleep: bringing the socket
+        back is the session watchdog and the fleet backstop. A false OFFLINE
+        costs a poll of dispatch (visible, and fails closed); a false IDLE
+        costs a print.
         """
         with self._snapshot_lock:
             return self._snapshot_impl()
@@ -1150,21 +1022,21 @@ class BambuPrinter:
             # exception read as "unreachable".
             return self._go_offline(f"unreadable ({type(e).__name__})")
 
-        if not connected:
-            # Authoritative. In LAN mode the printer *is* the MQTT broker, so the
-            # session keepalive is a liveness check on the printer itself, not on
-            # some intermediary.
-            return self._go_offline("MQTT link is down")
-
-        if not self._cached:
-            # No report yet. We know nothing about this printer, and nothing is not IDLE.
-            return self._go_offline("no MQTT payload received yet")
-
-        silent_for = self._stale_for()
-        if silent_for is not None:
-            return self._go_offline(
-                f"nothing new for {silent_for:.0f}s (> {self._stale_after_seconds:.0f}s) — "
-                f"the printer is gone, or the MQTT session is wedged")
+        view = self.state.view()
+        label = self._connection_label(view, connected=connected)
+        if label != "live":
+            reason = self._offline_reason(view, connected=connected)
+            if label == "stale":
+                self._note_offline(reason)
+                try:
+                    return self._stale_snapshot(view)
+                except Exception:
+                    logger.exception(
+                        "printer %s: parsing its telemetry raised — this is a BRIDGE BUG, not an "
+                        "unreachable printer. Reporting OFFLINE so nothing dispatches to it.",
+                        self.bambu_id)
+                    return self._offline_snapshot(view)
+            return self._go_offline(reason, view)
 
         if self._offline:
             # Covers both a recovery and the first payload after a bridge start.
@@ -1172,8 +1044,9 @@ class BambuPrinter:
             self._offline = False
 
         try:
+            payload = view.get("payload") or {}
             gcode_state = None
-            print_obj = self._cached.get("print")
+            print_obj = payload.get("print")
             if isinstance(print_obj, dict):
                 raw_state = print_obj.get("gcode_state")
                 if isinstance(raw_state, str):
@@ -1184,12 +1057,16 @@ class BambuPrinter:
             ):
                 self._full_status_attempts = 0
             self._last_gcode_state = gcode_state
-            if ams_needs_pushall(self._cached):
+            if ams_needs_pushall(payload):
                 # Inline only when no worker is wired. Otherwise this publishes
                 # pushall and sleeps in the absorb window, on the report loop.
+                # Those reports merge before this snapshot is built, so the
+                # copy taken above is stale and has to be read again.
                 self._defer_or_run(self._request_ams_if_needed)
+                view = self.state.view()
+                payload = view.get("payload") or {}
             self._remember_ams()
-            return self._build_snapshot(self._cached, fresh=self._take_fresh())
+            return self._build_snapshot(payload, fresh=self.state.take_fresh(), view=view)
         except Exception:
             # NOT an unreachable printer — a bug in the bridge's own parsing. Letting it
             # pass for one would silently delete a *live* printer from the UI, leaving a
@@ -1200,7 +1077,7 @@ class BambuPrinter:
                 "printer %s: parsing its telemetry raised — this is a BRIDGE BUG, not an "
                 "unreachable printer. Reporting OFFLINE so nothing dispatches to it.",
                 self.bambu_id)
-            return self._offline_snapshot()
+            return self._offline_snapshot(view)
 
     def _defer_or_run(self, fn) -> None:
         """One deferred refresh at a time. Every snapshot would otherwise queue
@@ -1223,66 +1100,119 @@ class BambuPrinter:
         if future is None or future.done():
             self._deferred_pending = False
 
-    def _go_offline(self, reason: str) -> Dict:
-        """Report OFFLINE and **drop the cache**, so a recovering printer is rebuilt from
-        what it actually says rather than from what it last said before it vanished.
+    def _connection_label(self, view: Dict, *, connected: bool) -> str:
+        """``live``, ``stale``, or ``offline``. Separate from ``status``.
 
-        `_last_raw` / `_last_fresh_monotonic` deliberately survive — see `__init__`.
+        ``live`` requires a report on *this* session inside the same window that
+        makes ``status`` OFFLINE when it expires. A CONNACK with no report yet
+        is not live: the retained payload belongs to the previous client.
 
-        Logged on the edge, not on every poll: a printer that has been unplugged for a
-        week should not emit a warning every 15 seconds forever.
+        A session that does not publish ``state`` is judged by the socket. An
+        up socket is treated as live-or-stale; a down socket is offline. The
+        "down for at most 60s" stale window is the session keeping a non-offline
+        state until it marks the socket unreachable — this method does not run
+        a second timer.
+        """
+        payload = view.get("payload") if isinstance(view, dict) else None
+        has_state = isinstance(payload, dict) and bool(payload)
+        message_at = view.get("last_message_monotonic") if isinstance(view, dict) else None
+        in_window = False
+        if message_at is not None:
+            in_window = (self._monotonic() - message_at) <= self._stale_after_seconds
+        if connected and has_state and in_window and self._message_in_current_session(message_at):
+            return "live"
+        if not has_state:
+            return "offline"
+        session_state = self._reported_session_state(connected)
+        reason = self.down_reason
+        if session_state == "offline" or reason in ("unreachable", "auth_rejected"):
+            return "offline"
+        if reason == "refused" and not in_window:
+            return "offline"
+        return "stale"
+
+    def _reported_session_state(self, connected: bool) -> str:
+        session = self._session
+        if session is None:
+            return "offline"
+        state = getattr(session, "state", None)
+        if isinstance(state, str) and state:
+            return state
+        return "live" if connected else "offline"
+
+    def _message_in_current_session(self, message_at) -> bool:
+        """True when ``message_at`` is at or after this client's CONNACK.
+
+        No CONNACK stamp means there is no session boundary to enforce. A real
+        session sets one before any report can arrive; a stand-in that never
+        handshakes has nothing older to exclude.
+        """
+        if message_at is None:
+            return False
+        session = self._session
+        if session is None:
+            return False
+        connack_at = getattr(session, "connack_at", None)
+        if connack_at is None:
+            return True
+        return message_at >= connack_at
+
+    def _offline_reason(self, view: Dict, *, connected: bool) -> str:
+        if not connected:
+            return "MQTT link is down"
+        payload = view.get("payload") if isinstance(view, dict) else None
+        message_at = view.get("last_message_monotonic") if isinstance(view, dict) else None
+        if not payload or message_at is None:
+            return "no MQTT payload received yet"
+        if not self._message_in_current_session(message_at):
+            return "no report in this session yet"
+        silent_for = self._monotonic() - message_at
+        return (
+            f"nothing new for {silent_for:.0f}s (> {self._stale_after_seconds:.0f}s) — "
+            f"the printer is gone, or the MQTT session is wedged"
+        )
+
+    def _note_offline(self, reason: str) -> None:
+        """Log the edge into OFFLINE. The merged payload stays.
+
+        Logged once, not every poll: a printer that has been unplugged for a
+        week should not emit a warning every 15 seconds forever. The fresh
+        edge is discarded so the first live snapshot after the gap is not
+        credited with a change that happened before it.
         """
         if not self._offline:
             logger.warning("printer %s -> OFFLINE: %s", self.bambu_id, reason)
             self._offline = True
-        with self._payload_lock:
-            self._cached = None
-            self._pending_fresh = False
         self._historical_failed_streak = 0
-        return self._offline_snapshot()
+        self.state.discard_fresh()
 
-    def _note_freshness(self, raw) -> bool:
-        """Stamp the clock when the printer says something NEW.
+    def _go_offline(self, reason: str, view: Optional[Dict] = None) -> Dict:
+        """Report the null telemetry shape. Does not drop the merged payload.
 
-        Keyed on the payload *changing*. A dead printer's last report is still in
-        `_cached`, still non-empty — it just stops changing. That is the whole signal.
-
-        The comparison stores a copy: the MQTT thread can mutate the dict it handed
-        us, and a stored reference would compare equal to itself forever.
+        Dropping it made the next report look like a first contact and threw
+        away trays the printer had already described. ``reconnect()`` still
+        clears the payload when the address changes.
         """
-        if not isinstance(raw, dict) or not raw:
-            return False                # silence, not news
-        if raw == self._last_raw:
-            return False                # the same frozen payload, not a new one
-        self._last_raw = copy.deepcopy(raw)
-        self._last_fresh_monotonic = self._monotonic()
-        return True
+        self._note_offline(reason)
+        return self._offline_snapshot(view)
 
-    def _heard_monotonic(self) -> Optional[float]:
-        """When this printer last proved it was talking, or None if it never has."""
-        heard = self._last_fresh_monotonic
-        message = self._last_message_monotonic
-        if heard is None:
-            return message
-        if message is None:
-            return heard
-        return max(heard, message)
+    def _contract_fields(self, view: Optional[Dict], connection: str) -> Dict:
+        message_at = view.get("last_message_monotonic") if isinstance(view, dict) else None
+        age = None
+        if message_at is not None:
+            age = round(max(0.0, self._monotonic() - message_at), 1)
+        session = self._session
+        started = getattr(session, "session_started_at", None) if session is not None else None
+        if started is not None and not isinstance(started, str):
+            started = None
+        return {
+            "connection": connection,
+            "last_message_age_seconds": age,
+            "connect_error": None if connection == "live" else self.down_reason,
+            "session_started_at": started,
+        }
 
-    def _stale_for(self) -> Optional[float]:
-        """Seconds of silence, if the printer has been quiet too long — else None."""
-        heard = self._heard_monotonic()
-        if heard is None:
-            return None                 # nothing has ever arrived; the empty cache says so
-        silent_for = self._monotonic() - heard
-        return silent_for if silent_for > self._stale_after_seconds else None
-
-    def _take_fresh(self) -> bool:
-        with self._payload_lock:
-            fresh = self._pending_fresh
-            self._pending_fresh = False
-            return fresh
-
-    def _build_snapshot(self, payload: Dict, *, fresh: bool) -> Dict:
+    def _build_snapshot(self, payload: Dict, *, fresh: bool, view: Dict) -> Dict:
         print_obj = payload.get("print")
         if not isinstance(print_obj, dict):
             print_obj = {}
@@ -1294,17 +1224,18 @@ class BambuPrinter:
         else:
             # Duplicate/non-fresh reports and every disqualifier break consecutiveness.
             self._historical_failed_streak = 0
+        user_cancelled = bool(view.get("user_cancelled"))
         status = map_status(
             gcode_state if isinstance(gcode_state, str) else None,
             print_error=telemetry.get("print_error"),
             hms_code=telemetry.get("hms_code"),
             hms=print_obj.get("hms"),
-            user_cancelled=self._user_cancelled,
+            user_cancelled=user_cancelled,
         )
         if status == "ERROR" and _is_leftover_idle_failed(print_obj, telemetry):
             status = "IDLE"
         status = promote_live_idle(status, print_obj)
-        return {
+        report = {
             "bambu_id": self.bambu_id,
             "status": status,
             # None — not [] — while this printer's payload carries no AMS unit list,
@@ -1317,22 +1248,52 @@ class BambuPrinter:
             # signal still lets the cloud check assignment state on dumps that
             # do not meet leftover-idle (file leftover, heat, HMS).
             "historical_failed_ready": self._historical_failed_streak >= 2,
-            "user_cancelled": self._user_cancelled,
+            "user_cancelled": user_cancelled,
             "print_duration_seconds": self._stopwatch.duration_seconds,
             "print_duration_source": self._stopwatch.source,
             "local_ip": self._ip or None,
         }
+        report.update(self._contract_fields(view, "live"))
+        return report
 
-    def _offline_snapshot(self) -> Dict:
-        """Null telemetry and no slots: the printer is unreadable, so we report nothing
-        we cannot currently see. A stale temperature or ETA on an unreachable printer
-        would be actively misleading, and the ingest clears what stops being reported.
+    def _stale_snapshot(self, view: Dict) -> Dict:
+        """Last telemetry, status OFFLINE, ``connection: stale``.
+
+        Status stays OFFLINE so an older ingest still refuses to dispatch.
+        The stopwatch is not observed: a quiet printer must not keep a print
+        clock running. ``slots`` is ``parse_ams`` of the retained payload,
+        which is None when that payload never carried a unit list and a real
+        list when it did — not ``[]`` standing in for "we are not looking".
         """
-        self._historical_failed_streak = 0
-        return {
+        payload = view.get("payload") or {}
+        report = {
             "bambu_id": self.bambu_id,
             "status": "OFFLINE",
-            "slots": [],
+            "slots": parse_ams(payload),
+            **parse_telemetry(payload),
+            "historical_failed_ready": False,
+            "user_cancelled": bool(view.get("user_cancelled")),
+            "print_duration_seconds": self._stopwatch.duration_seconds,
+            "print_duration_source": self._stopwatch.source,
+            "local_ip": self._ip or None,
+        }
+        report.update(self._contract_fields(view, "stale"))
+        return report
+
+    def _offline_snapshot(self, view: Optional[Dict] = None) -> Dict:
+        """Null telemetry and ``slots: None``.
+
+        ``[]`` would tell the cloud the AMS is empty and delete every slot
+        row. None means this report is not an AMS reading. The merged payload
+        is left in ``PrinterState`` for the next message to merge onto.
+        """
+        if view is None:
+            view = self.state.view()
+        self._historical_failed_streak = 0
+        report = {
+            "bambu_id": self.bambu_id,
+            "status": "OFFLINE",
+            "slots": None,
             **parse_telemetry(None),
             "historical_failed_ready": False,
             "user_cancelled": False,
@@ -1340,13 +1301,15 @@ class BambuPrinter:
             "print_duration_source": None,
             "local_ip": self._ip or None,
         }
+        report.update(self._contract_fields(view, "offline"))
+        return report
 
     def _is_connected(self) -> bool:
         """Is the MQTT session to this printer actually up?
 
         In LAN-only mode the printer runs the broker, so the session keepalive
         is a liveness check on the machine. Unplug it and the session goes
-        False while the last merged payload is still sitting in `_cached`.
+        False while the merged payload is still in ``state``.
         """
         session = self._session
         if session is None:

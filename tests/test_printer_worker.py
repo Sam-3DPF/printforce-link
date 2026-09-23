@@ -137,10 +137,11 @@ def test_hung_publish_on_a_does_not_block_fleet_snapshot():
     )
     printer_a = fleet.by_id("A")
     printer_a._session = _BlockingPublish()
-    printer_a._cached = {"print": {"gcode_state": "IDLE"}}
+    # No AMS unit list, so the live snapshot defers pushall onto A's worker.
+    printer_a._on_mqtt_report({"print": {"gcode_state": "IDLE"}})
     printer_b = fleet.by_id("B")
     printer_b._session = _Quiet()
-    printer_b._cached = {"print": {"gcode_state": "IDLE", "ams": {"ams": []}}}
+    printer_b._on_mqtt_report({"print": {"gcode_state": "IDLE", "ams": {"ams": []}}})
 
     done = threading.Event()
     box = {}

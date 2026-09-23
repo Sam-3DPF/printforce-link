@@ -162,13 +162,16 @@ def _attach(printer, payloads, **kwargs):
 #  snapshot-level behavior built on top of it.)
 
 def test_fresh_bridge_reports_offline_not_idle_even_mid_print():
-    """`mqtt_dump()` returns {} until the first MQTT push lands. Every printer —
-    including one mid-print — read IDLE during that window before this fix."""
+    """No report yet is OFFLINE, not IDLE. `slots` is None on that report: `[]`
+    would tell the cloud the AMS is unplugged and delete every slot row. None
+    means this cycle has no AMS information."""
     printer = _printer([{}])
     snapshot = printer.snapshot()
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["slots"] == []
+    assert snapshot["connection"] == "offline"
+    assert snapshot["slots"] is None
     assert snapshot["nozzle_temper"] is None
+    assert snapshot["last_message_age_seconds"] is None
 
 
 def test_unreadable_printer_reports_offline_and_never_raises():
@@ -267,6 +270,10 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "print_duration_seconds": None,
         "print_duration_source": None,
         "local_ip": "10.0.0.5",
+        "connection": "live",
+        "last_message_age_seconds": 0.0,
+        "connect_error": None,
+        "session_started_at": None,
     }
 
 
@@ -838,8 +845,8 @@ def test_mqtt_message_keeps_idle_hex_when_dump_is_already_a_stub():
         ]}]},
     }}
     printer = _printer([stub, stub])
-    printer._ingest_status(full)
-    printer._ingest_status(stub)
+    printer.state.ingest(full)
+    printer.state.ingest(stub)
     snapshot = printer.snapshot()
     assert [slot["color_hex"] for slot in snapshot["slots"]] == [
         "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
@@ -1236,10 +1243,12 @@ def test_a_gap_between_pushes_does_not_knock_a_live_printer_offline():
 
 
 def test_a_printer_that_dies_mid_print_goes_offline_not_printing_forever():
-    """Someone unplugs a printer that is PRINTING at 47%, 220°C. `mqtt_dump()` cannot
-    raise, so `except Exception -> OFFLINE` never fires; the cache is populated, so the
-    "no payload yet" branch never fires either. Before this, the bridge replayed that
-    same stale payload to the cloud every 10 seconds, forever.
+    """Someone unplugs a printer that is PRINTING at 47%, 220°C, and the socket
+    still looks up. Status stays OFFLINE so this is not a live print and not an
+    authorization to dispatch. The session has not been called unreachable, so
+    the report is ``connection: stale`` and keeps the last telemetry and the
+    last AMS slots. Nulling those, or sending ``slots: []``, would either hide
+    the last picture or tell the cloud the AMS was unplugged.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)   # then it repeats, i.e. freezes
@@ -1249,9 +1258,12 @@ def test_a_printer_that_dies_mid_print_goes_offline_not_printing_forever():
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["progress_percent"] is None            # not a frozen 47%
-    assert snapshot["nozzle_temper"] is None               # not a frozen 220°C
-    assert snapshot["slots"] == []                         # not a colour it no longer holds
+    assert snapshot["connection"] == "stale"
+    assert snapshot["progress_percent"] == 47
+    assert snapshot["nozzle_temper"] == 220.0
+    assert snapshot["slots"] == [
+        {"slot_number": 1, "color_hex": "FF6A13FF", "filament_type": "PLA"},
+    ]
 
 
 def test_stale_historical_failed_payload_never_becomes_ready():
@@ -1288,8 +1300,9 @@ def test_a_frozen_idle_printer_reports_offline_and_never_idle():
 
 
 def test_an_empty_dump_after_a_live_poll_is_not_replayed_from_the_cache():
-    """`mqtt_dump()` returning {} is silence, not news — and silence must not be answered
-    with the last thing the printer happened to say."""
+    """An empty dump is silence, not news. Status stays OFFLINE so the last
+    payload is not presented as a live print. It is still the last-known
+    picture, reported as stale rather than wiped."""
     clock = FakeClock()
     printer = _printer([_PRINTING, {}], monotonic=clock.now)
     assert printer.snapshot()["status"] == "PRINTING"
@@ -1298,17 +1311,14 @@ def test_an_empty_dump_after_a_live_poll_is_not_replayed_from_the_cache():
     snapshot = printer.snapshot()                          # mqtt_dump() -> {}
 
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["progress_percent"] is None
+    assert snapshot["connection"] == "stale"
+    assert snapshot["progress_percent"] == 47
 
 
 def test_offline_does_not_flap_back_to_printing_while_the_printer_stays_dead():
-    """Going OFFLINE drops `_cached` — but the *freshness baseline* must survive it.
-
-    A dead printer hands back the same dict on every poll. If dropping the cache also
-    reset "when did this last change?", the very next poll would merge that same dict into
-    an empty cache, read it as new data, and flap the printer back to PRINTING — then
-    OFFLINE, then PRINTING, every window, forever. The dispatcher would find an IDLE
-    window on a machine that is not there.
+    """Silence stays OFFLINE. The merged payload is kept, and the freshness
+    baseline is not reset, so a quiet printer is not reported live again just
+    because the same dict is still sitting there.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
@@ -1322,24 +1332,29 @@ def test_offline_does_not_flap_back_to_printing_while_the_printer_stays_dead():
 
 
 def test_a_printer_that_comes_back_reports_live_telemetry_again():
-    """Recovery. The cache was dropped on the way out, so the printer is rebuilt from what
-    it says NOW — the pre-outage 47% must not be resurrected alongside it. (The real
-    `mqtt_dump()` accumulates and the library re-pushes everything on connect, so a
-    reconnected printer's first dump is a full picture.)
+    """A new report after the quiet gap is live again. The gap does not drop
+    the merged payload, so a partial IDLE delta keeps the last percent. That
+    percent is still between 0 and 100, and ``promote_live_idle`` treats gcode
+    IDLE plus that percent as PRINTING — the same rule a live delta follows.
+    A full post-CONNACK recovery that must not look live *before* the new
+    message is covered in test_report_contract.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
     printer.snapshot()
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
-    assert printer.snapshot()["status"] == "OFFLINE"
+    quiet = printer.snapshot()
+    assert quiet["status"] == "OFFLINE"
+    assert quiet["connection"] == "stale"
 
     printer._session.push({"print": {"gcode_state": "IDLE", "nozzle_temper": 24.0}})
     clock.advance(15)
     snapshot = printer.snapshot()
 
-    assert snapshot["status"] == "IDLE"
+    assert snapshot["connection"] == "live"
+    assert snapshot["status"] == "PRINTING"
     assert snapshot["nozzle_temper"] == 24.0
-    assert snapshot["progress_percent"] is None            # the stale 47% did not survive
+    assert snapshot["progress_percent"] == 47
 
 
 _FINISHED = {"print": {
@@ -1352,8 +1367,9 @@ _FINISHED = {"print": {
 
 
 def test_a_finished_printer_gone_quiet_reports_offline_without_publishing():
-    """A finished plate that stops talking is OFFLINE. Snapshot must not send a
-    command to keep the last temperatures looking live.
+    """A finished plate that stops talking is OFFLINE and stale: the last
+    temperatures stay on the report, and snapshot does not publish a command
+    to pretend they are a new reading.
     """
     clock = FakeClock()
     printer = _printer([_FINISHED], monotonic=clock.now)
@@ -1366,16 +1382,17 @@ def test_a_finished_printer_gone_quiet_reports_offline_without_publishing():
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["nozzle_temper"] is None
-    assert snapshot["progress_percent"] is None
+    assert snapshot["connection"] == "stale"
+    assert snapshot["nozzle_temper"] == 29.0
+    assert snapshot["progress_percent"] == 100
     assert printer._session.published == before
     assert slept == []
 
 
 def test_silence_on_a_live_socket_reports_offline_without_publishing():
     """Silence longer than the staleness window is OFFLINE even when the socket
-    still looks up. The frozen dump must not be replayed, and snapshot must not
-    publish while it decides that.
+    still looks up. Status stays OFFLINE so the frozen dump is not a live print,
+    and snapshot must not publish while it decides that.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
@@ -1386,7 +1403,8 @@ def test_silence_on_a_live_socket_reports_offline_without_publishing():
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["progress_percent"] is None
+    assert snapshot["connection"] == "stale"
+    assert snapshot["progress_percent"] == 47
     assert printer._session.published == before
 
 

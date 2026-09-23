@@ -233,18 +233,22 @@ def test_printer_state_survives_an_in_place_session_rebuild():
     printer.connect()
     broker.current.fire_connack(0)
     _report(broker.current, {"print": {"gcode_state": "RUNNING", "mc_percent": 10}})
-
-    cached = {"print": {"gcode_state": "RUNNING", "mc_percent": 10}}
-    printer._cached = cached
-    printer._user_cancelled = True
+    # PAUSE does not clear the cancel latch the way RUNNING does. The latch
+    # and the merged percent both have to outlive a same-object client rebuild.
+    _report(broker.current, {
+        "print": {"gcode_state": "PAUSE", "print_error": 50348044, "mc_percent": 10},
+    })
+    assert printer.state.view()["user_cancelled"] is True
     printer._stopwatch._duration_seconds = 90
     printer._stopwatch._source = "bridge"
     stopwatch = printer._stopwatch
 
     printer.rebuild_session()
 
-    assert printer._cached is cached
-    assert printer._user_cancelled is True
+    kept = printer.state.view()
+    assert kept["user_cancelled"] is True
+    assert kept["payload"]["print"]["mc_percent"] == 10
+    assert kept["payload"]["print"]["gcode_state"] == "PAUSE"
     assert printer._stopwatch is stopwatch
     assert printer._stopwatch.duration_seconds == 90
     assert printer._stopwatch.source == "bridge"

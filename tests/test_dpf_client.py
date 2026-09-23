@@ -15,7 +15,13 @@ class _FakeResp:
         return self._json
 
 
-def test_report_state_replays_last_good_snapshots_after_an_outage(monkeypatch):
+def test_report_state_posts_this_pass_after_a_failed_post(monkeypatch):
+    """A failed POST must not make the next success replay the stored batch.
+
+    The next call carries whatever the caller passes now. Replaying the last
+    good snapshots would present a printer that has since gone stale as if
+    that older report were still current.
+    """
     posts = []
 
     def fake_post(self, url, json=None, headers=None):
@@ -27,12 +33,13 @@ def test_report_state_replays_last_good_snapshots_after_an_outage(monkeypatch):
     monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
     monkeypatch.setattr(dpf_mod.time, "sleep", lambda *_a, **_k: None)
     client = DpfClient("https://x", "tok", retries=1)
-    live = [{"bambu_id": "S1", "status": "NEEDS_CLEARING"}]
+    live = [{"bambu_id": "S1", "status": "NEEDS_CLEARING", "connection": "live"}]
+    during_outage = [{"bambu_id": "S1", "status": "OFFLINE", "connection": "stale"}]
+    current = [{"bambu_id": "S1", "status": "PRINTING", "connection": "live"}]
     assert client.report_state(live)
-    assert client.report_state([{"bambu_id": "S1", "status": "OFFLINE"}]) == {}
-    replayed = client.report_state([{"bambu_id": "S1", "status": "OFFLINE"}])
-    assert replayed == {"ok": True}
-    assert posts[-1]["printers"] == live
+    assert client.report_state(during_outage) == {}
+    assert client.report_state(current) == {"ok": True}
+    assert [post["printers"] for post in posts] == [live, during_outage, current]
 
 
 def test_report_state_posts_expected_shape(monkeypatch):

@@ -1,8 +1,9 @@
 """Feed a collected printer log through the current state owner.
 
 The file shape is ``PrinterLog.export()``. ``source`` and ``note`` are
-optional labels and are ignored here. U4 can point ``replay_into_printer``
-at ``state.py`` without rewriting fixtures.
+optional labels and are ignored here. ``replay_into_state`` applies inbound
+messages with ``PrinterState.ingest``. ``replay_into_printer`` still drives
+``BambuPrinter`` and returns ``snapshot()``.
 """
 
 import json
@@ -14,6 +15,29 @@ def load_fixture(path) -> dict:
     if not isinstance(doc, dict):
         raise ValueError("replay fixture must be a JSON object")
     return doc
+
+
+def replay_into_state(state, fixture, now=None) -> None:
+    """Apply inbound messages through ``PrinterState.ingest``.
+
+    Outbound messages are commands, not state. ``now`` stamps each message:
+    a callable is invoked per message, a number is used as-is, and the default
+    lets the state use its own clock.
+    """
+    for message in fixture.get("messages") or []:
+        if not isinstance(message, dict) or message.get("direction") != "in":
+            continue
+        payload = message.get("payload")
+        if not isinstance(payload, dict):
+            continue
+        if callable(now):
+            stamp = now()
+        else:
+            stamp = now
+        if stamp is None:
+            state.ingest(payload)
+        else:
+            state.ingest(payload, stamp)
 
 
 def replay_into_printer(printer, fixture) -> dict:

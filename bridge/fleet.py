@@ -396,13 +396,25 @@ class Fleet:
 
                 "print_duration_seconds": int | None,
                 "print_duration_source": "bridge" | "printer" | None,
+
+                # Separate from status. live = socket up and a report on this
+                # session is inside the staleness window. stale = last telemetry
+                # and last slots, status still OFFLINE. offline = null telemetry
+                # and slots None (not []).
+                "connection": "live" | "stale" | "offline",
+                "last_message_age_seconds": float | None,
+                "connect_error": str | None,          # session down_reason; None when live
+                "session_started_at": str | None,     # ISO-8601 UTC of this CONNACK
             }, ...]
 
-        `bambu_id` / `status` / `slots` are unchanged from the shipped contract, so an
-        older ingest keeps working; everything else is additive and unknown keys are
-        ignored on the far side. A printer that cannot be read reports OFFLINE with null
-        telemetry rather than being omitted — a missing printer and an unreachable one
-        are different facts. See `BambuPrinter.snapshot`.
+        `bambu_id` / `status` keep the shipped mapping, so an older ingest keeps
+        working. `connection` and the stamps beside it are additive; unknown keys
+        are ignored on the far side. `slots: []` still means the printer reported
+        an AMS with no units. `slots: None` means no AMS information — including
+        every `connection: offline` report, which must not be read as an empty AMS.
+        A stale report keeps the last `slots` list. A printer that cannot be read
+        reports OFFLINE with null telemetry rather than being omitted — a missing
+        printer and an unreachable one are different facts. See `BambuPrinter.snapshot`.
         """
         # Membership only. Each snapshot runs outside the lock so one printer's
         # network I/O cannot stall the report for the rest of the fleet.

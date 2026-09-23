@@ -20,6 +20,7 @@ import os
 import ssl
 import threading
 import time
+from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
 
@@ -108,7 +109,8 @@ class LinkSession:
 
     def __init__(self, host: str, access_code: str, serial: str, *,
                  client_factory=None, on_report=None, monotonic=None,
-                 command_probe=None, watchdog_interval=_WATCHDOG_INTERVAL_SECONDS,
+                 wall_clock=None, command_probe=None,
+                 watchdog_interval=_WATCHDOG_INTERVAL_SECONDS,
                  log=None):
         self.host = host
         self.access_code = access_code
@@ -116,6 +118,9 @@ class LinkSession:
         self._on_report = on_report
         self._client_factory = client_factory or build_paho_client
         self._monotonic = monotonic or time.monotonic
+        # Epoch seconds. Separate from the monotonic liveness clock so a test
+        # can freeze silence without freezing the CONNACK's wall time.
+        self._wall_clock = wall_clock or time.time
         self._command_probe = (
             COMMAND_PROBE_ENABLED if command_probe is None else bool(command_probe)
         )
@@ -134,6 +139,10 @@ class LinkSession:
         self._down_reason = None
         self._had_session = False
         self._connack_at = None
+        # Wall time of the current client's successful CONNACK. Cleared when a
+        # replacement client starts, so a reset does not report the previous
+        # handshake as this session.
+        self._session_started_wall = None
         self._socket_down_since = None
         self._last_reset_at = None
         self._probe_seq = 1
@@ -184,6 +193,26 @@ class LinkSession:
     def had_session(self) -> bool:
         """True once any client has received a successful CONNACK. Survives a reset."""
         return self._had_session
+
+    @property
+    def connack_at(self):
+        """Monotonic time of the last successful CONNACK, or None.
+
+        A printer report from before this stamp belongs to the previous client
+        and must not be reported as live.
+        """
+        return self._connack_at
+
+    @property
+    def session_started_at(self):
+        """ISO-8601 UTC of this client's last successful CONNACK, or None."""
+        wall = self._session_started_wall
+        if wall is None:
+            return None
+        text = datetime.fromtimestamp(float(wall), timezone.utc).isoformat()
+        if text.endswith("+00:00"):
+            return text[:-6] + "Z"
+        return text
 
     def silent_for(self, now=None):
         """Seconds since the last report, or since CONNACK if no report has arrived.
@@ -374,6 +403,7 @@ class LinkSession:
             self._client_id = client_id
             self._connected = False
             self._socket_down_since = self._monotonic()
+            self._session_started_wall = None
         self._record_event("connect", host=self.host, client_id=client_id)
         try:
             client.connect_async(self.host, _PORT, keepalive=_KEEPALIVE_SECONDS)
@@ -430,6 +460,7 @@ class LinkSession:
                 self._last_connect_error = None
                 self._had_session = True
                 self._connack_at = self._monotonic()
+                self._session_started_wall = self._wall_clock()
                 self._socket_down_since = None
                 self._auth_retry_not_before = None
             self._state = "connecting"
