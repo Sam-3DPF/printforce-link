@@ -8,7 +8,7 @@ today's sends do not carry an id.
 import json
 import logging
 
-from bridge.bambu.state import PrinterState
+from bridge.bambu.state import LifecycleTracker, PrinterState
 from bridge.router import Dispatcher, Router
 from tests.replay import load_fixture, replay_into_state
 from tests.test_report_contract import _Session, _printer as _contract_printer
@@ -480,6 +480,46 @@ def test_a_finish_repeated_in_the_same_session_emits_once():
     state.ingest(_doc("FINISH", gcode_file="plate.gcode", bed_temper=50.0))
     state.ingest(_doc("FINISH", gcode_file="plate.gcode", bed_temper=40.0))
     assert _types(state.pending_events()) == ["print_started", "print_finished"]
+
+
+def test_a_running_payload_with_a_new_subtask_clears_the_previous_hms():
+    """A start delta omits hms. The previous print's faults must not stay."""
+    state = _state()
+    fault = {"attr": 0x03000100, "code": 0x00010002}
+    state.ingest(_doc("IDLE"))
+    state.ingest(_doc(
+        "RUNNING", subtask_id="1", gcode_file="a.gcode", subtask_name="a",
+        hms=[fault],
+    ))
+    assert state.view()["payload"]["print"]["hms"] == [fault]
+
+    state.ingest(_doc(
+        "RUNNING", subtask_id="2", gcode_file="b.gcode", subtask_name="b",
+    ))
+    assert state.view()["payload"]["print"]["hms"] == []
+
+
+def test_observe_clears_hms_when_the_print_identity_changes():
+    tracker = LifecycleTracker("P1", wall_clock=lambda: _AT)
+    fault = {"attr": 0x03000100, "code": 0x00010002}
+    first = {"print": {
+        "gcode_state": "RUNNING",
+        "subtask_id": "1",
+        "gcode_file": "a.gcode",
+        "hms": [fault],
+    }}
+    tracker.observe(first)
+    assert first["print"]["hms"] == [fault]
+
+    # The merge already kept the previous list because this frame omitted hms.
+    carried = {"print": {
+        "gcode_state": "RUNNING",
+        "subtask_id": "2",
+        "gcode_file": "b.gcode",
+        "hms": [fault],
+    }}
+    tracker.observe(carried)
+    assert carried["print"]["hms"] == []
 
 
 def test_a_user_cancel_that_lands_as_failed_is_a_cancel():
