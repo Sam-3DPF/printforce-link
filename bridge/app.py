@@ -180,6 +180,61 @@ def _start_printhost(cfg: Config, dpf: Optional["DpfClient"] = None) -> Optional
     return router
 
 
+_OFFLINE_DIAGNOSTIC_AFTER_SECONDS = 300.0
+
+
+class _OfflineDiagnosticTrigger:
+    """One automatic diagnostic per offline spell.
+
+    The clock starts the first time a serial is reported OFFLINE. More than
+    five minutes later, one run is queued. Further OFFLINE reports in that
+    spell do not queue another. Any other status clears the spell, so the
+    next long outage can run again. A worker that is already busy is left
+    for this pass: the check waits on the printer, and it is not marked done
+    until a worker actually accepts it.
+    """
+
+    def __init__(self, monotonic=time.monotonic,
+                 offline_after_seconds=_OFFLINE_DIAGNOSTIC_AFTER_SECONDS):
+        self._monotonic = monotonic
+        self._offline_after = float(offline_after_seconds)
+        self._since = {}
+        self._ran = set()
+
+    def consider(self, reports, fleet, dpf) -> None:
+        now = float(self._monotonic())
+        for report in reports or []:
+            if not isinstance(report, dict):
+                continue
+            serial = report.get("bambu_id")
+            if not serial:
+                continue
+            serial = str(serial)
+            if report.get("status") != "OFFLINE":
+                self._since.pop(serial, None)
+                self._ran.discard(serial)
+                continue
+            since = self._since.get(serial)
+            if since is None:
+                self._since[serial] = now
+                continue
+            if serial in self._ran:
+                continue
+            if now - since <= self._offline_after:
+                continue
+            busy = getattr(fleet, "worker_busy", None)
+            if callable(busy) and busy(serial):
+                continue
+            by_id = getattr(fleet, "by_id", None)
+            printer = by_id(serial) if callable(by_id) else None
+            if printer is None:
+                continue
+            if _queue_diagnose(
+                fleet, printer, dpf, serial, None, trigger="auto_offline",
+            ):
+                self._ran.add(serial)
+
+
 def main(config_path: str = "config.toml") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(config_path)
@@ -253,6 +308,7 @@ def main(config_path: str = "config.toml") -> None:
     last_repair_attempt = None
     started_sends = set()
     applied_controls = set()
+    offline_diagnostics = _OfflineDiagnosticTrigger()
     # One readiness object per serial. retain() drops keys this call did not see,
     # so a shared object would forget another printer's legacy-marker observations.
     legacy_marker_readiness = {}
@@ -304,6 +360,9 @@ def main(config_path: str = "config.toml") -> None:
                 router=router, legacy_marker_readiness=legacy_marker_readiness,
                 cloud_send_jobs=cloud_send_jobs,
             )
+            # After sends are queued, so a worker already uploading is skipped
+            # this pass. One run per offline spell, not one per loop.
+            offline_diagnostics.consider(reports, fleet, dpf)
             # After sends are queued: a worker that is mid-upload is busy even
             # while the snapshot still says IDLE, and a restart must not kill it.
             printers_busy = _printers_busy(reports, fleet)
@@ -375,7 +434,9 @@ def main(config_path: str = "config.toml") -> None:
         time.sleep(cfg.state_interval_seconds)
 
 
-_CONTROL_ACTIONS = frozenset({"pause", "resume", "stop", "refresh", "collect_log"})
+_CONTROL_ACTIONS = frozenset({
+    "pause", "resume", "stop", "refresh", "collect_log", "diagnose",
+})
 
 
 def _printers_busy(reports, fleet) -> bool:
@@ -609,6 +670,53 @@ def _queue_collect_log(fleet, printer, dpf, bambu_id: str, control_id: str) -> b
     return _log_upload_accepted(result)
 
 
+def _diagnostic_posted(result) -> bool:
+    return isinstance(result, dict) and bool(result)
+
+
+def _queue_diagnose(fleet, printer, dpf, bambu_id: str, control_id, *, trigger) -> bool:
+    """Run the check off the report loop, then POST it.
+
+    The MQTT windows alone can take 30 seconds. Doing that here would stall
+    every other printer. A queued run counts as applied, the same way
+    collect_log's upload does: this pass must not wait on the printer or on
+    3DPF. No reporter, or an empty response from an inline call, leaves the
+    id unmarked so the next pass retries.
+    """
+    report = getattr(dpf, "report_diagnostic", None) if dpf is not None else None
+    if not callable(report):
+        logger.warning(
+            "printer %s: diagnose has nowhere to report; will retry", bambu_id,
+        )
+        return False
+    diagnose = getattr(printer, "diagnose", None)
+    if not callable(diagnose):
+        logger.warning("printer %s: diagnose is not available", bambu_id)
+        return True
+
+    def _run():
+        return report(bambu_id, diagnose(trigger=trigger), control_id=control_id)
+
+    submit = getattr(fleet, "submit", None)
+    if callable(submit):
+        future = submit(bambu_id, _run)
+        if future is None or future.cancelled():
+            return False
+        if future.done():
+            if future.exception() is not None:
+                return False
+            return _diagnostic_posted(future.result())
+        return True
+    try:
+        result = _run()
+    except Exception:
+        logger.exception(
+            "printer %s: diagnose failed; will retry this control.id", bambu_id,
+        )
+        return False
+    return _diagnostic_posted(result)
+
+
 def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
                    spool_dir: Optional[str], router, dpf=None) -> None:
     control_id = control["id"]
@@ -626,6 +734,11 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
     action = control["action"]
     if action == "collect_log":
         if not _queue_collect_log(fleet, printer, dpf, bambu_id, control_id):
+            return
+    elif action == "diagnose":
+        if not _queue_diagnose(
+            fleet, printer, dpf, bambu_id, control_id, trigger="operator",
+        ):
             return
     else:
         result = None

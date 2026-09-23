@@ -179,6 +179,14 @@ class DpfClient:
             {"log": log, "control_id": control_id},
         )
 
+    def report_diagnostic(self, bambu_id: str, diagnostic: Dict,
+                          control_id: Optional[str] = None) -> Dict:
+        """POST one connection diagnostic. The body is never logged."""
+        return self._post(
+            f"/api/bridge/printers/{bambu_id}/diagnostic",
+            {"diagnostic": diagnostic, "control_id": control_id},
+        )
+
     def report_discovered(self, printers: List[Dict]) -> Dict:
         """Report the LAN printers the bridge currently sees, for the onboarding wizard (U11).
         `printers`: [{"bambu_id", "ip", "model", "name"}, ...] — no access code. Best-effort:

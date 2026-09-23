@@ -25,6 +25,7 @@ from .ams import (
     save_remembered_ams,
 )
 from .bambu.log import PrinterLog
+from .bambu.diagnostic import run_connection_diagnostic
 from .bambu.session import LinkSession
 from .bambu_alerts import describe_hms
 from .coerce import as_float, as_int, clean_str
@@ -681,6 +682,17 @@ class BambuPrinter:
     def collect_log(self) -> Dict:
         """Both rings, oldest first, for the collect_log upload."""
         return self._log.export()
+
+    def diagnose(self, trigger: str = "operator") -> Dict:
+        """Run the connection check against the address this printer is dialing.
+
+        Blocks for up to about half a minute, so callers run it on the printer
+        worker. The access code stays inside this object and the check.
+        """
+        return run_connection_diagnostic(
+            self._ip, self.bambu_id, self._cfg.access_code,
+            printer=self, trigger=trigger,
+        )
 
     def silent_for(self, now=None):
         """Seconds the session has been quiet, for the fleet backstop."""
