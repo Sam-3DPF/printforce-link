@@ -830,6 +830,10 @@ class BambuPrinter:
         """Drop lifecycle events included in a report POST the cloud accepted."""
         self.state.ack_events(ids)
 
+    def emit_recovered(self, kind, submission_id) -> None:
+        """Queue an unobserved link finish. See ``PrinterState.emit_recovered``."""
+        self.state.emit_recovered(kind, submission_id)
+
     def _on_mqtt_report(self, doc) -> None:
         """Ingest one report. Runs on the paho network thread."""
         self._note_session_boundary()
@@ -1009,6 +1013,9 @@ class BambuPrinter:
               "print_duration_source": "bridge" | "printer" | None,
               "events": [lifecycle event, ...],                    # pending until the POST acks
               "print_origin": "link" | "external" | None,          # None when idle or unknown
+              "print_submission_id": str | None,                   # matched Link id; None offline
+              "session_seq": int,                                  # bumps on each CONNACK
+              "session_gcode_seen": bool,                          # this session carried gcode_state
               "local_ip": str | None,                               # address currently dialed
               "connection": "live" | "stale" | "offline",
               "last_message_age_seconds": float | None,             # None if no report yet
@@ -1255,12 +1262,19 @@ class BambuPrinter:
         self._note_offline(reason)
         return self._offline_snapshot(view)
 
-    def _lifecycle_fields(self, view: Optional[Dict]) -> Dict:
+    def _lifecycle_fields(self, view: Optional[Dict], *, connection: str) -> Dict:
         """Pending edges, and who owns the print currently on the machine.
 
         ``events`` is a copy of the unacked queue. The same ids are sent
         again until ``ack_events`` drops them. ``print_origin`` is None when
         the merged state is idle or this session has not seen a print state.
+
+        ``print_submission_id`` is the registered Link id that matched
+        ``subtask_id`` or ``task_id``. The firmware ids themselves stay off
+        the report. An offline report has no current match, so the field is
+        None there even if the retained payload would still classify.
+        ``session_seq`` identifies the CONNACK. ``session_gcode_seen`` is
+        false until a report in this session included ``gcode_state``.
         """
         events = view.get("events") if isinstance(view, dict) else None
         if not isinstance(events, list):
@@ -1268,7 +1282,22 @@ class BambuPrinter:
         origin = view.get("print_origin") if isinstance(view, dict) else None
         if origin not in ("link", "external"):
             origin = None
-        return {"events": events, "print_origin": origin}
+        seq = view.get("session_seq") if isinstance(view, dict) else 0
+        if isinstance(seq, bool) or not isinstance(seq, int):
+            seq = 0
+        seen = isinstance(view, dict) and view.get("session_gcode_seen") is True
+        matched = view.get("print_submission_id") if isinstance(view, dict) else None
+        if connection == "offline" or not isinstance(matched, str) or not matched.strip():
+            matched = None
+        else:
+            matched = matched.strip()
+        return {
+            "events": events,
+            "print_origin": origin,
+            "print_submission_id": matched,
+            "session_seq": seq,
+            "session_gcode_seen": seen,
+        }
 
     def _contract_fields(self, view: Optional[Dict], connection: str) -> Dict:
         message_at = view.get("last_message_monotonic") if isinstance(view, dict) else None
@@ -1327,7 +1356,7 @@ class BambuPrinter:
             "print_duration_source": duration_source,
             "local_ip": self._ip or None,
         }
-        report.update(self._lifecycle_fields(view))
+        report.update(self._lifecycle_fields(view, connection="live"))
         report.update(self._contract_fields(view, "live"))
         return report
 
@@ -1353,7 +1382,7 @@ class BambuPrinter:
             "print_duration_source": duration_source,
             "local_ip": self._ip or None,
         }
-        report.update(self._lifecycle_fields(view))
+        report.update(self._lifecycle_fields(view, connection="stale"))
         report.update(self._contract_fields(view, "stale"))
         return report
 
@@ -1382,7 +1411,7 @@ class BambuPrinter:
             "fault_print_error": None,
             "commands_rejected": None,
         }
-        report.update(self._lifecycle_fields(view))
+        report.update(self._lifecycle_fields(view, connection="offline"))
         report.update(self._contract_fields(view, "offline"))
         return report
 

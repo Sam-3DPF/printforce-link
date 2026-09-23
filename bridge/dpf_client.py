@@ -89,7 +89,14 @@ class DpfClient:
 
     def report_failed(self, batch_id: str, plate_number: Optional[int] = None,
                       reason: Optional[str] = None) -> Dict:
-        """Tell 3DPF a batch's print failed (U12). Idempotent; retried until acked."""
+        """Tell 3DPF a batch's print failed. Idempotent; retried until acked.
+
+        ``reason`` is free text the cloud stores as-is. ``ended_unobserved``
+        means a persisted assignment was still open after a reconnect and the
+        printer's first steady report did not show that print. Link did not
+        see it end; the operator decides what happened. Other reasons are
+        unchanged.
+        """
         return self._post(f"/api/bridge/batches/{batch_id}/failed",
                           {"plate_number": plate_number, "reason": reason})
 

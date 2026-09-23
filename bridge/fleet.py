@@ -402,6 +402,9 @@ class Fleet:
                 "print_duration_source": "bridge" | "printer" | None,
                 "events": [lifecycle event, ...],       # pending until this POST acks
                 "print_origin": "link" | "external" | None,
+                "print_submission_id": str | None,      # matched Link id; None when offline
+                "session_seq": int,                     # bumps on each CONNACK
+                "session_gcode_seen": bool,             # this session carried gcode_state
 
                 # Separate from status. live = socket up and a report on this
                 # session is inside the staleness window. stale = last telemetry
@@ -440,6 +443,19 @@ class Fleet:
         register = getattr(printer, "register_submission", None)
         if callable(register):
             register(submission_id)
+
+    def emit_recovered_event(self, bambu_id: str, kind, submission_id) -> None:
+        """Queue a restart-inferred lifecycle event on one printer.
+
+        Unknown serials are ignored. ``submission_id`` is the id Link stored
+        on the assignment. The printer's task id is not copied onto the event.
+        """
+        printer = self.by_id(bambu_id)
+        if printer is None:
+            return
+        emit = getattr(printer, "emit_recovered", None)
+        if callable(emit):
+            emit(kind, submission_id)
 
     def ack_events(self, acks) -> None:
         """Drop lifecycle event ids whose report POST was accepted.

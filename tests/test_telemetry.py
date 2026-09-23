@@ -282,6 +282,12 @@ def test_snapshot_is_the_full_flat_wire_contract():
         # The print is not one Link submitted.
         "events": [],
         "print_origin": "external",
+        # No registered submission, so the matched id is absent. This printer's
+        # fake session has no CONNACK, so the session token is still 0; the
+        # payload did carry gcode_state.
+        "print_submission_id": None,
+        "session_seq": 0,
+        "session_gcode_seen": True,
     }
 
 

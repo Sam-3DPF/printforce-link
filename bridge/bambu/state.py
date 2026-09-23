@@ -238,6 +238,31 @@ class LifecycleTracker:
 
         self._prev_state = state
 
+    def matched_submission(self, print_obj) -> Optional[str]:
+        """Link submission id matching this print, or None.
+
+        The firmware id is not returned. A report can carry the match because
+        Link generated that id; it still must not carry ``subtask_id`` or
+        ``task_id`` themselves.
+        """
+        if not isinstance(print_obj, dict):
+            return None
+        _origin, token = self._classify(print_obj)
+        return token
+
+    def emit_recovered(self, kind, submission_id, print_obj) -> None:
+        """Queue an edge this session did not see. Caller holds the state lock.
+
+        ``observed`` is false: the printer was already in this state when the
+        session's first real report arrived. ``origin`` is link because
+        ``submission_id`` is one Link stored, not a task id copied off the wire.
+        """
+        token = _id_token(submission_id)
+        if token is None or not isinstance(kind, str) or not kind.strip():
+            return
+        body = print_obj if isinstance(print_obj, dict) else {}
+        self._enqueue(kind.strip(), "link", token, body, observed=False)
+
     def _classify(self, print_obj: dict):
         for key in ("subtask_id", "task_id"):
             token = _id_token(print_obj.get(key))
@@ -245,7 +270,7 @@ class LifecycleTracker:
                 return "link", token
         return "external", None
 
-    def _enqueue(self, kind, origin, submission_id, print_obj) -> None:
+    def _enqueue(self, kind, origin, submission_id, print_obj, *, observed=True) -> None:
         if len(self._events) >= _MAX_LIFECYCLE_EVENTS:
             dropped = self._events.pop(0)
             logger.warning(
@@ -260,7 +285,7 @@ class LifecycleTracker:
             "gcode_file": clean_str(print_obj.get("gcode_file")),
             "subtask_name": clean_str(print_obj.get("subtask_name")),
             "at": _iso_utc(self._wall_clock()),
-            "observed": True,
+            "observed": bool(observed),
         })
 
 
@@ -294,6 +319,12 @@ class PrinterState:
         self._user_cancelled = False
         self._last_print_error = ""
         self._net_info_ips: List[str] = []
+        # Bumped on each CONNACK. 0 means this object has not had a session yet.
+        # The flag stays false until a report in the current session includes
+        # ``gcode_state``. A CONNACK alone does not set it, and a state left
+        # in the merged payload from the previous connection does not either.
+        self._session_seq = 0
+        self._session_gcode_seen = False
 
     def ingest(self, doc, now=None) -> bool:
         """Merge one MQTT document. Returns whether the raw payload changed.
@@ -315,6 +346,7 @@ class PrinterState:
                 self._seed_remembered_ams()
             self._payload = merge_status_payload(self._payload, doc)
             self._note_cancel_edge(self._payload)
+            self._note_session_gcode(doc)
             self._lifecycle.observe(self._payload, user_cancelled=self._user_cancelled)
             fresh = self._note_freshness(doc, now)
             if fresh:
@@ -334,6 +366,9 @@ class PrinterState:
                 "net_info_ips": list(self._net_info_ips),
                 "events": self._lifecycle.copy_events(),
                 "print_origin": self._lifecycle.print_origin,
+                "print_submission_id": self._lifecycle.matched_submission(_print_obj(self._payload)),
+                "session_seq": self._session_seq,
+                "session_gcode_seen": self._session_gcode_seen,
             }
 
     def clear(self) -> None:
@@ -373,9 +408,21 @@ class PrinterState:
             return list(self._net_info_ips)
 
     def new_session(self) -> None:
-        """A new CONNACK. Previous-state knowledge resets; queued events stay."""
+        """A new CONNACK. Previous-state knowledge resets; queued events stay.
+
+        The session token advances and the gcode-seen flag clears. The next
+        decision waits for a report that carries ``gcode_state``; the payload
+        retained from the previous connection is not that report.
+        """
         with self._lock:
+            self._session_seq += 1
+            self._session_gcode_seen = False
             self._lifecycle.new_session()
+
+    def emit_recovered(self, kind, submission_id) -> None:
+        """Queue a lifecycle event for a finish this session did not observe."""
+        with self._lock:
+            self._lifecycle.emit_recovered(kind, submission_id, _print_obj(self._payload))
 
     def register_submission(self, submission_id) -> None:
         """Remember a submission id Link sent to this printer.
@@ -408,6 +455,17 @@ class PrinterState:
             if not isinstance(print_obj, dict) or "gcode_state" not in print_obj:
                 return None
             return print_obj.get("gcode_state"), print_obj.get("gcode_start_time")
+
+    def _note_session_gcode(self, doc) -> None:
+        """Record that this session has seen a report carrying ``gcode_state``.
+
+        Caller holds ``self._lock``. A delta that omits the field does not
+        count, even when the merged payload still has a state from before
+        this CONNACK.
+        """
+        incoming = doc.get("print") if isinstance(doc, dict) else None
+        if isinstance(incoming, dict) and _gcode_state(incoming):
+            self._session_gcode_seen = True
 
     def _remember_net_info(self, doc) -> None:
         """Keep the last explicit interface list. Absence is not an empty list.
@@ -469,6 +527,15 @@ class PrinterState:
         self._last_raw = copy.deepcopy(raw)
         self._last_fresh_monotonic = now
         return True
+
+
+def _print_obj(payload) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    print_obj = payload.get("print")
+    if not isinstance(print_obj, dict):
+        return {}
+    return print_obj
 
 
 def net_info_ips(doc) -> List[str]:
