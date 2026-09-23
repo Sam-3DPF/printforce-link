@@ -1425,46 +1425,8 @@ def _legacy_marker_snapshot_allows_start(snapshot) -> bool:
     )
 
 
-def _leftover_named_file(snapshot: dict) -> bool:
-    if snapshot.get("has_active_file") is True:
-        return True
-    for key in ("gcode_file", "subtask_name", "current_file"):
-        value = snapshot.get(key)
-        if isinstance(value, str) and value.strip():
-            return True
-    return False
-
-
-def _leftover_finished_idle(snapshot) -> bool:
-    if not isinstance(snapshot, dict) or snapshot.get("status") != "IDLE":
-        return False
-    if not _leftover_named_file(snapshot):
-        return False
-    progress = snapshot.get("progress_percent")
-    # 255 is P1 idle "no stage", not leftover-finished. Progress 100 is the plate.
-    return progress == 100
-
-
-def _clear_leftover_finished(fleet, bambu_id: str) -> None:
-    if not _leftover_finished_idle(_live_snapshot(fleet, bambu_id)):
-        return
-    stopper = getattr(fleet, "stop_print", None)
-    if callable(stopper):
-        stopper(bambu_id)
-        return
-    apply_control = getattr(fleet, "apply_control", None)
-    if callable(apply_control):
-        apply_control(bambu_id, "stop")
-        return
-    by_id = getattr(fleet, "by_id", None)
-    printer = by_id(bambu_id) if callable(by_id) else None
-    printer_stop = getattr(printer, "stop_print", None) if printer is not None else None
-    if callable(printer_stop):
-        printer_stop()
-
-
 def _mqtt_start_print(fleet, bambu_id, remote_name, ams_mapping, plate_index):
-    _clear_leftover_finished(fleet, bambu_id)
+    """Publish the start. IDLE, FINISH, and FAILED need no stop first."""
     return fleet.start_print(bambu_id, remote_name, ams_mapping, plate_index)
 
 

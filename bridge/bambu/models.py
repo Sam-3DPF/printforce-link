@@ -6,8 +6,10 @@ shop P1S announces ``C12`` with a serial starting ``01P00``; 3DPF records
 ``C11`` as the P1P (``backend/shared/constants.py`` ``BAMBU_MODEL_CODES``).
 An unknown or missing code uses the P1 profile and is logged once per printer.
 
-``start_url_scheme`` is what Link sends today. The U7 shop check decides
-whether a P1S wants ``ftp://`` instead; change it here, not at the call site.
+``start_url_scheme`` is what a start sends. The shop check that would
+compare ``ftp://`` with ``file:///sdcard/`` on a P1S in FINISH was not run
+from this environment, so the P1 scheme stays ``file:///sdcard/``. Change
+it here, not at the call site.
 """
 
 import logging

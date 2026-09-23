@@ -21,6 +21,12 @@ from .ams import (
     parse_tray_exist_bits,
     save_remembered_ams,
 )
+from .bambu.commands import (
+    build_project_file,
+    fresh_submission_id,
+    gcode_state_of,
+    project_file_refused,
+)
 from .bambu.log import PrinterLog
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.models import ModelProfile, profile_for
@@ -43,7 +49,6 @@ from .bambu_alerts import describe_hms
 from .coerce import as_float, as_int, clean_str
 from .config import PrinterConfig
 from .bambu import ftps
-from .transfer import lan_start_url
 
 logger = logging.getLogger(__name__)
 
@@ -521,6 +526,9 @@ class BambuPrinter:
         )
         # Last commands_rejected answer. None until a payload has been merged.
         self._command_acceptance = None
+        # Last submission id this printer published, so two starts in the
+        # same millisecond still differ.
+        self._last_submission_id = None
 
     @property
     def bambu_id(self) -> str:
@@ -797,24 +805,35 @@ class BambuPrinter:
             logger.debug("printer %s: upload event was not recorded", self.bambu_id)
 
     def start_print(self, remote_name: str, ams_mapping, plate_number: int = 1) -> bool:
-        """MQTT-start a file already on the printer. A True return is not an ack."""
+        """MQTT-start a file already on the printer. A True return is not an ack.
+
+        Refused while the last ``gcode_state`` is PREPARE, SLICING, RUNNING,
+        or PAUSE, including when the session is only stale. IDLE, FINISH, and
+        FAILED publish the file with a fresh submission id and no stop first.
+        """
         if self._session is None:
             raise RuntimeError("printer not connected")
-        url = lan_start_url(remote_name)
-        started = self._publish_command({
-            "print": {
-                "sequence_id": "0",
-                "command": "project_file",
-                "param": f"Metadata/plate_{int(plate_number)}.gcode",
-                "url": url,
-                "subtask_name": remote_name,
-                "use_ams": True,
-                "ams_mapping": list(ams_mapping),
-            },
-        })
-        logger.info("printer %s: started %s (plate %s, ams_mapping=%s, url=%s) -> %s",
-                    self.bambu_id, remote_name, plate_number, list(ams_mapping),
-                    url, started)
+        state = gcode_state_of(self.state.view().get("payload"))
+        if project_file_refused(state):
+            logger.info(
+                "printer %s: refused project_file while %s", self.bambu_id, state,
+            )
+            self._record_command({"print": {"command": "project_file"}}, False)
+            return False
+        submission_id = fresh_submission_id(previous=self._last_submission_id)
+        self._last_submission_id = submission_id
+        payload = build_project_file(
+            remote_name, ams_mapping, plate_number, self.profile, submission_id,
+        )
+        started = self._publish_command(payload)
+        if started:
+            self.register_submission(submission_id)
+        url = payload["print"]["url"]
+        logger.info(
+            "printer %s: started %s (plate %s, ams_mapping=%s, url=%s, submission=%s) -> %s",
+            self.bambu_id, remote_name, plate_number, list(ams_mapping),
+            url, submission_id, started,
+        )
         return bool(started)
 
     def pause_print(self) -> bool:

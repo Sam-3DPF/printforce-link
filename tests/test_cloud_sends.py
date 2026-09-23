@@ -1125,12 +1125,12 @@ def _leftover_finished_snapshot(**overrides):
     return snapshot
 
 
-def test_leftover_finished_idle_stops_before_mqtt_start(tmp_path):
+def test_leftover_finished_idle_starts_without_a_stop(tmp_path):
     fleet = _ConfirmFleet()
     fleet._printer._snapshot = _leftover_finished_snapshot()
     _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
-    assert fleet.stops == ["P1"]
-    assert fleet.commands[:2] == ["stop_print", "start_print"]
+    assert fleet.stops == []
+    assert fleet.commands == ["start_print"]
     assert len(fleet.starts) == 1
 
 
@@ -1147,7 +1147,7 @@ def test_empty_finished_idle_does_not_stop_before_start(tmp_path):
     assert fleet.commands == ["start_print"]
 
 
-def test_idle_retry_stops_leftover_finished_before_second_start(tmp_path):
+def test_idle_retry_does_not_stop_leftover_finished_before_the_second_start(tmp_path):
     clock = _FakeClock()
     fleet = _ConfirmFleet()
     fleet._printer._snapshot = _leftover_finished_snapshot()
@@ -1159,7 +1159,7 @@ def test_idle_retry_stops_leftover_finished_before_second_start(tmp_path):
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
-    assert fleet.stops == ["P1"]
+    assert fleet.stops == []
     assert len(fleet.starts) == 1
 
     clock.advance(20)
@@ -1167,8 +1167,6 @@ def test_idle_retry_stops_leftover_finished_before_second_start(tmp_path):
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
-    assert fleet.stops == ["P1", "P1"]
+    assert fleet.stops == []
     assert len(fleet.starts) == 2
-    assert fleet.commands == [
-        "stop_print", "start_print", "stop_print", "start_print",
-    ]
+    assert fleet.commands == ["start_print", "start_print"]
