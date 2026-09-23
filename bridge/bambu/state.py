@@ -9,11 +9,17 @@ the fleet still proves the serial before it dials one.
 """
 import copy
 import ipaddress
+import logging
 import threading
 import time
+import uuid
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
 from ..ams import load_remembered_ams, merge_ams
+from ..coerce import clean_str
+
+logger = logging.getLogger(__name__)
 
 # User-cancel on a P1S often lands as FAILED plus one of these, not IDLE.
 # 50348044 is print.print_error. The code is gone again in about two seconds,
@@ -21,6 +27,11 @@ from ..ams import load_remembered_ams, merge_ams
 _CANCEL_PRINT_ERRORS = frozenset({"50348044", "0300400C"})
 # Raw firmware labels/codes cross the bridge boundary only in this bounded form.
 _MAX_FIRMWARE_TEXT = 64
+# Unacked lifecycle events and recent submission ids.
+# Older ones drop so a printer that never gets a POST ack cannot grow forever.
+_MAX_LIFECYCLE_EVENTS = 50
+_MAX_REMEMBERED_SUBMISSIONS = 50
+_PREPARE_FAIL_STATES = frozenset({"PREPARE", "SLICING"})
 
 
 def _norm_error_code(value) -> str:
@@ -73,6 +84,196 @@ def merge_status_payload(cached: Optional[dict], incoming: Optional[dict]) -> Di
     return merged
 
 
+def _iso_utc(epoch: float) -> str:
+    text = datetime.fromtimestamp(float(epoch), timezone.utc).isoformat()
+    if text.endswith("+00:00"):
+        return text[:-6] + "Z"
+    return text
+
+
+def _id_token(value) -> Optional[str]:
+    """String form of a Bambu id. Zero and blank are the empty sentinel."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if value == 0:
+            return None
+        return str(value)
+    if isinstance(value, str):
+        text = value.strip()
+        if not text or text == "0":
+            return None
+        return text
+    return None
+
+
+def _gcode_state(print_obj: dict) -> str:
+    state = print_obj.get("gcode_state")
+    if not isinstance(state, str):
+        return ""
+    return state.strip().upper()
+
+
+def _has_file(print_obj: dict) -> bool:
+    return bool(clean_str(print_obj.get("gcode_file")) or clean_str(print_obj.get("subtask_name")))
+
+
+def _print_identity(print_obj: dict) -> Optional[str]:
+    """One print's key. A non-zero subtask or task id wins over the file name.
+
+    With no such id, the file (then the subtask name) is the print. A change
+    of that key while RUNNING is a new print. The same id with a different
+    file string is still the same print: Link cannot watch the P1S request
+    topic, so the id is the only stable ownership key.
+    """
+    sub = _id_token(print_obj.get("subtask_id"))
+    if sub:
+        return "sub:" + sub
+    task = _id_token(print_obj.get("task_id"))
+    if task:
+        return "task:" + task
+    gcode = clean_str(print_obj.get("gcode_file"))
+    if gcode:
+        return "file:" + gcode
+    name = clean_str(print_obj.get("subtask_name"))
+    if name:
+        return "name:" + name
+    return None
+
+
+class LifecycleTracker:
+    """Print edges for one printer, updated under ``PrinterState``'s lock.
+
+    One print is one cycle. It opens on ``print_started`` — RUNNING with a
+    file after a known non-RUNNING state in this session — or silently on the
+    first RUNNING of a session, which is a print already under way. A
+    different print identity while RUNNING opens a new cycle with its own
+    start. PAUSE and back is the same cycle. The cycle closes on exactly one
+    terminal: FINISH or FAILED after RUNNING was seen this session, FAILED
+    straight from PREPARE or SLICING, or IDLE straight from RUNNING
+    (``print_cancelled``; a FAILED that carries the user-cancel latch is a
+    cancel too). A first push has no previous state, so a plate already
+    standing at FINISH does not emit, and a closed cycle cannot close twice.
+
+    Queued events survive ``new_session``: a new CONNACK is not an ack.
+    ``origin`` is ``link`` only when ``subtask_id`` or ``task_id`` equals a
+    submission id ``register_submission`` was given.
+    """
+
+    def __init__(self, bambu_id: str, wall_clock=None):
+        self._bambu_id = bambu_id
+        self._wall_clock = wall_clock or time.time
+        self._events: List[dict] = []
+        self._submissions: Dict[str, None] = {}
+        self._prev_state: Optional[str] = None
+        self._active_identity: Optional[str] = None
+        self._seen_running = False
+        self._print_origin: Optional[str] = None
+
+    def new_session(self) -> None:
+        """Forget this session's previous state. Keep queued events and the open cycle.
+
+        The next report is a first push: a standing FINISH is not an edge,
+        and a standing RUNNING of the open print is not a new start.
+        """
+        self._prev_state = None
+        self._seen_running = False
+        self._print_origin = None
+
+    def register_submission(self, submission_id) -> None:
+        token = _id_token(submission_id)
+        if token is None:
+            return
+        self._submissions.pop(token, None)
+        self._submissions[token] = None
+        while len(self._submissions) > _MAX_REMEMBERED_SUBMISSIONS:
+            self._submissions.pop(next(iter(self._submissions)))
+
+    def ack(self, ids) -> None:
+        """Drop exactly these event ids. Unknown ids are ignored."""
+        if not ids:
+            return
+        wanted = {item for item in ids if isinstance(item, str) and item}
+        if not wanted:
+            return
+        self._events = [event for event in self._events if event.get("id") not in wanted]
+
+    def copy_events(self) -> List[dict]:
+        return copy.deepcopy(self._events)
+
+    @property
+    def print_origin(self) -> Optional[str]:
+        return self._print_origin
+
+    def observe(self, payload, *, user_cancelled: bool = False) -> None:
+        """One merged payload. Caller holds the state lock."""
+        print_obj = payload.get("print") if isinstance(payload, dict) else None
+        if not isinstance(print_obj, dict):
+            return
+        state = _gcode_state(print_obj)
+        if not state:
+            return
+        identity = _print_identity(print_obj)
+        origin, submission_id = self._classify(print_obj)
+        self._print_origin = None if state == "IDLE" else origin
+        prev = self._prev_state
+
+        if state == "RUNNING" and _has_file(print_obj) and identity:
+            if self._active_identity is None:
+                if prev is not None and prev != "RUNNING":
+                    self._enqueue("print_started", origin, submission_id, print_obj)
+                self._active_identity = identity
+            elif identity != self._active_identity:
+                self._enqueue("print_started", origin, submission_id, print_obj)
+                self._active_identity = identity
+
+        terminal = None
+        if state == "FINISH" and (prev == "RUNNING" or self._seen_running):
+            terminal = "print_finished"
+        elif state == "FAILED" and (
+            prev in _PREPARE_FAIL_STATES or prev == "RUNNING" or self._seen_running
+        ):
+            terminal = "print_cancelled" if user_cancelled else "print_failed"
+        elif state == "IDLE" and prev == "RUNNING":
+            terminal = "print_cancelled"
+        if terminal is not None:
+            self._enqueue(terminal, origin, submission_id, print_obj)
+            self._active_identity = None
+            self._seen_running = False
+        elif state == "RUNNING":
+            self._seen_running = True
+        elif state in ("IDLE", "FINISH", "FAILED"):
+            # A standing terminal or idle machine has no print open.
+            self._active_identity = None
+
+        self._prev_state = state
+
+    def _classify(self, print_obj: dict):
+        for key in ("subtask_id", "task_id"):
+            token = _id_token(print_obj.get(key))
+            if token and token in self._submissions:
+                return "link", token
+        return "external", None
+
+    def _enqueue(self, kind, origin, submission_id, print_obj) -> None:
+        if len(self._events) >= _MAX_LIFECYCLE_EVENTS:
+            dropped = self._events.pop(0)
+            logger.warning(
+                "printer %s: lifecycle queue full; dropping oldest event %s",
+                self._bambu_id, dropped.get("id"),
+            )
+        self._events.append({
+            "id": uuid.uuid4().hex,
+            "type": kind,
+            "submission_id": submission_id,
+            "origin": origin,
+            "gcode_file": clean_str(print_obj.get("gcode_file")),
+            "subtask_name": clean_str(print_obj.get("subtask_name")),
+            "at": _iso_utc(self._wall_clock()),
+            "observed": True,
+        })
+
+
 class PrinterState:
     """Merged report for one printer. ``ingest`` runs on the paho thread.
 
@@ -84,10 +285,11 @@ class PrinterState:
     """
 
     def __init__(self, bambu_id: str, ams_cache_path: Optional[str] = None,
-                 monotonic=None):
+                 monotonic=None, wall_clock=None):
         self._bambu_id = bambu_id
         self._ams_cache_path = ams_cache_path
         self._monotonic = monotonic or time.monotonic
+        self._lifecycle = LifecycleTracker(bambu_id, wall_clock=wall_clock)
         self._lock = threading.Lock()
         self._payload: Optional[Dict] = None
         self._pending_fresh = False
@@ -123,6 +325,7 @@ class PrinterState:
                 self._seed_remembered_ams()
             self._payload = merge_status_payload(self._payload, doc)
             self._note_cancel_edge(self._payload)
+            self._lifecycle.observe(self._payload, user_cancelled=self._user_cancelled)
             fresh = self._note_freshness(doc, now)
             if fresh:
                 self._pending_fresh = True
@@ -139,14 +342,18 @@ class PrinterState:
                 "pending_fresh": self._pending_fresh,
                 "user_cancelled": self._user_cancelled,
                 "net_info_ips": list(self._net_info_ips),
+                "events": self._lifecycle.copy_events(),
+                "print_origin": self._lifecycle.print_origin,
             }
 
     def clear(self) -> None:
         """Drop the merged payload and its freshness baseline.
 
-        The cancel latch and the last ``net.info`` list stay. ``reconnect``
-        did not clear those: the latch is about the print, and a missing net
-        block is not evidence the interfaces are gone.
+        The cancel latch, the lifecycle queue, and the last ``net.info`` list
+        stay. ``reconnect`` did not clear the latch: it is about the print,
+        and a missing net block is not evidence the interfaces are gone.
+        Dropping the payload is not an ack of events the report POST has not
+        accepted. ``new_session`` is what forgets the previous gcode state.
         """
         with self._lock:
             self._payload = None
@@ -174,6 +381,43 @@ class PrinterState:
     def address_candidates(self) -> List[str]:
         with self._lock:
             return list(self._net_info_ips)
+
+    def new_session(self) -> None:
+        """A new CONNACK. Previous-state knowledge resets; queued events stay."""
+        with self._lock:
+            self._lifecycle.new_session()
+
+    def register_submission(self, submission_id) -> None:
+        """Remember a submission id Link sent to this printer.
+
+        A later report whose ``subtask_id`` or ``task_id`` equals it is
+        ``origin: link``. Nothing in the send path calls this until that
+        path exists; startup registers ids already stored on assignments.
+        """
+        with self._lock:
+            self._lifecycle.register_submission(submission_id)
+
+    def ack_events(self, ids) -> None:
+        """Drop lifecycle events whose report POST was accepted."""
+        with self._lock:
+            self._lifecycle.ack(ids)
+
+    def pending_events(self) -> List[dict]:
+        with self._lock:
+            return self._lifecycle.copy_events()
+
+    def stopwatch_sample(self):
+        """Merged ``(gcode_state, gcode_start_time)`` for the print stopwatch.
+
+        None when the merged payload has no ``gcode_state``. Observing a
+        missing state would clear a clock the printer did not actually leave.
+        """
+        with self._lock:
+            payload = self._payload if isinstance(self._payload, dict) else None
+            print_obj = payload.get("print") if isinstance(payload, dict) else None
+            if not isinstance(print_obj, dict) or "gcode_state" not in print_obj:
+                return None
+            return print_obj.get("gcode_state"), print_obj.get("gcode_start_time")
 
     def _remember_net_info(self, doc) -> None:
         """Keep the last explicit interface list. Absence is not an empty list.

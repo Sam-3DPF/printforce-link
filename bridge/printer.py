@@ -548,6 +548,9 @@ class BambuPrinter:
         self._stale_after_seconds = stale_after_seconds
 
         self._offline = False                     # for logging the edge, not every poll
+        self._seen_connack_at = None
+        # The stopwatch is fed from the MQTT thread and read from snapshot.
+        self._stopwatch_lock = threading.Lock()
         self._historical_failed_streak = 0
         self._asked_full_status = False
         self._full_status_attempts = 0
@@ -709,6 +712,10 @@ class BambuPrinter:
         target_ip = new_ip or self._ip
         self.disconnect()
         self.state.clear()
+        # A new client is a new session even before its CONNACK. Queued
+        # lifecycle events stay; the payload drop is not an ack.
+        self.state.new_session()
+        self._seen_connack_at = None
         self._historical_failed_streak = 0
         self._last_gcode_state = None
         self._connect(target_ip)
@@ -848,9 +855,52 @@ class BambuPrinter:
         payload = self.state.view()["payload"] or {}
         return not ams_needs_pushall(payload)
 
+    def register_submission(self, submission_id) -> None:
+        """Remember a Link submission id for origin matching on this printer."""
+        self.state.register_submission(submission_id)
+
+    def ack_events(self, ids) -> None:
+        """Drop lifecycle events included in a report POST the cloud accepted."""
+        self.state.ack_events(ids)
+
     def _on_mqtt_report(self, doc) -> None:
         """Ingest one report. Runs on the paho network thread."""
+        self._note_session_boundary()
         self.state.ingest(doc, self._monotonic())
+        self._observe_stopwatch()
+
+    def _note_session_boundary(self) -> None:
+        """A new CONNACK forgets previous-state knowledge, not queued events.
+
+        Compared here because the session object is replaced on reconnect and
+        on an in-place rebuild. The first report after that CONNACK is a
+        first push.
+        """
+        session = self._session
+        connack_at = getattr(session, "connack_at", None) if session is not None else None
+        if connack_at is None or connack_at == self._seen_connack_at:
+            return
+        self._seen_connack_at = connack_at
+        self.state.new_session()
+
+    def _observe_stopwatch(self) -> None:
+        """Feed the stopwatch from the same merged state the edge tracker saw.
+
+        Snapshot does not observe. A poll that builds a stale or offline
+        report must not advance the clock, and a second observe of the state
+        already taken on the MQTT thread would measure the gap between the
+        message and the poll instead of the print.
+        """
+        sample = self.state.stopwatch_sample()
+        if sample is None:
+            return
+        gcode_state, gcode_start_time = sample
+        with self._stopwatch_lock:
+            self._stopwatch.observe(gcode_state, {"gcode_start_time": gcode_start_time})
+
+    def _stopwatch_reading(self):
+        with self._stopwatch_lock:
+            return self._stopwatch.duration_seconds, self._stopwatch.source
 
     def _publish_command(self, payload: dict) -> bool:
         session = self._session
@@ -966,6 +1016,8 @@ class BambuPrinter:
               "historical_failed_ready": bool,                      # separate from status
               "print_duration_seconds": int | None,                # observed, not estimated
               "print_duration_source": "bridge" | "printer" | None,
+              "events": [lifecycle event, ...],                    # pending until the POST acks
+              "print_origin": "link" | "external" | None,          # None when idle or unknown
               "local_ip": str | None,                               # address currently dialed
               "connection": "live" | "stale" | "offline",
               "last_message_age_seconds": float | None,             # None if no report yet
@@ -1196,6 +1248,21 @@ class BambuPrinter:
         self._note_offline(reason)
         return self._offline_snapshot(view)
 
+    def _lifecycle_fields(self, view: Optional[Dict]) -> Dict:
+        """Pending edges, and who owns the print currently on the machine.
+
+        ``events`` is a copy of the unacked queue. The same ids are sent
+        again until ``ack_events`` drops them. ``print_origin`` is None when
+        the merged state is idle or this session has not seen a print state.
+        """
+        events = view.get("events") if isinstance(view, dict) else None
+        if not isinstance(events, list):
+            events = []
+        origin = view.get("print_origin") if isinstance(view, dict) else None
+        if origin not in ("link", "external"):
+            origin = None
+        return {"events": events, "print_origin": origin}
+
     def _contract_fields(self, view: Optional[Dict], connection: str) -> Dict:
         message_at = view.get("last_message_monotonic") if isinstance(view, dict) else None
         age = None
@@ -1217,7 +1284,7 @@ class BambuPrinter:
         if not isinstance(print_obj, dict):
             print_obj = {}
         gcode_state = print_obj.get("gcode_state")
-        self._stopwatch.observe(gcode_state, print_obj)
+        duration_seconds, duration_source = self._stopwatch_reading()
         telemetry = parse_telemetry(payload)
         if fresh and _is_historical_failed_candidate(print_obj, telemetry):
             self._historical_failed_streak += 1
@@ -1249,10 +1316,11 @@ class BambuPrinter:
             # do not meet leftover-idle (file leftover, heat, HMS).
             "historical_failed_ready": self._historical_failed_streak >= 2,
             "user_cancelled": user_cancelled,
-            "print_duration_seconds": self._stopwatch.duration_seconds,
-            "print_duration_source": self._stopwatch.source,
+            "print_duration_seconds": duration_seconds,
+            "print_duration_source": duration_source,
             "local_ip": self._ip or None,
         }
+        report.update(self._lifecycle_fields(view))
         report.update(self._contract_fields(view, "live"))
         return report
 
@@ -1266,6 +1334,7 @@ class BambuPrinter:
         list when it did — not ``[]`` standing in for "we are not looking".
         """
         payload = view.get("payload") or {}
+        duration_seconds, duration_source = self._stopwatch_reading()
         report = {
             "bambu_id": self.bambu_id,
             "status": "OFFLINE",
@@ -1273,10 +1342,11 @@ class BambuPrinter:
             **parse_telemetry(payload),
             "historical_failed_ready": False,
             "user_cancelled": bool(view.get("user_cancelled")),
-            "print_duration_seconds": self._stopwatch.duration_seconds,
-            "print_duration_source": self._stopwatch.source,
+            "print_duration_seconds": duration_seconds,
+            "print_duration_source": duration_source,
             "local_ip": self._ip or None,
         }
+        report.update(self._lifecycle_fields(view))
         report.update(self._contract_fields(view, "stale"))
         return report
 
@@ -1301,6 +1371,7 @@ class BambuPrinter:
             "print_duration_source": None,
             "local_ip": self._ip or None,
         }
+        report.update(self._lifecycle_fields(view))
         report.update(self._contract_fields(view, "offline"))
         return report
 

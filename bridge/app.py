@@ -235,6 +235,64 @@ class _OfflineDiagnosticTrigger:
                 self._ran.add(serial)
 
 
+def _ack_reported_events(fleet, response, reports) -> None:
+    """Drop lifecycle events only after ``report_state`` accepts the POST.
+
+    A failed POST returns an empty dict. The same event ids go out on the
+    next pass. Acking before the accept would lose the edge.
+    """
+    if not isinstance(response, dict) or not response:
+        return
+    ack = getattr(fleet, "ack_events", None)
+    if not callable(ack):
+        return
+    by_printer = {}
+    for report in reports or []:
+        if not isinstance(report, dict):
+            continue
+        bambu_id = report.get("bambu_id")
+        events = report.get("events")
+        if not bambu_id or not isinstance(events, list):
+            continue
+        ids = [
+            event.get("id")
+            for event in events
+            if isinstance(event, dict) and isinstance(event.get("id"), str) and event.get("id")
+        ]
+        if ids:
+            by_printer[bambu_id] = ids
+    if by_printer:
+        ack(by_printer)
+
+
+def _register_persisted_submissions(fleet, router) -> None:
+    """Register submission ids loaded from the assignment file.
+
+    Has to happen before the printer's first report of this process. A
+    finish seen before the id is registered is classified external, and an
+    external finish does not close the batch.
+    """
+    if router is None or fleet is None:
+        return
+    snapshot = getattr(router, "assignments_snapshot", None)
+    register = getattr(fleet, "register_submission", None)
+    if not callable(snapshot) or not callable(register):
+        return
+    try:
+        assignments = snapshot()
+    except Exception:
+        logger.exception("could not read assignments to register submission ids")
+        return
+    if not isinstance(assignments, dict):
+        return
+    for bambu_id, assignment in assignments.items():
+        if not isinstance(assignment, dict):
+            continue
+        submission_id = assignment.get("submission_id")
+        if submission_id:
+            register(bambu_id, submission_id)
+
+
 def main(config_path: str = "config.toml") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(config_path)
@@ -289,20 +347,24 @@ def main(config_path: str = "config.toml") -> None:
     # within two minutes. connect_all can sit on a half-open printer socket for
     # that whole window, so reach 3DPF before connecting printers.
     _confirm_startup_health(dpf, updater)
+    # Print-host accepts OrcaSlicer uploads and forwards them into the cloud
+    # Sliced Queue. Local auto-dispatch is off; start is a cloud send command.
+    # The router is loaded before connect_all so a persisted submission id is
+    # registered before the printer's first report. A finish that arrives
+    # first would otherwise be classified external.
+    router = _start_printhost(cfg, dpf)
+    dispatcher = None
+    if router is not None:
+        dispatcher = Dispatcher(router, fleet, dpf)
+        router.set_submission_registrar(fleet.register_submission)
+        _register_persisted_submissions(fleet, router)
+        logger.info("print-host enabled; %d job(s) restored from the queue",
+                    len(router.pending()))
     fleet.connect_all()
     reconciler = ConfigReconciler(dpf, fleet, store)
     discovery_reporter = DiscoveryReporter(dpf)
     logger.info("%d printer(s) at startup (%d from config.toml, %d from the local store)",
                 len(printer_configs), len(cfg.printers), len(store.configs()))
-
-    # Print-host accepts OrcaSlicer uploads and forwards them into the cloud
-    # Sliced Queue. Local auto-dispatch is off; start is a cloud send command.
-    router = _start_printhost(cfg, dpf)
-    dispatcher = None
-    if router is not None:
-        dispatcher = Dispatcher(router, fleet, dpf)
-        logger.info("print-host enabled; %d job(s) restored from the queue",
-                    len(router.pending()))
 
     last_heartbeat = 0.0
     last_repair_attempt = None
@@ -324,6 +386,8 @@ def main(config_path: str = "config.toml") -> None:
         # this iteration has finished every irreversible printer action and durable marker.
         update_restart_lock.acquire()
         try:
+            if router is not None:
+                _register_persisted_submissions(fleet, router)
             reports = fleet.snapshot()
             wire_reports = (
                 router.annotate_reports(reports)
@@ -335,6 +399,7 @@ def main(config_path: str = "config.toml") -> None:
                 ]
             )
             response = dpf.report_state(wire_reports, link=updater.metadata())
+            _ack_reported_events(fleet, response, wire_reports)
             last_repair_attempt = maybe_repair(
                 dpf,
                 store,

@@ -396,6 +396,8 @@ class Fleet:
 
                 "print_duration_seconds": int | None,
                 "print_duration_source": "bridge" | "printer" | None,
+                "events": [lifecycle event, ...],       # pending until this POST acks
+                "print_origin": "link" | "external" | None,
 
                 # Separate from status. live = socket up and a report on this
                 # session is inside the staleness window. stale = last telemetry
@@ -421,6 +423,36 @@ class Fleet:
         with self._lock:
             printers = list(self._printers)
         return [printer.snapshot() for printer in printers]
+
+    def register_submission(self, bambu_id: str, submission_id) -> None:
+        """Teach one printer a submission id Link already sent it.
+
+        Unknown serials are ignored. The printer may not be in the fleet yet
+        when an assignment is loaded; a later call covers it.
+        """
+        printer = self.by_id(bambu_id)
+        if printer is None:
+            return
+        register = getattr(printer, "register_submission", None)
+        if callable(register):
+            register(submission_id)
+
+    def ack_events(self, acks) -> None:
+        """Drop lifecycle event ids whose report POST was accepted.
+
+        ``acks`` is ``{bambu_id: [event id, ...]}``. A printer that left the
+        fleet keeps nothing to drop. Ids the printer does not have queued
+        are ignored by the printer.
+        """
+        if not isinstance(acks, dict):
+            return
+        for bambu_id, ids in acks.items():
+            printer = self.by_id(bambu_id)
+            if printer is None:
+                continue
+            ack = getattr(printer, "ack_events", None)
+            if callable(ack):
+                ack(ids)
 
     def add_printer(self, cfg: PrinterConfig) -> None:
         """Add a printer to a running fleet without a restart (U2) — the precondition for

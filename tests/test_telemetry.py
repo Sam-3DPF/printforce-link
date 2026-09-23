@@ -274,6 +274,10 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "last_message_age_seconds": 0.0,
         "connect_error": None,
         "session_started_at": None,
+        # First contact is already RUNNING, so there is no start edge.
+        # The print is not one Link submitted.
+        "events": [],
+        "print_origin": "external",
     }
 
 

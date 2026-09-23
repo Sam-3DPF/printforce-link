@@ -17,12 +17,13 @@ def load_fixture(path) -> dict:
     return doc
 
 
-def replay_into_state(state, fixture, now=None) -> None:
+def replay_into_state(state, fixture, now=None) -> list:
     """Apply inbound messages through ``PrinterState.ingest``.
 
-    Outbound messages are commands, not state. ``now`` stamps each message:
-    a callable is invoked per message, a number is used as-is, and the default
-    lets the state use its own clock.
+    Returns the lifecycle events those messages left queued. Outbound
+    messages are commands, not state. ``now`` stamps each message: a callable
+    is invoked per message, a number is used as-is, and the default lets the
+    state use its own clock.
     """
     for message in fixture.get("messages") or []:
         if not isinstance(message, dict) or message.get("direction") != "in":
@@ -38,6 +39,7 @@ def replay_into_state(state, fixture, now=None) -> None:
             state.ingest(payload)
         else:
             state.ingest(payload, stamp)
+    return state.pending_events()
 
 
 def replay_into_printer(printer, fixture) -> dict:
