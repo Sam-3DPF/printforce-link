@@ -23,6 +23,7 @@ from .ams import (
 )
 from .bambu.log import PrinterLog
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
+from .bambu.models import ModelProfile, profile_for
 from .bambu.session import LinkSession
 from .bambu.hms import (
     commands_rejected as hms_commands_rejected,
@@ -607,6 +608,16 @@ class BambuPrinter:
         return proves_serial(
             ip, self.bambu_id, self._cfg.access_code, log=self._log,
         )
+
+    @property
+    def profile(self) -> ModelProfile:
+        """Start-URL and FTPS rules for this printer's model. Unknown is P1."""
+        return profile_for(self._cfg.model, serial=self.bambu_id)
+
+    def set_model(self, model: str) -> None:
+        """Adopt the DevModel code discovery reported for this serial."""
+        if isinstance(model, str) and model.strip():
+            self._cfg.model = model.strip()
 
     def diagnose(self, trigger: str = "operator") -> Dict:
         """Run the connection check against the address this printer is dialing.

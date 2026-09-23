@@ -457,6 +457,19 @@ class Fleet:
         if callable(emit):
             emit(kind, submission_id)
 
+    def set_model(self, bambu_id: str, model: str) -> None:
+        """Hand a discovered DevModel code to the member and its stored config."""
+        if not model:
+            return
+        with self._lock:
+            printer = next((p for p in self._printers if p.bambu_id == bambu_id), None)
+            cfg = self._configs.get(bambu_id)
+            if cfg is not None and cfg.model != model:
+                cfg.model = model
+        setter = getattr(printer, "set_model", None) if printer is not None else None
+        if callable(setter):
+            setter(model)
+
     def ack_events(self, acks) -> None:
         """Drop lifecycle event ids whose report POST was accepted.
 
@@ -768,6 +781,7 @@ class Fleet:
                 ip=new_ip,
                 access_code=cfg.access_code,
                 name=cfg.name,
+                model=cfg.model,
             )
         worker = threading.Thread(
             target=self._run_reconnect,

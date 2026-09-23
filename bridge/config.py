@@ -26,10 +26,11 @@ class PrinterConfig:
     ip: str
     access_code: str   # SECRET
     name: str = ""
+    model: str = ""    # SSDP DevModel.bambu.com code ("C12"); "" until discovery sees it
 
     def __repr__(self) -> str:
         return (f"PrinterConfig(bambu_id={self.bambu_id!r}, ip={self.ip!r}, "
-                f"name={self.name!r}, access_code=***)")
+                f"name={self.name!r}, model={self.model!r}, access_code=***)")
 
 
 @dataclass

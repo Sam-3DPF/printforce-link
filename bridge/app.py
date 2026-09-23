@@ -362,7 +362,15 @@ def main(config_path: str = "config.toml") -> None:
                     len(router.pending()))
     fleet.connect_all()
     reconciler = ConfigReconciler(dpf, fleet, store)
-    discovery_reporter = DiscoveryReporter(dpf)
+    def _remember_models(found) -> None:
+        for printer in found:
+            serial = getattr(printer, "serial", None)
+            model = getattr(printer, "model", None)
+            if serial and model:
+                store.set_model(serial, model)
+                fleet.set_model(serial, model)
+
+    discovery_reporter = DiscoveryReporter(dpf, on_found=_remember_models)
     logger.info("%d printer(s) at startup (%d from config.toml, %d from the local store)",
                 len(printer_configs), len(cfg.printers), len(store.configs()))
 

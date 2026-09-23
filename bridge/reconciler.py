@@ -29,6 +29,22 @@ logger = logging.getLogger(__name__)
 _DEFAULT_RECONCILE_INTERVAL_SECONDS = 60.0
 
 
+def _model_code(entry) -> str:
+    """A DevModel code 3DPF may carry. 3DPF's config pull does not send one yet."""
+    for key in ("model", "model_name"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _stored_model(store, bambu_id: str) -> str:
+    for cfg in store.configs():
+        if cfg.bambu_id == bambu_id:
+            return cfg.model
+    return ""
+
+
 class ConfigReconciler:
     def __init__(self, dpf, fleet, store,
                  interval_seconds: float = _DEFAULT_RECONCILE_INTERVAL_SECONDS,
@@ -84,6 +100,9 @@ class ConfigReconciler:
             if not bambu_id:
                 continue
             local_ip = p.get("local_ip")
+            model = _model_code(p)
+            if model:
+                self._store.set_model(bambu_id, model)
             if not access_code:
                 # Already delivered: 3DPF still sends the pinned local_ip. Apply a
                 # reserved-IP edit without waiting for a new access code or a restart.
@@ -92,6 +111,8 @@ class ConfigReconciler:
             # 1. Durably store the code first — the store is its permanent home, so we
             #    must have written it before ACKing the cloud to delete its copy.
             self._store.upsert(bambu_id, access_code, local_ip)
+            if model:
+                self._store.set_model(bambu_id, model)
             # 2. Push the code into the running fleet so the printer connects without a
             #    restart (U2). The cloud only sends a code while it is UNdelivered, so a code
             #    arriving here for a printer ALREADY in the fleet means the operator
@@ -103,8 +124,10 @@ class ConfigReconciler:
             if local_ip:
                 if self._fleet.by_id(bambu_id) is not None:
                     self._fleet.remove_printer(bambu_id)
-                self._fleet.add_printer(
-                    PrinterConfig(bambu_id=bambu_id, ip=local_ip, access_code=access_code))
+                self._fleet.add_printer(PrinterConfig(
+                    bambu_id=bambu_id, ip=local_ip, access_code=access_code,
+                    model=model or _stored_model(self._store, bambu_id),
+                ))
             # 3. Queue the ACK so the cloud deletes the code.
             printer_id, config_version = p.get("printer_id"), p.get("config_version")
             if printer_id and config_version:
@@ -145,6 +168,7 @@ class ConfigReconciler:
             ip=local_ip,
             access_code=current.access_code,
             name=current.name,
+            model=current.model,
         ))
         logger.info("printer %s moved to reserved/current IP %s (was %s)",
                     bambu_id, local_ip, current.ip)
