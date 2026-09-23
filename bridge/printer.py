@@ -42,7 +42,8 @@ from .bambu.state import (
 from .bambu_alerts import describe_hms
 from .coerce import as_float, as_int, clean_str
 from .config import PrinterConfig
-from .transfer import lan_start_url, store_on_printer
+from .bambu import ftps
+from .transfer import lan_start_url
 
 logger = logging.getLogger(__name__)
 
@@ -748,14 +749,52 @@ class BambuPrinter:
         """FTPS-upload only. Split from start so a live stop can abort after the push.
 
         ``cancel`` is the printer worker's event. The FTPS loop checks it between
-        blocks so removing the printer does not wait out the file.
+        blocks so removing the printer does not wait out the file. ``FtpsError``
+        propagates with its kind so the caller can tell a handshake failure
+        from a storage failure.
         """
         if self._session is None:
             raise RuntimeError("printer not connected")
         name = remote_name or os.path.basename(file_path)
-        store_on_printer(self._ip, self._cfg.access_code, file_path, name, cancel=cancel)
-        logger.info("printer %s: uploaded %s", self.bambu_id, name)
-        return name
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            size = None
+        started = time.monotonic()
+        self._record_upload(phase="start", name=name, bytes=size)
+        outcome = "ok"
+        try:
+            stored = ftps.upload(
+                self._ip, self._cfg.access_code, file_path, name,
+                profile=self.profile, cancel=cancel,
+            )
+        except ftps.UploadCancelled:
+            outcome = "cancelled"
+            raise
+        except ftps.FtpsError as exc:
+            outcome = exc.kind
+            raise
+        except Exception:
+            outcome = "error"
+            raise
+        finally:
+            # PrinterLog uses ``kind`` for the event name and drops a field
+            # with that name, so the outcome is ``result``.
+            self._record_upload(
+                phase="result", result=outcome, name=name, bytes=size,
+                seconds=round(time.monotonic() - started, 3),
+            )
+        logger.info("printer %s: uploaded %s", self.bambu_id, stored)
+        return stored
+
+    def _record_upload(self, **fields) -> None:
+        record = getattr(self._log, "record_event", None)
+        if not callable(record):
+            return
+        try:
+            record("upload", **fields)
+        except Exception:
+            logger.debug("printer %s: upload event was not recorded", self.bambu_id)
 
     def start_print(self, remote_name: str, ams_mapping, plate_number: int = 1) -> bool:
         """MQTT-start a file already on the printer. A True return is not an ack."""

@@ -1,4 +1,4 @@
-"""Link-owned Bambu transport. MQTT lives here; FTPS arrives in a later unit."""
+"""Link-owned Bambu transport. MQTT is ``session``; implicit FTPS is ``ftps``."""
 
 from .session import LinkSession
 
