@@ -24,6 +24,7 @@ from .ams import (
     parse_tray_exist_bits,
     save_remembered_ams,
 )
+from .bambu.log import PrinterLog
 from .bambu.session import LinkSession
 from .bambu_alerts import describe_hms
 from .coerce import as_float, as_int, clean_str
@@ -105,6 +106,17 @@ _MQTT_COMMANDS = {
 
 def _default_session_factory(ip, access_code, serial, on_report):
     return LinkSession(ip, access_code, serial, on_report=on_report)
+
+
+def _mqtt_command_name(payload) -> str:
+    if isinstance(payload, dict):
+        for key in ("print", "pushing", "info"):
+            body = payload.get(key)
+            if isinstance(body, dict):
+                command = body.get("command")
+                if isinstance(command, str) and command.strip():
+                    return command.strip()[:64]
+    return "command"
 
 
 def _norm_error_code(value) -> str:
@@ -564,7 +576,7 @@ class BambuPrinter:
     def __init__(self, cfg: PrinterConfig, stopwatch: Optional[PrintStopwatch] = None,
                  stale_after_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
                  monotonic=time.monotonic, ams_cache_path: Optional[str] = None,
-                 sleep=time.sleep, session_factory=None):
+                 sleep=time.sleep, session_factory=None, log_path=None):
         self._cfg = cfg
         # IP is a cache, the serial (bambu_id) is the identity. Seeded from config, then
         # updated by reconnect() when SSDP finds the serial at a new address (U1) — so a
@@ -610,6 +622,13 @@ class BambuPrinter:
         # snapshot itself does not publish or sleep.
         self._defer = None
         self._deferred_pending = False
+        # One ring for the life of this object. rebuild_session and reconnect
+        # replace the client and keep this log.
+        self._log = PrinterLog(
+            cfg.bambu_id,
+            secrets=(cfg.access_code,) if isinstance(cfg.access_code, str) else (),
+            file_path=log_path,
+        )
 
     @property
     def bambu_id(self) -> str:
@@ -654,6 +673,15 @@ class BambuPrinter:
             return False
         return bool(getattr(session, "had_session", False))
 
+    @property
+    def log(self):
+        """MQTT and session ring for this serial. It outlives the client."""
+        return self._log
+
+    def collect_log(self) -> Dict:
+        """Both rings, oldest first, for the collect_log upload."""
+        return self._log.export()
+
     def silent_for(self, now=None):
         """Seconds the session has been quiet, for the fleet backstop."""
         session = self._session
@@ -677,10 +705,18 @@ class BambuPrinter:
     def connect(self) -> None:
         self._connect(self._ip)
 
-    def _connect(self, ip: str) -> None:
+    def _make_session(self, ip: str):
         session = self._session_factory(
             ip, self._cfg.access_code, self._cfg.bambu_id, self._on_mqtt_report,
         )
+        # Bound before start() so the first connect event lands in the ring.
+        bind = getattr(session, "set_log", None)
+        if callable(bind):
+            bind(self._log)
+        return session
+
+    def _connect(self, ip: str) -> None:
+        session = self._make_session(ip)
         # connect_async returns before the broker answers. Commit the address only
         # after that start did not raise, so a failed dial leaves current_ip alone
         # and reconcile_connections retries instead of treating a client that never
@@ -896,12 +932,27 @@ class BambuPrinter:
 
     def _publish_command(self, payload: dict) -> bool:
         session = self._session
-        if session is None:
-            return False
+        accepted = False
+        if session is not None:
+            try:
+                accepted = bool(session.publish(payload))
+            except Exception:
+                accepted = False
+        self._record_command(payload, accepted)
+        return accepted
+
+    def _record_command(self, payload, accepted: bool) -> None:
+        log = self._log
+        if log is None:
+            return
         try:
-            return bool(session.publish(payload))
+            log.record_event(
+                "command",
+                name=_mqtt_command_name(payload),
+                accepted=bool(accepted),
+            )
         except Exception:
-            return False
+            logger.debug("printer %s: command was not recorded", self.bambu_id)
 
     def _request_idle_rfid(self) -> bool:
         """`ams_get_rfid` is the printer command HA uses to read one P1 tray."""

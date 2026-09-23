@@ -209,10 +209,16 @@ def main(config_path: str = "config.toml") -> None:
     # store (U4) — the store is how the onboarding wizard's printers reach the bridge
     # without a file edit. On restart the store re-connects everything already onboarded.
     printer_configs = _merge_printer_configs(cfg.printers, store.configs())
-    ams_cache_path = os.path.join(os.path.dirname(os.path.abspath(config_path)) or ".", "ams-cache.json")
+    config_dir = os.path.dirname(os.path.abspath(config_path)) or "."
+    ams_cache_path = os.path.join(config_dir, "ams-cache.json")
+    log_dir = os.path.join(config_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
 
     def make_printer(printer_cfg, stale_after_seconds=None):
-        kwargs = {"ams_cache_path": ams_cache_path}
+        kwargs = {
+            "ams_cache_path": ams_cache_path,
+            "log_path": _printer_log_path(log_dir, printer_cfg.bambu_id),
+        }
         if stale_after_seconds is not None:
             kwargs["stale_after_seconds"] = stale_after_seconds
         return BambuPrinter(printer_cfg, **kwargs)
@@ -369,7 +375,7 @@ def main(config_path: str = "config.toml") -> None:
         time.sleep(cfg.state_interval_seconds)
 
 
-_CONTROL_ACTIONS = frozenset({"pause", "resume", "stop", "refresh"})
+_CONTROL_ACTIONS = frozenset({"pause", "resume", "stop", "refresh", "collect_log"})
 
 
 def _printers_busy(reports, fleet) -> bool:
@@ -430,7 +436,7 @@ def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
     queued or running is left for the next pass instead of being queued twice.
     Fakes without ``submit`` keep the single inline call.
     """
-    _handle_desired(desired, fleet, applied_controls, spool_dir, router=router)
+    _handle_desired(desired, fleet, applied_controls, spool_dir, router=router, dpf=dpf)
     submit = getattr(fleet, "submit", None)
     if not callable(submit):
         _handle_cloud_sends(
@@ -521,7 +527,7 @@ def _authorized_send(desired: List[Dict], bambu_id: str, batch_id: str,
 
 
 def _handle_desired(desired: List[Dict], fleet=None, applied_controls=None,
-                    spool_dir: Optional[str] = None, router=None) -> None:
+                    spool_dir: Optional[str] = None, router=None, dpf=None) -> None:
     """Act on the authoritative desired-state 3DPF returns.
 
     `control` is one-shot: the same id is published once, then remembered like
@@ -539,11 +545,72 @@ def _handle_desired(desired: List[Dict], fleet=None, applied_controls=None,
         bambu_id = row.get("bambu_id")
         if control is None or not bambu_id:
             continue
-        _apply_control(fleet, str(bambu_id), control, applied_controls, spool_dir, router)
+        _apply_control(
+            fleet, str(bambu_id), control, applied_controls, spool_dir, router, dpf=dpf,
+        )
+
+
+def _printer_log_path(log_dir: str, serial: str) -> str:
+    """One jsonl file per serial. The serial is a path segment, so it is sanitized."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(serial))[:128] or "printer"
+    return os.path.join(log_dir, f"printer-{safe}.jsonl")
+
+
+def _log_upload_accepted(result) -> bool:
+    return isinstance(result, dict) and bool(result)
+
+
+def _queue_collect_log(fleet, printer, dpf, bambu_id: str, control_id: str) -> bool:
+    """Upload off the report loop.
+
+    A queued POST counts as applied, the same way refresh does: this pass must
+    not wait on 3DPF. A printer with no ``collect_log`` is a no-op. No uploader,
+    or an empty response, leaves the id unmarked so the next pass retries.
+    """
+    collect = getattr(printer, "collect_log", None)
+    if not callable(collect):
+        logger.warning("printer %s: collect_log is not available", bambu_id)
+        return True
+    try:
+        payload = collect()
+    except Exception:
+        logger.exception(
+            "printer %s: collect_log failed; will retry this control.id", bambu_id,
+        )
+        return False
+    upload = getattr(dpf, "upload_printer_log", None) if dpf is not None else None
+    if not callable(upload):
+        logger.warning(
+            "printer %s: collect_log has nowhere to upload; will retry", bambu_id,
+        )
+        return False
+
+    def _send():
+        return upload(bambu_id, payload, control_id=control_id)
+
+    submit = getattr(fleet, "submit", None)
+    if callable(submit):
+        future = submit(bambu_id, _send)
+        if future is None or future.cancelled():
+            return False
+        if future.done():
+            if future.exception() is not None:
+                return False
+            return _log_upload_accepted(future.result())
+        return True
+    try:
+        result = _send()
+    except Exception:
+        logger.exception(
+            "printer %s: collect_log upload failed; will retry this control.id",
+            bambu_id,
+        )
+        return False
+    return _log_upload_accepted(result)
 
 
 def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
-                   spool_dir: Optional[str], router) -> None:
+                   spool_dir: Optional[str], router, dpf=None) -> None:
     control_id = control["id"]
     marker = (
         os.path.join(spool_dir, f"control-{control_id}.applied")
@@ -557,36 +624,40 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
         logger.warning("control %s for unknown printer %s", control["action"], bambu_id)
         return
     action = control["action"]
-    result = None
-    try:
-        if callable(getattr(fleet, "apply_control", None)):
-            result = fleet.apply_control(bambu_id, action)
-        elif action == "pause":
-            result = printer.pause_print()
-        elif action == "resume":
-            result = (
-                printer.resume_from_stage()
-                if hasattr(printer, "resume_from_stage")
-                else printer.resume_print()
-            )
-        elif action == "stop":
-            result = printer.stop_print()
-        elif action == "refresh":
-            result = (
-                printer.request_full_status()
-                if hasattr(printer, "request_full_status")
-                else False
-            )
-    except Exception:
-        logger.exception("printer %s: %s failed; will retry this control.id",
-                         bambu_id, action)
-        return
-    if result is False:
-        logger.warning("printer %s: %s was not published; will retry this control.id",
-                       bambu_id, action)
-        return
-    if action == "stop" and router is not None and hasattr(router, "clear_assignment"):
-        router.clear_assignment(bambu_id)
+    if action == "collect_log":
+        if not _queue_collect_log(fleet, printer, dpf, bambu_id, control_id):
+            return
+    else:
+        result = None
+        try:
+            if callable(getattr(fleet, "apply_control", None)):
+                result = fleet.apply_control(bambu_id, action)
+            elif action == "pause":
+                result = printer.pause_print()
+            elif action == "resume":
+                result = (
+                    printer.resume_from_stage()
+                    if hasattr(printer, "resume_from_stage")
+                    else printer.resume_print()
+                )
+            elif action == "stop":
+                result = printer.stop_print()
+            elif action == "refresh":
+                result = (
+                    printer.request_full_status()
+                    if hasattr(printer, "request_full_status")
+                    else False
+                )
+        except Exception:
+            logger.exception("printer %s: %s failed; will retry this control.id",
+                             bambu_id, action)
+            return
+        if result is False:
+            logger.warning("printer %s: %s was not published; will retry this control.id",
+                           bambu_id, action)
+            return
+        if action == "stop" and router is not None and hasattr(router, "clear_assignment"):
+            router.clear_assignment(bambu_id)
     applied_controls.add(control_id)
     if marker:
         try:

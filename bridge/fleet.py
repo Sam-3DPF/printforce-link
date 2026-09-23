@@ -60,6 +60,21 @@ def _printer_had_session(printer) -> bool:
     return bool(value)
 
 
+def _note_backstop(printer) -> None:
+    """The session cannot see this rebuild. Fakes have no log."""
+    log = getattr(printer, "log", None)
+    record = getattr(log, "record_event", None)
+    if not callable(record):
+        return
+    try:
+        record("backstop")
+    except Exception:
+        logger.debug(
+            "printer %s: could not record the backstop",
+            getattr(printer, "bambu_id", "?"),
+        )
+
+
 def _printer_silent_for(printer, now):
     fn = getattr(printer, "silent_for", None)
     if not callable(fn):
@@ -510,6 +525,7 @@ class Fleet:
                 bambu_id,
             )
             printer.rebuild_session()
+            _note_backstop(printer)
         except Exception as exc:
             logger.warning(
                 "printer %s session rebuild failed (%s)",

@@ -1,4 +1,6 @@
 """One-shot pause / resume / stop on desired-state (U3)."""
+import logging
+import threading
 import time
 
 from bridge.app import _handle_desired
@@ -233,6 +235,142 @@ def test_start_print_uses_p1_sdcard_url():
     payload = printer._session.payloads[0]["print"]
     assert payload["command"] == "project_file"
     assert payload["url"] == "file:///sdcard/batch-a.3mf"
+
+
+def test_collect_log_uploads_inline_when_the_fleet_has_no_worker(tmp_path):
+    seen = []
+
+    class _Printer(_FakePrinter):
+        def collect_log(self):
+            return {"serial": "P1", "messages": [], "events": [{"kind": "connect"}]}
+
+    class _Dpf:
+        def upload_printer_log(self, bambu_id, log, control_id=None):
+            seen.append((bambu_id, log, control_id))
+            return {"stored": 1}
+
+    printer = _Printer()
+    dpf = _Dpf()
+    applied = set()
+    _handle_desired(
+        _desired("collect_log"), _ControlFleet(printer), applied, str(tmp_path), dpf=dpf,
+    )
+    _handle_desired(
+        _desired("collect_log"), _ControlFleet(printer), applied, str(tmp_path), dpf=dpf,
+    )
+    assert seen == [("P1", {"serial": "P1", "messages": [], "events": [{"kind": "connect"}]}, "c1")]
+    assert applied == {"c1"}
+    assert (tmp_path / "control-c1.applied").exists()
+
+
+def test_collect_log_uploads_off_the_report_loop(tmp_path):
+    started = threading.Event()
+    release = threading.Event()
+    uploads = []
+    result = {}
+
+    class _Printer(_FakePrinter):
+        def collect_log(self):
+            return {"serial": "P1", "messages": [{"direction": "in"}], "events": []}
+
+    class _Dpf:
+        def upload_printer_log(self, bambu_id, log, control_id=None):
+            uploads.append((threading.get_ident(), bambu_id, log, control_id))
+            started.set()
+            release.wait(2.0)
+            return {"ok": True}
+
+    printer = _Printer()
+    cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
+    fleet = Fleet(
+        [cfg],
+        printer_factory=lambda _cfg, stale_after_seconds=None: printer,
+        discover_fn=lambda _timeout: [],
+    )
+
+    def run():
+        result["loop"] = threading.get_ident()
+        _handle_desired(
+            _desired("collect_log"),
+            fleet,
+            result.setdefault("applied", set()),
+            str(tmp_path),
+            dpf=_Dpf(),
+        )
+        result["done"] = True
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    try:
+        assert started.wait(1.0)
+        deadline = time.monotonic() + 1.0
+        while result.get("done") is not True and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert result.get("done") is True
+        assert not release.is_set()
+        assert (tmp_path / "control-c1.applied").exists()
+    finally:
+        release.set()
+        thread.join(2.0)
+    assert not thread.is_alive()
+    assert uploads
+    assert uploads[0][0] != result["loop"]
+    assert uploads[0][1:] == (
+        "P1",
+        {"serial": "P1", "messages": [{"direction": "in"}], "events": []},
+        "c1",
+    )
+
+
+def test_collect_log_is_retried_when_the_upload_returns_nothing(tmp_path):
+    calls = {"n": 0}
+
+    class _Printer(_FakePrinter):
+        def collect_log(self):
+            return {"serial": "P1", "messages": [], "events": []}
+
+    class _Dpf:
+        def upload_printer_log(self, bambu_id, log, control_id=None):
+            calls["n"] += 1
+            return {}
+
+    printer = _Printer()
+    applied = set()
+    desired = _desired("collect_log")
+    _handle_desired(desired, _ControlFleet(printer), applied, str(tmp_path), dpf=_Dpf())
+    _handle_desired(desired, _ControlFleet(printer), applied, str(tmp_path), dpf=_Dpf())
+    assert calls["n"] == 2
+    assert applied == set()
+    assert not (tmp_path / "control-c1.applied").exists()
+
+
+def test_collect_log_without_the_method_warns_and_is_consumed(tmp_path, caplog):
+    printer = _FakePrinter()
+    applied = set()
+    with caplog.at_level(logging.WARNING, logger="bridge.app"):
+        _handle_desired(
+            _desired("collect_log"), _ControlFleet(printer), applied, str(tmp_path), dpf=object(),
+        )
+    assert printer.calls == []
+    assert "collect_log" in caplog.text
+    assert applied == {"c1"}
+    assert (tmp_path / "control-c1.applied").exists()
+
+
+def test_collect_log_without_an_uploader_is_not_marked(tmp_path, caplog):
+    class _Printer(_FakePrinter):
+        def collect_log(self):
+            return {"serial": "P1", "messages": [], "events": []}
+
+    printer = _Printer()
+    applied = set()
+    with caplog.at_level(logging.WARNING, logger="bridge.app"):
+        _handle_desired(
+            _desired("collect_log"), _ControlFleet(printer), applied, str(tmp_path),
+        )
+    assert applied == set()
+    assert not (tmp_path / "control-c1.applied").exists()
+    assert "collect_log" in caplog.text
 
 
 def test_resume_from_stage_on_real_printer_wrapper():

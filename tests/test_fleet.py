@@ -949,6 +949,30 @@ def test_backstop_leaves_a_printer_that_never_had_a_session():
     assert fleet.by_id("S1") is printer
 
 
+def test_backstop_records_an_event_on_the_printer_log():
+    clock = Clock(5000.0)
+    events = []
+
+    class _Log:
+        def record_event(self, kind, **fields):
+            events.append((kind, fields))
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        clock=clock,
+        tcp_probe=lambda _ip: True,
+    )
+    printer = fleet.by_id("S1")
+    printer.had_session = True
+    printer.silent_seconds = 301
+    printer.log = _Log()
+    clock.t = 5000.0 + 60
+    fleet.recover_dead_sessions()
+    assert _wait_for(lambda: events == [("backstop", {})])
+    assert printer.rebuild_calls == 1
+    assert fleet.by_id("S1") is printer
+
+
 def test_backstop_returns_without_waiting_on_the_tcp_probe():
     clock = Clock(9000.0)
     started = threading.Event()

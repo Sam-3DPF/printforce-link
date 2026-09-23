@@ -108,7 +108,8 @@ class LinkSession:
 
     def __init__(self, host: str, access_code: str, serial: str, *,
                  client_factory=None, on_report=None, monotonic=None,
-                 command_probe=None, watchdog_interval=_WATCHDOG_INTERVAL_SECONDS):
+                 command_probe=None, watchdog_interval=_WATCHDOG_INTERVAL_SECONDS,
+                 log=None):
         self.host = host
         self.access_code = access_code
         self.serial = serial
@@ -120,6 +121,8 @@ class LinkSession:
         )
         # None keeps the thread off so a test can call tick() on its own clock.
         self._watchdog_interval = watchdog_interval
+        # The printer owns the ring. A reset builds a new client, not a new log.
+        self._log = log
         self._lock = threading.Lock()
         self._reset_lock = threading.Lock()
         self._client = None
@@ -204,6 +207,31 @@ class LinkSession:
         stamps = [t for t in (self._last_message_at, self._connack_at) if t is not None]
         return max(stamps) if stamps else None
 
+    def set_log(self, log) -> None:
+        """Attach the printer-owned ring. Reconnect must not start a second one."""
+        self._log = log
+
+    def _record_event(self, kind, **fields) -> None:
+        log = self._log
+        if log is None:
+            return
+        try:
+            log.record_event(kind, **fields)
+        except Exception:
+            logger.debug("printer %s: session event was not recorded", self.serial)
+
+    def _record_message(self, direction, topic, payload, *, accepted=None) -> None:
+        log = self._log
+        if log is None:
+            return
+        try:
+            if accepted is None:
+                log.record_message(direction, topic, payload)
+            else:
+                log.record_message(direction, topic, payload, accepted=accepted)
+        except Exception:
+            logger.debug("printer %s: session message was not recorded", self.serial)
+
     def start(self) -> None:
         """Begin connecting. Returns as soon as the network loop is running."""
         self._user_stopped = False
@@ -225,6 +253,7 @@ class LinkSession:
             if self._user_stopped:
                 return
             preserve_auth = keep_reason == "auth_rejected"
+            self._record_event("reset", reason=keep_reason)
             self._stop()
             self._last_reset_at = self._monotonic()
             self._state = "connecting"
@@ -263,6 +292,7 @@ class LinkSession:
                 self._auth_retry_not_before = now + _AUTH_RETRY_SECONDS
             if now >= self._auth_retry_not_before and self._reset_allowed(now):
                 self._auth_retry_not_before = now + _AUTH_RETRY_SECONDS
+                self._record_event("auth_retry")
                 self.hard_reset(keep_reason="auth_rejected")
             return
 
@@ -288,6 +318,8 @@ class LinkSession:
 
         anchor = self._silence_anchor()
         if anchor is not None and now - anchor > _STALE_AFTER_SECONDS:
+            if self._state != "stale":
+                self._record_event("stale")
             self._state = "stale"
             self._down_reason = "silent_session"
             if self._reset_allowed(now):
@@ -310,6 +342,7 @@ class LinkSession:
         self._outstanding = (seq, now)
         self._last_probe_seq = seq
         self._next_probe_at = now + _PROBE_INTERVAL_SECONDS
+        self._record_event("probe_sent", sequence_id=seq)
         return seq
 
     def publish(self, payload: dict) -> bool:
@@ -321,12 +354,16 @@ class LinkSession:
             client = self._client
             connected = self._connected
         if not connected or client is None:
+            self._record_message("out", self._request_topic, payload, accepted=False)
             return False
         try:
             info = client.publish(self._request_topic, json.dumps(payload), qos=_QOS)
         except Exception:
+            self._record_message("out", self._request_topic, payload, accepted=False)
             return False
-        return _publish_accepted(info)
+        accepted = _publish_accepted(info)
+        self._record_message("out", self._request_topic, payload, accepted=accepted)
+        return accepted
 
     def _open(self) -> None:
         client_id = _next_client_id(self.serial)
@@ -337,6 +374,7 @@ class LinkSession:
             self._client_id = client_id
             self._connected = False
             self._socket_down_since = self._monotonic()
+        self._record_event("connect", host=self.host, client_id=client_id)
         try:
             client.connect_async(self.host, _PORT, keepalive=_KEEPALIVE_SECONDS)
             client.loop_start()
@@ -396,6 +434,7 @@ class LinkSession:
                 self._auth_retry_not_before = None
             self._state = "connecting"
             self._down_reason = None
+            self._record_event("connack", result="ok", code=code)
             try:
                 client.subscribe(self._report_topic, qos=_QOS)
             except Exception:
@@ -404,10 +443,12 @@ class LinkSession:
             self.publish({"info": {"sequence_id": "0", "command": "get_version"}})
             return
         rejected = code in _AUTH_REJECTED
+        reason = "auth_rejected" if rejected else "refused"
         with self._lock:
             self._connected = False
-            self._last_connect_error = "auth_rejected" if rejected else "refused"
+            self._last_connect_error = reason
         self._down_reason = self._last_connect_error
+        self._record_event("connack", result=reason, code=code)
         self._state = "connecting"
         if rejected:
             # paho would redial in 1–30s. An off printer refuses this way too,
@@ -430,6 +471,7 @@ class LinkSession:
         doc = _parse_report(getattr(msg, "payload", None))
         if doc is None:
             return
+        self._record_message("in", topic or self._report_topic, doc)
         now = self._monotonic()
         self._last_message_at = now
         self._note_probe_reply(doc)
@@ -446,7 +488,9 @@ class LinkSession:
         if client is not self._client:
             return
         code = _reason_value(reason_code)
-        if code == 0 and self._report_is_recent():
+        ignored = code == 0 and self._report_is_recent()
+        self._record_event("disconnect", code=code, ignored=bool(ignored))
+        if ignored:
             return
         with self._lock:
             if self._client is client:
@@ -512,6 +556,7 @@ class LinkSession:
             if now - sent >= _PROBE_TIMEOUT_SECONDS:
                 self._outstanding = None
                 self._probe_misses += 1
+                self._record_event("probe_miss", count=self._probe_misses)
                 if self._probe_misses >= 2:
                     self._state = "commands_ignored"
                     self._down_reason = "commands_ignored"
@@ -540,16 +585,19 @@ class LinkSession:
         if sequence in (None, ""):
             self._outstanding = None
             self._probe_misses = 0
+            self._record_event("probe_answered", sequence_id=None)
             return
         seq = str(sequence)
         outstanding = self._outstanding
         if outstanding is not None and seq == outstanding[0]:
             self._outstanding = None
             self._probe_misses = 0
+            self._record_event("probe_answered", sequence_id=seq)
             return
         if seq == self._last_probe_seq:
             self._outstanding = None
             self._probe_misses = 0
+            self._record_event("probe_answered", sequence_id=seq)
 
     def _report_is_recent(self) -> bool:
         last = self._last_message_at

@@ -329,6 +329,24 @@ def test_download_url_writes_dest(tmp_path, monkeypatch):
         assert handle.read() == b"abcdef"
 
 
+def test_upload_printer_log_posts_the_buffer(monkeypatch):
+    captured = {}
+
+    def fake_post(self, url, json=None, headers=None):
+        captured.update(url=url, json=json, headers=headers)
+        return _FakeResp(200, {"data": {"ok": True}})
+
+    monkeypatch.setattr(dpf_mod.httpx.Client, "post", fake_post)
+    client = DpfClient("https://app.3dprintforce.com", "tok")
+    body = {"serial": "S1", "messages": [{"direction": "in"}], "events": []}
+
+    assert client.upload_printer_log("S1", body, control_id="c9") == {"ok": True}
+    assert captured["url"] == "https://app.3dprintforce.com/api/bridge/printers/S1/log"
+    assert captured["json"] == {"log": body, "control_id": "c9"}
+    assert captured["headers"]["Authorization"] == "Bearer tok"
+    assert "S1" not in str(captured["headers"])
+
+
 def test_download_url_empty_is_false():
     client = DpfClient("https://app.3dprintforce.com", "tok")
     assert client.download_url("", "/tmp/x") is False

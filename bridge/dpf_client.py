@@ -172,6 +172,13 @@ class DpfClient:
             logger.warning("download of send file failed: %s", type(e).__name__)
             return False
 
+    def upload_printer_log(self, bambu_id: str, log: Dict, control_id: Optional[str] = None) -> Dict:
+        """POST one printer's ring. The body is never logged."""
+        return self._post(
+            f"/api/bridge/printers/{bambu_id}/log",
+            {"log": log, "control_id": control_id},
+        )
+
     def report_discovered(self, printers: List[Dict]) -> Dict:
         """Report the LAN printers the bridge currently sees, for the onboarding wizard (U11).
         `printers`: [{"bambu_id", "ip", "model", "name"}, ...] — no access code. Best-effort:
