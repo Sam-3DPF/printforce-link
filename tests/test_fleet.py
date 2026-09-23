@@ -12,6 +12,14 @@ from bridge.discover import DiscoveredPrinter
 from bridge.fleet import Fleet
 
 
+class _EventLog:
+    def __init__(self):
+        self.events = []
+
+    def record_event(self, kind, **fields):
+        self.events.append((kind, dict(fields)))
+
+
 class FakePrinter:
     """Stand-in for BambuPrinter with the surface the Fleet uses."""
 
@@ -27,6 +35,20 @@ class FakePrinter:
         self.disconnect_calls = 0
         self.reconnects = []            # new_ip passed to each reconnect()
         self.connect_hook = connect_hook
+        self.address_candidate_ips = []
+        self.proofs = []
+        self.proof_result = True
+        self.proof_hook = None
+        self.log = _EventLog()
+
+    def address_candidates(self):
+        return list(self.address_candidate_ips)
+
+    def proves_serial_at(self, ip):
+        self.proofs.append(ip)
+        if self.proof_hook is not None:
+            return self.proof_hook(ip)
+        return self.proof_result
 
     def connect(self):
         self.connect_calls += 1
@@ -92,15 +114,17 @@ def _fleet(configs, discovered=None, clock=None, rediscover_interval=60.0,
         return list(discovered() if callable(discovered) else (discovered or []))
 
     clock = clock or Clock()
-    extra = {}
-    if tcp_probe is not None:
-        extra["tcp_probe"] = tcp_probe
+    # A stored address that refuses 8883 is the case the older swap tests cover.
+    # An answering port is opted in per test. No test opens a real socket.
+    if tcp_probe is None:
+        def tcp_probe(_ip):
+            return False
     fleet = Fleet(configs, printer_factory=printer_factory or FakePrinter,
                   discover_fn=discover_fn,
                   rediscover_interval_seconds=rediscover_interval, monotonic=clock,
                   on_address=on_address,
                   connect_timeout_seconds=connect_timeout_seconds,
-                  **extra)
+                  tcp_probe=tcp_probe)
     return fleet, calls, clock
 
 
@@ -253,6 +277,7 @@ def test_stale_ip_reconnects_when_reserved_address_is_on_a_known_lan():
         printer_factory=factory,
         discover_fn=discover_fn,
         monotonic=Clock(),
+        tcp_probe=lambda _ip: False,
     )
     old = fleet.by_id("S5")
     old.is_offline = True
@@ -1000,3 +1025,280 @@ def test_backstop_returns_without_waiting_on_the_tcp_probe():
         assert printer.rebuild_calls == 0
     finally:
         release.set()
+
+
+# ---- U10: address policy -----------------------------------------------------------
+
+def _events(printer, kind):
+    return [fields for name, fields in printer.log.events if name == kind]
+
+
+def test_answering_stored_ip_is_kept_when_ssdp_sees_another_address():
+    # DHCP noise must not move a printer whose MQTT port still accepts.
+    remembered = []
+    probes = []
+
+    def tcp_probe(ip):
+        probes.append(ip)
+        return True
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        tcp_probe=tcp_probe,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: _events(old, "address_kept") == [{
+        "ip": "192.168.1.10",
+        "candidate": "192.168.1.55",
+        "source": "ssdp",
+    }])
+    assert probes == ["192.168.1.10"]
+    assert fleet.by_id("S1") is old
+    assert old.current_ip == "192.168.1.10"
+    assert old.disconnect_calls == 0
+    assert old.proofs == []
+    assert remembered == []
+
+
+def test_dead_stored_ip_switches_when_the_ssdp_candidate_proves_the_serial():
+    remembered = []
+    probes = []
+
+    def tcp_probe(ip):
+        probes.append(ip)
+        return False
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        tcp_probe=tcp_probe,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: remembered == [("S1", "192.168.1.55")])
+    assert probes == ["192.168.1.10"]
+    assert old.proofs == ["192.168.1.55"]
+    assert fleet.by_id("S1") is not old
+    assert fleet.by_id("S1").current_ip == "192.168.1.55"
+    assert _events(fleet.by_id("S1"), "address_switched") == [{
+        "ip": "192.168.1.55",
+        "previous": "192.168.1.10",
+        "source": "ssdp",
+    }]
+
+
+def test_ssdp_candidate_that_does_not_prove_the_serial_is_rejected():
+    # CONNACK refused, or CONNACK with no report on this serial, is a False proof.
+    remembered = []
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        tcp_probe=lambda _ip: False,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.proof_result = False
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: old.proofs == ["192.168.1.55"])
+    assert _wait_for(lambda: not fleet._reconnects_in_flight)
+    assert fleet.by_id("S1") is old
+    assert old.current_ip == "192.168.1.10"
+    assert old.disconnect_calls == 0
+    assert remembered == []
+    assert _events(old, "address_rejected") == [{
+        "ip": "192.168.1.10",
+        "candidate": "192.168.1.55",
+        "source": "ssdp",
+    }]
+
+
+def test_address_proof_does_not_block_reconcile_connections():
+    started = threading.Event()
+    release = threading.Event()
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        tcp_probe=lambda _ip: False,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+
+    def proof(_ip):
+        started.set()
+        release.wait(2.0)
+        return True
+
+    old.proof_hook = proof
+    try:
+        began = time.monotonic()
+        fleet.reconcile_connections()
+        elapsed = time.monotonic() - began
+        assert elapsed < 0.3
+        assert started.wait(1.0)
+        assert fleet.by_id("S1") is old
+    finally:
+        release.set()
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+
+
+def test_a_failed_proof_is_not_repeated_for_five_minutes():
+    clock = Clock(1000.0)
+    fleet, calls, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        clock=clock,
+        tcp_probe=lambda _ip: False,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.proof_result = False
+    fleet.reconcile_connections()
+    assert _wait_for(lambda: old.proofs == ["192.168.1.55"])
+    assert _wait_for(lambda: not fleet._reconnects_in_flight)
+    assert fleet.by_id("S1") is old
+
+    clock.t = 1000.0 + 61
+    fleet.reconcile_connections()
+    assert calls["count"] == 2
+    assert not _wait_for(lambda: len(old.proofs) > 1, timeout=0.2)
+    assert old.proofs == ["192.168.1.55"]
+
+    clock.t = 1000.0 + 61 + 300
+    fleet.reconcile_connections()
+    assert _wait_for(lambda: old.proofs == ["192.168.1.55", "192.168.1.55"])
+    assert fleet.by_id("S1") is old
+
+
+def test_offline_printer_adopts_a_net_info_candidate_that_proves_the_serial():
+    remembered = []
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[],
+        tcp_probe=lambda _ip: False,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.address_candidate_ips = ["192.168.8.10"]
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: remembered == [("S1", "192.168.8.10")])
+    assert fleet.by_id("S1") is not old
+    assert fleet.by_id("S1").current_ip == "192.168.8.10"
+    assert old.proofs == ["192.168.8.10"]
+    assert _events(fleet.by_id("S1"), "address_switched") == [{
+        "ip": "192.168.8.10",
+        "previous": "192.168.1.10",
+        "source": "net_info",
+    }]
+
+
+def test_net_info_matching_the_stored_ip_is_not_a_candidate():
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[],
+        tcp_probe=lambda _ip: False,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.address_candidate_ips = ["192.168.1.10"]
+    fleet.reconcile_connections()
+
+    assert not _wait_for(lambda: len(old.proofs) > 0, timeout=0.15)
+    assert fleet.by_id("S1") is old
+    assert old.disconnect_calls == 0
+
+
+def test_propose_address_ignores_the_address_already_in_use():
+    probes = []
+
+    def tcp_probe(ip):
+        probes.append(ip)
+        return False
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        tcp_probe=tcp_probe,
+    )
+    printer = fleet.by_id("S1")
+    fleet.propose_address("S1", printer.current_ip, "pin")
+    fleet.propose_address("S1", "", "pin")
+    fleet.propose_address("NOPE", "192.168.1.55", "pin")
+    fleet.propose_address("S1", "192.168.1.55", "nope")
+
+    assert not _wait_for(lambda: probes or printer.proofs, timeout=0.15)
+    assert fleet.by_id("S1") is printer
+
+
+def test_pin_keeps_a_stored_ip_that_still_answers():
+    remembered = []
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        tcp_probe=lambda _ip: True,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    printer = fleet.by_id("S1")
+    fleet.propose_address("S1", "192.168.8.246", "pin")
+
+    assert _wait_for(lambda: _events(printer, "address_kept"))
+    assert fleet.by_id("S1") is printer
+    assert printer.current_ip == "192.168.1.10"
+    assert printer.proofs == []
+    assert remembered == []
+    assert _events(printer, "address_kept") == [{
+        "ip": "192.168.1.10",
+        "candidate": "192.168.8.246",
+        "source": "pin",
+    }]
+
+
+def test_pin_switches_when_the_stored_ip_is_dead_and_the_serial_proves():
+    remembered = []
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.86.28")],
+        tcp_probe=lambda _ip: False,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    fleet.propose_address("S1", "192.168.8.246", "pin")
+
+    assert _wait_for(lambda: remembered == [("S1", "192.168.8.246")])
+    assert fleet.by_id("S1") is not old
+    assert old.proofs == ["192.168.8.246"]
+    assert fleet.by_id("S1").current_ip == "192.168.8.246"
+    assert _events(fleet.by_id("S1"), "address_switched") == [{
+        "ip": "192.168.8.246",
+        "previous": "192.168.86.28",
+        "source": "pin",
+    }]
+
+
+def test_a_kept_pin_is_proposed_again_once_the_printer_goes_offline():
+    remembered = []
+    stored_answers = {"value": True}
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        tcp_probe=lambda _ip: stored_answers["value"],
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    printer = fleet.by_id("S1")
+    fleet.propose_address("S1", "192.168.8.246", "pin")
+    assert _wait_for(lambda: _events(printer, "address_kept"))
+    assert _wait_for(lambda: fleet._reconnects_in_flight == {})
+
+    stored_answers["value"] = False
+    printer.is_offline = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: remembered == [("S1", "192.168.8.246")])
+    assert fleet.by_id("S1").current_ip == "192.168.8.246"

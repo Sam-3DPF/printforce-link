@@ -304,6 +304,53 @@ def _await_connack(session, monotonic, sleep):
     )
 
 
+def proves_serial(ip, serial, access_code, *, session_factory=None,
+                  monotonic=None, sleep=None, log=None) -> bool:
+    """True when ``ip`` completes an MQTT session for this serial.
+
+    CONNACK must succeed, and at least one report must arrive within 10
+    seconds of that CONNACK. The default session subscribes only to
+    ``device/{serial}/report``, so a printer that answers as someone else
+    produces no report in the window. The temporary session always
+    disconnects, including when the handshake fails. It does not start the
+    liveness watchdog: this proof polls on the caller's clock.
+    """
+    session_factory = session_factory or _default_session_factory
+    monotonic = monotonic or time.monotonic
+    sleep = sleep or time.sleep
+    reports = []
+
+    def on_report(doc):
+        reports.append(doc)
+
+    session = None
+    try:
+        try:
+            session = session_factory(
+                ip,
+                access_code,
+                serial,
+                on_report=on_report,
+                command_probe=False,
+                log=log,
+            )
+            session.start()
+        except Exception:
+            logger.debug("printer %s: address proof session did not start", serial)
+            return False
+        auth = _await_connack(session, monotonic, sleep)
+        if auth["result"] != "pass":
+            return False
+        report = _await_reports(reports, monotonic, sleep)
+        return report["result"] == "pass"
+    finally:
+        if session is not None:
+            try:
+                session.disconnect()
+            except Exception:
+                logger.debug("printer %s: address proof session did not close", serial)
+
+
 def _await_reports(reports, monotonic, sleep):
     """The 10s starts when this is called, which is when CONNACK was observed.
 

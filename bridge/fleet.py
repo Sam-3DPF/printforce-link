@@ -34,6 +34,10 @@ _DEFAULT_CONNECT_TIMEOUT_SECONDS = 12.0
 _RECOVERY_INTERVAL_SECONDS = 60.0
 _RECOVERY_SILENCE_SECONDS = 300.0
 _RECOVERY_COOLDOWN_SECONDS = 300.0
+# An SSDP flap must not open a new MQTT session every scan. The TCP probe of
+# the stored address is cheap and is not counted here.
+_ADDRESS_PROOF_COOLDOWN_SECONDS = 300.0
+_ADDRESS_SOURCES = ("ssdp", "net_info", "pin")
 
 
 def _default_tcp_probe(ip: str) -> bool:
@@ -58,6 +62,61 @@ def _printer_had_session(printer) -> bool:
     if callable(value):
         value = value()
     return bool(value)
+
+
+def _note_address(printer, kind, **fields) -> None:
+    """Record an address decision. A fake with no log still finishes the gate."""
+    log = getattr(printer, "log", None)
+    record = getattr(log, "record_event", None) if log is not None else None
+    if not callable(record):
+        return
+    try:
+        record(kind, **fields)
+    except Exception:
+        logger.debug(
+            "printer %s: could not record %s",
+            getattr(printer, "bambu_id", "?"), kind,
+        )
+
+
+def _printer_address_candidates(printer) -> List[str]:
+    fn = getattr(printer, "address_candidates", None)
+    if not callable(fn):
+        return []
+    try:
+        found = fn()
+    except Exception:
+        logger.debug(
+            "printer %s: address candidates were not read",
+            getattr(printer, "bambu_id", "?"),
+        )
+        return []
+    if not isinstance(found, (list, tuple)):
+        return []
+    out: List[str] = []
+    for ip in found:
+        if isinstance(ip, str) and ip and ip not in out:
+            out.append(ip)
+    return out
+
+
+def _call_proves_serial(printer, ip: str) -> bool:
+    """False when this printer cannot show it lives at ``ip``.
+
+    A missing method is not proof. Swapping on SSDP alone is how a neighbor
+    printer steals the serial.
+    """
+    proof = getattr(printer, "proves_serial_at", None)
+    if not callable(proof):
+        return False
+    try:
+        return bool(proof(ip))
+    except Exception as exc:
+        logger.warning(
+            "printer %s: address proof at %s failed (%s)",
+            getattr(printer, "bambu_id", "?"), ip, type(exc).__name__,
+        )
+        return False
 
 
 def _note_backstop(printer) -> None:
@@ -141,6 +200,9 @@ class Fleet:
         self._last_recovery_monotonic = None
         self._recovery_tried_at = {}
         self._recovery_inflight = {}
+        # (serial, candidate) -> monotonic time of the last MQTT proof.
+        self._address_proof_at = {}
+        self._pin_candidates = {}
 
     def connect_all(self) -> None:
         """Connect the fleet without letting one printer hold up startup.
@@ -401,6 +463,7 @@ class Fleet:
             self._adds_in_flight.pop(bambu_id, None)
             self._reconnects_in_flight.pop(bambu_id, None)
             self._configs.pop(bambu_id, None)
+            self._pin_candidates.pop(bambu_id, None)
             worker = self._workers.pop(bambu_id, None)
             if printer is not None:
                 # Remove membership before network cleanup. Any late worker completion
@@ -420,7 +483,12 @@ class Fleet:
             return [p.current_ip for p in self._printers if p.current_ip]
 
     def reconcile_connections(self) -> None:
-        """Reconnect when SSDP reports a serial at a different IP.
+        """Propose a new address when an offline printer is seen somewhere else.
+
+        SSDP and the last ``print.net.info`` block are candidates. The stored
+        IP stays until it fails a TCP probe and the candidate proves this
+        serial. That proof runs on the reconnect worker, so this method
+        returns without waiting on it.
 
         Same-IP silence is not a new printer. The session watchdog resets a quiet
         client, and ``recover_dead_sessions`` probes port 8883 for one that has
@@ -431,7 +499,7 @@ class Fleet:
         elapsed since the last scan — a healthy farm pays nothing, and a whole farm that
         is briefly down is not hammered. Each serial owns at most one daemon reconnect
         worker, so a blocked connect cannot block the reporter or another printer.
-        A newly learned IP is persisted.
+        A newly learned IP is persisted only after the proof.
         """
         with self._lock:
             offline = [p for p in self._printers if p.is_offline]
@@ -453,11 +521,44 @@ class Fleet:
             logger.warning("re-discovery scan failed (%s); will retry next interval",
                            type(e).__name__)
             return
-        for p in offline:
-            d = found.get(p.bambu_id)
-            if d is None or not d.ip or d.ip == p.current_ip:
-                continue
-            self._schedule_reconnect(p, d.ip)
+        for printer in offline:
+            seen = set()
+            hit = found.get(printer.bambu_id)
+            if hit is not None and hit.ip:
+                seen.add(hit.ip)
+                self.propose_address(printer.bambu_id, hit.ip, "ssdp")
+            for ip in _printer_address_candidates(printer):
+                if ip in seen:
+                    continue
+                seen.add(ip)
+                self.propose_address(printer.bambu_id, ip, "net_info")
+            with self._lock:
+                pin = self._pin_candidates.get(printer.bambu_id)
+            if pin and pin not in seen:
+                self.propose_address(printer.bambu_id, pin, "pin")
+
+    def propose_address(self, bambu_id: str, ip: str, source: str) -> None:
+        """Ask the off-loop gate to consider ``ip`` for this serial.
+
+        Returns immediately. ``source`` is ``ssdp``, ``net_info``, or ``pin``.
+        The address already being dialed is not a candidate. A pair proved in
+        the last five minutes is skipped so a flapping answer cannot open
+        another MQTT session.
+        """
+        if source not in _ADDRESS_SOURCES or not ip or not bambu_id:
+            return
+        with self._lock:
+            if source == "pin":
+                # 3DPF sends a changed pin once. It stays a candidate for
+                # later offline passes, in case the printer moves after the
+                # stored address was kept.
+                self._pin_candidates[bambu_id] = ip
+            printer = next((p for p in self._printers if p.bambu_id == bambu_id), None)
+            if printer is None or ip == printer.current_ip:
+                return
+            if self._address_proof_throttled(bambu_id, ip):
+                return
+        self._schedule_reconnect(printer, ip, source)
 
     def recover_dead_sessions(self) -> None:
         """Rebuild a client that already connected, then went silent, if 8883 answers.
@@ -536,7 +637,51 @@ class Fleet:
                 if self._recovery_inflight.get(bambu_id) is token:
                     self._recovery_inflight.pop(bambu_id, None)
 
-    def _schedule_reconnect(self, printer, new_ip: str) -> None:
+    def _candidate_replaces_current(self, printer, candidate: str, source: str,
+                                    generation: int, token) -> bool:
+        """True when the stored port is closed and ``candidate`` proves this serial.
+
+        Runs on the reconnect worker. An answering stored address is kept and
+        does not consume the proof cooldown.
+        """
+        current = printer.current_ip
+        if not candidate or candidate == current:
+            return False
+        try:
+            answered = bool(self._tcp_probe(current))
+        except Exception:
+            answered = False
+        if answered:
+            _note_address(
+                printer, "address_kept",
+                ip=current, candidate=candidate, source=source,
+            )
+            return False
+        bambu_id = printer.bambu_id
+        with self._lock:
+            if (
+                printer not in self._printers
+                or self._membership_generations.get(bambu_id) != generation
+                or self._reconnects_in_flight.get(bambu_id) != (generation, token)
+            ):
+                return False
+            self._address_proof_at[(bambu_id, candidate)] = self._monotonic()
+        if _call_proves_serial(printer, candidate):
+            return True
+        _note_address(
+            printer, "address_rejected",
+            ip=current, candidate=candidate, source=source,
+        )
+        return False
+
+    def _address_proof_throttled(self, bambu_id: str, ip: str) -> bool:
+        """True when this pair was proved inside the cooldown. Caller holds ``self._lock``."""
+        tried = self._address_proof_at.get((bambu_id, ip))
+        if tried is None:
+            return False
+        return self._monotonic() - tried < _ADDRESS_PROOF_COOLDOWN_SECONDS
+
+    def _schedule_reconnect(self, printer, new_ip: str, source: str) -> None:
         """Start at most one daemon reconnect worker for this fleet member/serial."""
         bambu_id = printer.bambu_id
         with self._lock:
@@ -560,11 +705,9 @@ class Fleet:
                 access_code=cfg.access_code,
                 name=cfg.name,
             )
-        logger.info("printer %s reconnecting at %s (was %s)",
-                    bambu_id, new_ip, printer.current_ip)
         worker = threading.Thread(
             target=self._run_reconnect,
-            args=(printer, replacement_cfg, generation, token),
+            args=(printer, replacement_cfg, generation, token, source),
             name=f"printer-reconnect-{bambu_id}",
             daemon=True,
         )
@@ -578,12 +721,19 @@ class Fleet:
             logger.warning("printer %s reconnect worker could not start; will retry", bambu_id)
 
     def _run_reconnect(self, printer, replacement_cfg: PrinterConfig,
-                       generation: int, token) -> None:
-        """Connect a replacement off-loop, then swap it in only if membership is unchanged."""
+                       generation: int, token, source: str) -> None:
+        """Prove the candidate off-loop, then swap only if membership is unchanged.
+
+        The stored address is kept when port 8883 still accepts. Otherwise the
+        candidate must complete an MQTT session for this serial. The swap carries
+        the membership generation, so a connect that finishes after remove cannot
+        put the serial back.
+        """
         bambu_id = printer.bambu_id
         replacement = None
         swapped = False
         previous_ip = printer.current_ip
+        candidate = replacement_cfg.ip
         try:
             with self._lock:
                 if (
@@ -592,6 +742,12 @@ class Fleet:
                     or self._reconnects_in_flight.get(bambu_id) != (generation, token)
                 ):
                     return
+            if not self._candidate_replaces_current(
+                printer, candidate, source, generation, token,
+            ):
+                return
+            logger.info("printer %s reconnecting at %s (was %s)",
+                        bambu_id, candidate, previous_ip)
             replacement = self._make_printer(
                 replacement_cfg,
                 stale_after_seconds=self._stale_after_seconds,
@@ -622,6 +778,10 @@ class Fleet:
             if replacement is not None and not swapped:
                 replacement.disconnect()
             if swapped:
+                _note_address(
+                    replacement, "address_switched",
+                    ip=candidate, previous=previous_ip, source=source,
+                )
                 printer.disconnect()
                 if (
                     self._on_address is not None

@@ -9,11 +9,14 @@ every printer the cloud is delivering a NOT-yet-delivered access code for, it:
   3. ACKs the delivery so the cloud deletes its copy of the code (courier hand-off done).
 
 A printer WITH an access code is stored, added, and ACKed. Once the code is
-delivered, later pulls still carry `local_ip` with no code — apply that pin
-when it *changes* (an operator reserved-IP edit). An unchanged stale pin
-must not overwrite an address SSDP or a live session just learned. The
-store, not this pull, is what re-connects stored printers after a restart
-(app.py builds the fleet from it at startup).
+delivered, later pulls still carry `local_ip` with no code. An unchanged
+stale pin must not overwrite an address SSDP or a live session just learned.
+A changed pin for a printer already in the fleet is only a candidate: the
+fleet adopts it after the stored address fails and the pin proves the serial.
+A stored printer that is not running has nothing connected to prove against,
+so that pin is applied directly. The store, not this pull, is what
+re-connects stored printers after a restart (app.py builds the fleet from it
+at startup).
 """
 import logging
 import time
@@ -110,7 +113,12 @@ class ConfigReconciler:
             self._dpf.ack_printers_config(acks, removed=removed)
 
     def _refresh_stored_ip(self, bambu_id: str, local_ip: Optional[str]) -> None:
-        """Rebuild a stored printer when 3DPF pins a new LAN address."""
+        """Hand a changed 3DPF pin to the fleet, or apply it when nothing is connected.
+
+        ``_cloud_pins`` remembers the last pin so an unchanged stale address
+        cannot yank a learned one back. The store is not written here for a
+        running printer: ``on_address`` does that after the proof.
+        """
         if not local_ip or not self._store.has(bambu_id):
             return
         current = None
@@ -124,6 +132,11 @@ class ConfigReconciler:
             return
         if current is None or current.ip == local_ip:
             return
+        if self._fleet.by_id(bambu_id) is not None:
+            propose = getattr(self._fleet, "propose_address", None)
+            if callable(propose):
+                propose(bambu_id, local_ip, "pin")
+                return
         self._store.update_ip(bambu_id, local_ip)
         if self._fleet.by_id(bambu_id) is not None:
             self._fleet.remove_printer(bambu_id)

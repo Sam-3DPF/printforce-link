@@ -97,3 +97,36 @@ def test_failed_reconnect_keeps_old_ip_so_reconcile_retries(sessions):
     with pytest.raises(OSError):
         p.reconnect(new_ip="192.168.1.99")
     assert p.current_ip == "192.168.1.10"   # still targeting the old IP -> reconcile retries
+
+
+def test_net_info_from_a_report_is_remembered_until_a_later_net_block(sessions):
+    p = _printer(sessions)
+    p._on_mqtt_report({"print": {"net": {"info": [
+        {"ip": 0x0A08A8C0},
+        {"ip": 0},
+    ]}}})
+    assert p.address_candidates() == ["192.168.8.10"]
+    # A status delta with no net block must not wipe the last interfaces.
+    p._on_mqtt_report({"print": {"gcode_state": "IDLE"}})
+    assert p.address_candidates() == ["192.168.8.10"]
+    # A broken net block is not "no interfaces."
+    p._on_mqtt_report({"print": {"net": {"info": "nope"}}})
+    assert p.address_candidates() == ["192.168.8.10"]
+    p._on_mqtt_report({"print": {"net": {"info": [{"ip": 0}]}}})
+    assert p.address_candidates() == []
+
+
+def test_proves_serial_at_keeps_the_access_code_inside_the_printer(sessions, monkeypatch):
+    seen = {}
+
+    def fake(ip, serial, access_code, **kwargs):
+        seen["args"] = (ip, serial, access_code)
+        seen["log"] = kwargs.get("log")
+        return True
+
+    monkeypatch.setattr("bridge.printer.proves_serial", fake)
+    p = _printer(sessions)
+    assert p.proves_serial_at("192.168.8.10") is True
+    assert seen["args"] == ("192.168.8.10", "S1", "SECRET")
+    assert seen["log"] is p.log
+    assert not hasattr(p, "access_code")

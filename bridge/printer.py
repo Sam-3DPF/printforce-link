@@ -25,8 +25,9 @@ from .ams import (
     save_remembered_ams,
 )
 from .bambu.log import PrinterLog
-from .bambu.diagnostic import run_connection_diagnostic
+from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.session import LinkSession
+from .bambu.state import net_info_ips
 from .bambu_alerts import describe_hms
 from .coerce import as_float, as_int, clean_str
 from .config import PrinterConfig
@@ -623,6 +624,9 @@ class BambuPrinter:
         # snapshot itself does not publish or sleep.
         self._defer = None
         self._deferred_pending = False
+        # Last usable print.net.info addresses. A status delta that omits `net`
+        # must not wipe them; only a later net block replaces the list.
+        self._net_info_ips: list = []
         # One ring for the life of this object. rebuild_session and reconnect
         # replace the client and keep this log.
         self._log = PrinterLog(
@@ -682,6 +686,23 @@ class BambuPrinter:
     def collect_log(self) -> Dict:
         """Both rings, oldest first, for the collect_log upload."""
         return self._log.export()
+
+    def address_candidates(self) -> list:
+        """IPs from the last ``print.net.info`` block. A report with no net block leaves them."""
+        with self._payload_lock:
+            return list(self._net_info_ips)
+
+    def proves_serial_at(self, ip: str) -> bool:
+        """True when a temporary session at ``ip`` is this printer.
+
+        The access code stays in this object. Callers that decide whether to
+        dial ``ip`` use this instead of reading the secret.
+        """
+        if not ip:
+            return False
+        return proves_serial(
+            ip, self.bambu_id, self._cfg.access_code, log=self._log,
+        )
 
     def diagnose(self, trigger: str = "operator") -> Dict:
         """Run the connection check against the address this printer is dialing.
@@ -939,8 +960,24 @@ class BambuPrinter:
         """Ingest one report. Runs on the paho network thread."""
         if not isinstance(doc, dict):
             return
+        self._remember_net_info(doc)
         self._last_message_monotonic = self._monotonic()
         self._ingest_status(doc)
+
+    def _remember_net_info(self, doc) -> None:
+        """Keep the last explicit interface list. Absence is not an empty list."""
+        print_obj = doc.get("print")
+        if not isinstance(print_obj, dict):
+            return
+        net = print_obj.get("net")
+        info = net.get("info") if isinstance(net, dict) else None
+        # Only a real list replaces the last interfaces. A missing or broken
+        # block is not evidence that the printer has no address.
+        if not isinstance(info, list):
+            return
+        ips = net_info_ips(doc)
+        with self._payload_lock:
+            self._net_info_ips = ips
 
     def _publish_command(self, payload: dict) -> bool:
         session = self._session

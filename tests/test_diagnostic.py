@@ -805,3 +805,118 @@ def test_printer_diagnose_checks_the_address_it_is_dialing(monkeypatch):
     assert (ip, serial, access_code) == ("10.0.0.42", "S9", "code-1234")
     assert kwargs["printer"] is printer
     assert kwargs["trigger"] == "auto_offline"
+
+
+def _prove(session, *, connack_at=0.0, report_at=0.0, error=None, clock=None, log=None):
+    from bridge.bambu.diagnostic import proves_serial
+
+    clock = clock or Clock()
+    if session is None:
+        session = FakeSession(clock, connack_at=connack_at, report_at=report_at, error=error)
+    else:
+        session.clock = clock
+    seen = {}
+
+    def factory(host, access_code, serial, *, on_report, command_probe, log):
+        seen["call"] = (host, access_code, serial, command_probe, log)
+        session.on_report = on_report
+        clock.pump = session.pump
+        return session
+
+    result = proves_serial(
+        "192.168.8.10",
+        "S1",
+        _SECRET,
+        session_factory=factory,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        log=log,
+    )
+    return result, clock, session, seen
+
+
+def test_proves_serial_accepts_connack_and_a_report_within_10s():
+    log = _Log()
+    result, _clock, session, seen = _prove(None, log=log)
+    assert result is True
+    assert session.disconnected is True
+    assert seen["call"] == ("192.168.8.10", _SECRET, "S1", False, log)
+
+
+def test_proves_serial_rejects_silence_on_this_serials_topic():
+    # CONNACK succeeded. No report within 10s of that CONNACK means the
+    # machine that answered is not this serial.
+    result, clock, session, _seen = _prove(None, report_at=None)
+    assert result is False
+    assert session.disconnected is True
+    assert clock.now >= 10.0
+
+
+def test_proves_serial_rejects_a_refused_connack_without_waiting_out_reports():
+    result, clock, session, _seen = _prove(None, error="refused")
+    assert result is False
+    assert session.disconnected is True
+    assert clock.now < 10.0
+
+
+def test_proves_serial_rejects_an_auth_rejected_connack():
+    result, _clock, session, _seen = _prove(None, error="auth_rejected")
+    assert result is False
+    assert session.disconnected is True
+
+
+def test_proves_serial_starts_the_report_window_when_connack_arrives():
+    # Nine seconds to log in must not eat the ten seconds allowed for a report.
+    result, _clock, session, _seen = _prove(None, connack_at=9.0, report_at=10.0)
+    assert result is True
+    assert session.disconnected is True
+
+
+def test_proves_serial_disconnects_when_the_session_cannot_start():
+    from bridge.bambu.diagnostic import proves_serial
+
+    clock = Clock()
+    closed = {"called": False}
+
+    class Boom:
+        def start(self):
+            raise OSError("no route")
+
+        def disconnect(self):
+            closed["called"] = True
+
+    def factory(host, access_code, serial, *, on_report, command_probe, log):
+        return Boom()
+
+    assert proves_serial(
+        "192.168.8.10", "S1", _SECRET,
+        session_factory=factory, monotonic=clock.monotonic, sleep=clock.sleep,
+    ) is False
+    assert closed["called"] is True
+
+
+def test_proves_serial_uses_a_temporary_session_without_a_watchdog(monkeypatch):
+    from bridge.bambu.diagnostic import proves_serial
+
+    captured = {}
+
+    class Capture:
+        def __init__(self, host, access_code, serial, **kwargs):
+            captured["kwargs"] = kwargs
+            self.connected = True
+            self.last_connect_error = None
+
+        def start(self):
+            captured["kwargs"]["on_report"]({"print": {"gcode_state": "IDLE"}})
+
+        def disconnect(self):
+            captured["disconnected"] = True
+
+    monkeypatch.setattr("bridge.bambu.diagnostic.LinkSession", Capture)
+    clock = Clock()
+    assert proves_serial(
+        "10.0.0.9", "P1", _SECRET,
+        monotonic=clock.monotonic, sleep=clock.sleep,
+    ) is True
+    assert captured["kwargs"]["watchdog_interval"] is None
+    assert captured["disconnected"] is True

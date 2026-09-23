@@ -24,6 +24,10 @@ class FakeFleet:
         self._serials = set(serials)
         self.added = []
         self.removed = []
+        self.proposals = []
+
+    def propose_address(self, bambu_id, ip, source):
+        self.proposals.append((bambu_id, ip, source))
 
     def by_id(self, bambu_id):
         return object() if bambu_id in self._serials else None
@@ -136,10 +140,9 @@ def test_entry_without_code_is_skipped_when_not_stored():
     assert store.upserts == [] and fleet.added == [] and dpf.acked == []
 
 
-def test_ip_only_refresh_moves_a_stored_printer():
-    # 3DPF already sent the code. A later reserved-IP edit still arrives as
-    # local_ip with no access_code. v0.1.24 skipped that row, so Link kept
-    # dialing 192.168.86.x after the printer moved to 192.168.8.x.
+def test_changed_pin_for_a_running_printer_is_a_gated_candidate():
+    # The printer is already connected. A new 3DPF pin is not applied here —
+    # the fleet proves it, and the store moves only after that proof.
     store = FakeStore()
     store.upsert("S1", "CODE", "192.168.86.28")
     fleet = FakeFleet(serials=["S1"])
@@ -149,8 +152,29 @@ def test_ip_only_refresh_moves_a_stored_printer():
         store=store,
     )
     r.tick()
+    assert fleet.proposals == [("S1", "192.168.8.246", "pin")]
+    assert store.ip_updates == []
+    assert fleet.removed == []
+    assert fleet.added == []
+    assert store.entries["S1"]["local_ip"] == "192.168.86.28"
+    assert dpf.acked == []
+
+
+def test_changed_pin_adopts_directly_when_the_printer_is_not_running():
+    # Nothing is connected, so there is no session to prove against. The pin
+    # is written and the printer is added at that address.
+    store = FakeStore()
+    store.upsert("S1", "CODE", "192.168.86.28")
+    fleet = FakeFleet()
+    r, dpf, fleet, store = _reconciler(
+        [{"printer_id": "p1", "bambu_id": "S1", "local_ip": "192.168.8.246"}],
+        fleet=fleet,
+        store=store,
+    )
+    r.tick()
+    assert fleet.proposals == []
     assert store.ip_updates == [("S1", "192.168.8.246")]
-    assert fleet.removed == ["S1"]
+    assert fleet.removed == []
     assert [(c.bambu_id, c.ip, c.access_code) for c in fleet.added] == [
         ("S1", "192.168.8.246", "CODE"),
     ]
@@ -176,6 +200,7 @@ def test_unchanged_cloud_pin_does_not_clobber_a_learned_ip():
     assert store.ip_updates == []
     assert fleet.removed == []
     assert fleet.added == []
+    assert fleet.proposals == []
     assert store.entries["S1"]["local_ip"] == "192.168.8.188"
 
 
@@ -256,3 +281,68 @@ def test_remove_list_alongside_a_delivered_code_acks_both(): # U5
     assert store.removed == ["S2"]
     assert dpf.acked == [[{"printer_id": "p1", "config_version": "v1"}]]
     assert dpf.acked_removed == [["S2"]]
+
+
+def test_tick_does_not_block_on_the_address_proof():
+    import threading
+    import time
+
+    from bridge.config import PrinterConfig
+    from bridge.fleet import Fleet
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class Printer:
+        def __init__(self, cfg, stale_after_seconds=None):
+            self.bambu_id = cfg.bambu_id
+            self.current_ip = cfg.ip
+            self.is_offline = False
+            self.connect_calls = 0
+            self.disconnect_calls = 0
+
+        def connect(self):
+            self.connect_calls += 1
+
+        def disconnect(self):
+            self.disconnect_calls += 1
+
+        def proves_serial_at(self, ip):
+            started.set()
+            release.wait(2.0)
+            return True
+
+        def address_candidates(self):
+            return []
+
+    store = FakeStore()
+    store.upsert("S1", "CODE", "192.168.86.28")
+    fleet = Fleet(
+        [PrinterConfig("S1", "192.168.86.28", "CODE")],
+        printer_factory=Printer,
+        discover_fn=lambda timeout, probe_ips=None: [],
+        tcp_probe=lambda _ip: False,
+        monotonic=Clock(),
+        on_address=store.update_ip,
+    )
+    r, _dpf, fleet, store = _reconciler(
+        [{"bambu_id": "S1", "local_ip": "192.168.8.246"}],
+        fleet=fleet,
+        store=store,
+    )
+    try:
+        began = time.monotonic()
+        r.tick()
+        elapsed = time.monotonic() - began
+        assert elapsed < 0.3
+        assert started.wait(1.0)
+        assert store.ip_updates == []
+        assert store.entries["S1"]["local_ip"] == "192.168.86.28"
+    finally:
+        release.set()
+
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and store.ip_updates != [("S1", "192.168.8.246")]:
+        threading.Event().wait(0.005)
+    assert store.ip_updates == [("S1", "192.168.8.246")]
+    assert fleet.by_id("S1").current_ip == "192.168.8.246"
