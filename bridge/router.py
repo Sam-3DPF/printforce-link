@@ -223,6 +223,22 @@ class Router:
         if sid and registrar is not None:
             registrar(bambu_id, sid)
 
+    def update_send_attempt(self, bambu_id: str, **fields) -> None:
+        """Record the send watchdog beside this printer's assignment.
+
+        The attempt count, phase, and last failure live on the same object as
+        the batch assignment, so a restart continues the same send instead of
+        uploading the file again.
+        """
+        if not fields:
+            return
+        with self._lock:
+            assignment = self.assignments.get(bambu_id)
+            if assignment is None:
+                return
+            assignment.update(fields)
+            self._persist_assignments()
+
     def mark_assignment_active(self, bambu_id: str) -> None:
         """Persist proof that this assignment reached PRINTING/PAUSED at least once."""
         with self._lock:

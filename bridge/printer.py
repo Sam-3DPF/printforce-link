@@ -531,6 +531,11 @@ class BambuPrinter:
         self._last_submission_id = None
 
     @property
+    def last_submission_id(self):
+        """The submission id of the last ``project_file`` this printer published."""
+        return self._last_submission_id
+
+    @property
     def bambu_id(self) -> str:
         return self._cfg.bambu_id
 
