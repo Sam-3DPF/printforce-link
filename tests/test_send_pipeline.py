@@ -317,3 +317,83 @@ class _Clock:
 
     def advance(self, seconds):
         self.now += seconds
+
+
+def test_a_changed_file_name_enters_phase_b_and_an_unchanged_name_resets():
+    changed = _record()
+    changed["gcode_file"] = "old.gcode"
+    finish = {"status": "NEEDS_CLEARING", "gcode_state": "FINISH", "gcode_file": "new.gcode"}
+    assert decide(changed, finish, PHASE_A_SECONDS) == "enter_b"
+    same = _record()
+    same["gcode_file"] = "old.gcode"
+    finish["gcode_file"] = "old.gcode"
+    assert decide(same, finish, PHASE_A_SECONDS) == "reset_retry"
+    assert decide(same, {"status": "PRINTING", "gcode_state": "RUNNING", "gcode_file": "other.gcode"}, 1) == "confirm"
+    phase_b = _record(phase="B", attempts=1)
+    phase_b["gcode_file"] = "old.gcode"
+    assert decide(phase_b, {"status": "IDLE", "gcode_file": "new.gcode"}, PHASE_B_SECONDS) == "retry"
+    missing = _record()
+    assert decide(missing, finish, PHASE_A_SECONDS) == "reset_retry"
+
+
+def test_save_and_load_keep_the_pre_send_file_name(tmp_path):
+    from bridge.send_pipeline import load_attempt, save_attempt
+
+    router = Router(str(tmp_path / "queue.json"))
+    router.record_assignment("P1", "B1", 1, started_at=1.0)
+    marker = tmp_path / "B1.3mf.started"
+    marker.write_text("commanded")
+    record = _record(submission_id="9")
+    record["gcode_file"] = "plate.gcode"
+    record["uploaded"] = True
+    save_attempt(str(marker), router, "P1", record)
+    loaded = load_attempt(str(marker), router, "P1", 50.0)
+    assert loaded["gcode_file"] == "plate.gcode"
+    assert router.assignments_snapshot()["P1"]["gcode_file"] == "plate.gcode"
+
+
+def test_a_final_failure_names_the_drying_unit_and_does_not_stop_it(tmp_path):
+    from bridge.app import _advance_cloud_send
+
+    class _DryFleet:
+        def __init__(self):
+            self.commands = []
+
+        def by_id(self, _bambu_id):
+            return self
+
+        def snapshot(self):
+            return {
+                "status": "NEEDS_CLEARING",
+                "gcode_state": "FINISH",
+                "gcode_file": "same.gcode",
+                "connection": "live",
+                "dry_time": 5,
+                "drying_unit": 7,
+            }
+
+        def apply_control(self, *_args):
+            self.commands.append("control")
+            return True
+
+        def start_print(self, *_args):
+            self.commands.append("start")
+            return False
+
+    key = ("B1", "P1", 1)
+    spool = str(tmp_path)
+    started = _cloud_send_started_path(spool, key)
+    router = Router(str(tmp_path / "queue.json"))
+    router.record_assignment("P1", "B1", 1, started_at=0.0)
+    record = _record(attempts=MAX_ATTEMPTS)
+    record["gcode_file"] = "same.gcode"
+    record["last_failure"] = "no_echo"
+    from bridge.send_pipeline import save_attempt
+    save_attempt(started, router, "P1", record)
+    fleet = _DryFleet()
+    dpf = _FakeDpf()
+    _advance_cloud_send(key, {}, fleet, dpf, spool, set(), router, lambda: PHASE_A_SECONDS)
+    assert dpf.failed
+    assert "drying unit 7" in dpf.failed[0][2]
+    assert fleet.commands == []
+    assert "ams_filament_drying" not in dpf.failed[0][2]

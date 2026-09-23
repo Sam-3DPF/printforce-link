@@ -1,5 +1,6 @@
 """Link-owned MQTT session: one client per printer, report topic only, no camera."""
 import json
+import logging
 import socket
 import time
 
@@ -7,7 +8,7 @@ import pytest
 from paho.mqtt.packettypes import PacketTypes
 from paho.mqtt.reasoncodes import ReasonCode
 
-from bridge.bambu.session import LinkSession, build_paho_client
+from bridge.bambu.session import COMMAND_PROBE_ENABLED, LinkSession, build_paho_client
 from bridge.config import PrinterConfig
 from bridge.printer import BambuPrinter
 
@@ -339,4 +340,121 @@ def test_printer_snapshot_reads_a_session_report_and_pause_publishes_qos1():
     topic, payload, qos = fake.publishes[-1]
     assert topic == f"device/{_SERIAL}/request"
     assert qos == 1
-    assert json.loads(payload) == {"print": {"command": "pause"}}
+    assert json.loads(payload) == {"print": {"sequence_id": "0", "command": "pause"}}
+
+
+_REJECT = {"attr": 0x05000500, "code": 0x00010007}
+
+
+def test_command_probe_stays_off():
+    assert COMMAND_PROBE_ENABLED is False
+
+
+def test_a_non_utf8_report_parses_and_marks_the_session_live():
+    fake = FakePaho()
+    clock = Clock()
+    session = _session(fake, monotonic=clock, watchdog_interval=None)
+    session.start()
+    fake.fire_connack(0)
+    body = b'{"print": {"gcode_state": "IDLE", "note": "' + bytes([0xFF]) + b'"}}'
+    fake.fire_message(f"device/{_SERIAL}/report", body)
+    assert session.state == "live"
+    assert session.last_message_at == clock.now
+
+
+def test_non_json_after_replacement_does_not_mark_the_session_live():
+    fake = FakePaho()
+    clock = Clock()
+    session = _session(fake, monotonic=clock, watchdog_interval=None)
+    session.start()
+    fake.fire_connack(0)
+    fake.fire_message(f"device/{_SERIAL}/report", b"\xff\xfe not-json")
+    assert session.last_message_at is None
+    assert session.state != "live"
+
+
+def test_connack_134_logs_the_toggle_sentence_and_holds_the_client(caplog):
+    fake = FakePaho()
+    clock = Clock(1000.0)
+    session = _session(fake, monotonic=clock, watchdog_interval=None)
+    session.start()
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        fake.fire_connack(134)
+    assert "The access code changes when LAN Only or Developer Mode is toggled." in caplog.text
+    assert "secret-code" not in caplog.text
+    opened = fake.loop_started
+    clock.now += 30
+    session.tick()
+    assert fake.loop_started == opened
+    assert session.last_connect_error == "auth_rejected"
+
+
+def test_an_empty_report_topic_is_logged_once_for_the_client(caplog):
+    fake = FakePaho()
+    clock = Clock()
+    session = _session(fake, monotonic=clock, watchdog_interval=None)
+    session.start()
+    fake.fire_connack(0)
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        session.tick()
+        session.tick()
+    assert caplog.text.count("report topic is empty") == 1
+
+
+def test_command_rejection_does_not_open_a_client_in_any_gcode_state(caplog):
+    fake = FakePaho()
+    clock = Clock(5000.0)
+    cfg = PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="x", name="P1")
+
+    def factory(ip, access_code, serial, on_report):
+        return LinkSession(
+            ip, access_code, serial, on_report=on_report,
+            client_factory=lambda _cid: fake, monotonic=clock,
+            watchdog_interval=None,
+        )
+
+    printer = BambuPrinter(
+        cfg, session_factory=factory, monotonic=lambda: clock.now, sleep=lambda _seconds: None,
+    )
+    printer.connect()
+    fake.fire_connack(0)
+    opened = fake.loop_started
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        for state in ("IDLE", "FINISH", "FAILED", "RUNNING", "PREPARE", "SLICING", "PAUSE"):
+            fake.fire_message(
+                f"device/{_SERIAL}/report",
+                json.dumps({"print": {"gcode_state": state, "hms": [_REJECT]}}).encode(),
+            )
+            clock.now += 70
+            printer._session.tick()
+    assert fake.loop_started == opened
+    assert caplog.text.count("Enable Developer Mode and restart the printer.") == 1
+    assert "secret-code" not in caplog.text
+
+
+def test_the_message_callback_does_not_join_the_network_thread_for_that_fault():
+    fake = FakePaho()
+    clock = Clock()
+    cfg = PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="x", name="P1")
+
+    def factory(ip, access_code, serial, on_report):
+        return LinkSession(
+            ip, access_code, serial, on_report=on_report,
+            client_factory=lambda _cid: fake, monotonic=clock,
+            watchdog_interval=None,
+        )
+
+    printer = BambuPrinter(
+        cfg, session_factory=factory, monotonic=lambda: clock.now, sleep=lambda _seconds: None,
+    )
+    printer.connect()
+    fake.fire_connack(0)
+    fake.block_stop = True
+    started = time.monotonic()
+    fake.fire_message(
+        f"device/{_SERIAL}/report",
+        json.dumps({"print": {"gcode_state": "IDLE", "hms": [_REJECT]}}).encode(),
+    )
+    assert time.monotonic() - started < 2
+    assert printer.commands_rejected is True
+    assert fake.loop_started == 1
