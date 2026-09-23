@@ -6,6 +6,7 @@ interval. Run with: `python -m bridge.app config.toml`.
 """
 
 from collections import OrderedDict
+import inspect
 import logging
 import os
 import re
@@ -53,13 +54,11 @@ _FILAMENT_FAMILIES = ("PETG", "PLA", "ABS", "ASA", "TPU", "PA", "PC", "PVA", "HI
 LEGACY_MARKER_MIN_AGE_SECONDS = ASSIGNMENT_STARTUP_GRACE_SECONDS
 LEGACY_READY_OBSERVATION_MIN_GAP_SECONDS = 5.0
 LEGACY_READY_OBSERVATION_LIMIT = 256
-# MQTT start_print True is not an ack. Poll this long for PRINTING/PAUSED, then
-# leave the send pending until the next loop or the startup-grace timeout.
+# MQTT start_print True is not an ack. Callers may still pass
+# confirm_wait_seconds; the watchdog decides when the send is confirmed.
 CLOUD_SEND_CONFIRM_WAIT_SECONDS = 8.0
-CLOUD_SEND_CONFIRM_POLL_SECONDS = 0.5
 STARTED_MARKER_COMMANDED = "commanded"
 STARTED_MARKER_CONFIRMED = "confirmed"
-RETRY_IDLE_START_AFTER_SECONDS = 20.0
 
 
 class _LegacyMarkerReadiness:
@@ -625,9 +624,13 @@ def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
             started_sends,
             router=router,
             legacy_marker_readiness=readiness,
+            release_failures=False,
         )
         if future is not None:
             cloud_send_jobs[serial] = future
+    # Each worker sees only its own serial. Releasing here, with every send
+    # still in desired, is what keeps one printer from clearing another's latch.
+    release_settled_attempts(spool_dir, _desired_cloud_send_keys(desired))
 
 
 def _control_from_row(row: dict):
@@ -868,18 +871,35 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
             pass
 
 
+def _desired_cloud_send_keys(desired) -> set:
+    """Send keys the cloud is still asking for, on every printer."""
+    live = set()
+    for row in desired or []:
+        if not isinstance(row, dict):
+            continue
+        send = row.get("send")
+        if not isinstance(send, dict):
+            continue
+        bambu_id = row.get("bambu_id")
+        batch_id = send.get("batch_id")
+        if not bambu_id or not batch_id:
+            continue
+        live.add((str(batch_id), str(bambu_id), int(send.get("plate_index") or 1)))
+    return live
+
+
 def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                        started_sends=None, router=None,
                        legacy_marker_readiness=None,
                        wall_time=time.time,
                        confirm_wait_seconds=CLOUD_SEND_CONFIRM_WAIT_SECONDS,
-                       sleep_fn=time.sleep) -> None:
+                       sleep_fn=time.sleep,
+                       release_failures: bool = True) -> None:
     """Start a print only when the cloud Sliced Queue says so.
 
     MQTT publish True is not a physical start. DISPATCHED is reported only after
-    the printer snapshot shows PRINTING or PAUSED. A commanded-but-idle send is
-    left pending (never started twice) until that proof arrives, or the startup
-    grace expires and local start state is cleared so the cloud can keep SENDING.
+    the printer snapshot shows PRINTING or PAUSED. A commanded send stays in the
+    watchdog until an active snapshot confirms it or the attempt budget fails it.
     """
     import os
     if started_sends is None:
@@ -1105,7 +1125,8 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 pass
             discard_attempt(leftover)
     _cleanup_orphaned_cloud_send_markers(spool_dir, live, seen_serials)
-    release_settled_attempts(spool_dir, live)
+    if release_failures:
+        release_settled_attempts(spool_dir, live)
     legacy_marker_readiness.retain(pending_legacy_markers)
 
 
@@ -1155,21 +1176,6 @@ def _cloud_send_already_confirmed(started_path: str, router, bambu_id: str) -> b
         _cloud_send_marker_state(started_path) == STARTED_MARKER_CONFIRMED
         or _assignment_observed_active(router, bambu_id)
     )
-
-
-def _cloud_send_start_age_seconds(started_path: str, router, bambu_id: str,
-                                 wall_time) -> float:
-    now = float(wall_time())
-    if router is not None and callable(getattr(router, "assignments_snapshot", None)):
-        assignment = router.assignments_snapshot().get(str(bambu_id))
-        if isinstance(assignment, dict):
-            try:
-                started_at = float(assignment.get("started_at"))
-            except (TypeError, ValueError):
-                started_at = float("nan")
-            if started_at == started_at and started_at >= 0:
-                return max(0.0, now - started_at)
-    return max(0.0, now - _cloud_send_started_at(started_path, wall_time))
 
 
 def _report_confirmed_dispatch(key, dpf, spool_dir: str, router) -> None:
@@ -1228,11 +1234,27 @@ def _record_cloud_assignment(router, bambu_id, batch_id, plate_index, *,
         "started_at": started_at,
     }
     try:
+        params = inspect.signature(router.record_assignment).parameters
+    except (TypeError, ValueError):
+        params = None
+    accepts_submission = params is not None and (
+        "submission_id" in params
+        or any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+    )
+    if params is None:
+        try:
+            router.record_assignment(
+                bambu_id, batch_id, plate_index, submission_id=submission_id, **kwargs,
+            )
+        except TypeError:
+            router.record_assignment(bambu_id, batch_id, plate_index, **kwargs)
+        return
+    if accepts_submission:
         router.record_assignment(
             bambu_id, batch_id, plate_index, submission_id=submission_id, **kwargs,
         )
-    except TypeError:
-        router.record_assignment(bambu_id, batch_id, plate_index, **kwargs)
+        return
+    router.record_assignment(bambu_id, batch_id, plate_index, **kwargs)
 
 
 def _remember_attempt(started_path, router, bambu_id, wall_time, *,

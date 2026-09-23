@@ -7,12 +7,18 @@ from bridge.send_pipeline import (
     PHASE_A_SECONDS,
     PHASE_B_SECONDS,
     decide,
+    failure_latched,
     failure_reason,
+    latch_failure,
     printer_is_held,
     ready_for_upload,
     snapshot_is_active,
 )
-from bridge.app import _handle_cloud_sends
+from bridge.app import (
+    _apply_desired,
+    _cloud_send_started_path,
+    _handle_cloud_sends,
+)
 from bridge.router import Router
 
 from test_cloud_sends import (
@@ -201,6 +207,38 @@ def test_phase_b_timeout_retries_without_resetting(tmp_path):
     assert len(fleet.starts) == 2
     assert len(fleet.uploads) == 1
     assert dpf.failed == []
+
+
+def test_one_printer_pass_does_not_clear_another_printers_failure(tmp_path):
+    key_a = ("B1", "P1", 1)
+    key_b = ("B2", "P2", 1)
+    latch_failure(_cloud_send_started_path(str(tmp_path), key_a), key_a, "no_echo")
+    latch_failure(_cloud_send_started_path(str(tmp_path), key_b), key_b, "no_echo")
+
+    class _InlineSubmit:
+        def submit(self, serial, fn, *args, **kwargs):
+            fn(*args, **kwargs)
+
+    def row(batch_id, bambu_id):
+        return {
+            "bambu_id": bambu_id,
+            "send": {
+                "batch_id": batch_id,
+                "plate_index": 1,
+                "file_url": "https://example/signed.3mf",
+            },
+        }
+
+    both = [row("B1", "P1"), row("B2", "P2")]
+    _apply_desired(both, _InlineSubmit(), _FakeDpf(), str(tmp_path), set(), set())
+    assert failure_latched(_cloud_send_started_path(str(tmp_path), key_a))
+    assert failure_latched(_cloud_send_started_path(str(tmp_path), key_b))
+
+    _apply_desired(
+        [row("B1", "P1")], _InlineSubmit(), _FakeDpf(), str(tmp_path), set(), set(),
+    )
+    assert failure_latched(_cloud_send_started_path(str(tmp_path), key_a))
+    assert failure_latched(_cloud_send_started_path(str(tmp_path), key_b)) is False
 
 
 class _Clock:

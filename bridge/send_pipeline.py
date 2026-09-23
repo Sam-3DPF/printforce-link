@@ -13,11 +13,12 @@ and the send fails with the last reason. The file is uploaded once.
 import json
 import os
 
+from .bambu.commands import project_file_refused
+
 PHASE_A_SECONDS = 90.0
 PHASE_B_SECONDS = 180.0
 MAX_ATTEMPTS = 3
 
-_ACTIVE_GCODE = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
 _READY_GCODE = frozenset({"IDLE", "FINISH", "FAILED"})
 _BUSY_STATUS = frozenset({"PRINTING", "PAUSED", "OFFLINE"})
 _ATTEMPT_FIELDS = (
@@ -32,7 +33,7 @@ def snapshot_is_active(snapshot) -> bool:
         return False
     if snapshot.get("status") in ("PRINTING", "PAUSED"):
         return True
-    return _gcode(snapshot) in _ACTIVE_GCODE
+    return project_file_refused(_gcode(snapshot))
 
 
 def snapshot_echoed(snapshot, submission_id) -> bool:

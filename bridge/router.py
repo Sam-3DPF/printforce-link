@@ -30,6 +30,12 @@ from .printer import is_cancel_failed
 
 logger = logging.getLogger(__name__)
 
+# Watchdog fields stored beside an assignment. Other keys stay untouched.
+_SEND_ATTEMPT_FIELDS = frozenset({
+    "submission_id", "attempts", "phase", "phase_started_at",
+    "last_failure", "uploaded",
+})
+
 
 def is_cancel_failed_snapshot(snap: Optional[Dict]) -> bool:
     """True when a drain snapshot is a user-cancel, not a real fail."""
@@ -228,8 +234,11 @@ class Router:
 
         The attempt count, phase, and last failure live on the same object as
         the batch assignment, so a restart continues the same send instead of
-        uploading the file again.
+        uploading the file again. Only those attempt fields are written.
         """
+        fields = {
+            key: value for key, value in fields.items() if key in _SEND_ATTEMPT_FIELDS
+        }
         if not fields:
             return
         with self._lock:
