@@ -456,3 +456,149 @@ def test_remembered_ams_round_trip(tmp_path):
     save_remembered_ams(path, "P1", ams)
     assert load_remembered_ams(path, "P1")["ams"][0]["tray"][0]["tray_color"] == "E8AFCFFF"
     assert load_remembered_ams(path, "other") is None
+
+
+def test_clear_exist_bit_blanks_a_tray_that_still_has_a_color():
+    """Bit 0 wipes type, color, and remain even when the tray object still
+    carries them. A firmware echo of the old spool must not stay loaded."""
+    status = {"print": {"ams": {"tray_exist_bits": "0", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA", "remain": 40},
+        ]},
+    ]}}}
+    assert parse_ams(status) == [
+        {"slot_number": 1, "color_hex": None, "filament_type": None},
+    ]
+    previous = {"tray_exist_bits": "1", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA", "remain": 40},
+        ]},
+    ]}
+    incoming = {"tray_exist_bits": "0", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA", "remain": 40},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    tray = merged["ams"][0]["tray"][0]
+    assert tray.get("tray_color") is None
+    assert tray.get("tray_type") is None
+    assert tray.get("remain") is None
+
+
+def test_regular_state_other_than_loaded_clears_remembered_color():
+    """A regular `{id, state}` update with state other than 11 is an unload.
+    State 11 is loaded and keeps the remembered color."""
+    previous = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+        ]},
+    ]}
+    incoming = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "state": 0},
+            {"id": "1", "state": 11},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert "tray_color" not in merged["ams"][0]["tray"][0]
+    assert merged["ams"][0]["tray"][1]["tray_color"] == "A3D8E1FF"
+    # The unloaded tray is empty, so it is not a dark spool waiting on RFID.
+    # The loaded tray (state 11) with no color still is.
+    assert idle_trays_needing_rfid({"print": {"ams": incoming}}) == [(0, 1)]
+
+
+def test_regular_state_unload_blanks_an_echoed_color():
+    """State other than 11 is empty even when the tray object still has a color.
+    The first payload has no remembered tray to compare against."""
+    echoed = {"id": "0", "state": 0, "tray_color": "E8AFCFFF", "tray_type": "PLA", "remain": 40}
+    status = {"print": {"ams": {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [echoed]},
+    ]}}}
+    assert parse_ams(status) == [
+        {"slot_number": 1, "color_hex": None, "filament_type": None},
+    ]
+    incoming = {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [echoed]}]}
+    previous = {"tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA", "remain": 40},
+        ]},
+    ]}
+    for merged in (merge_ams(previous, incoming), merge_ams(None, incoming)):
+        tray = merged["ams"][0]["tray"][0]
+        assert tray.get("tray_color") is None
+        assert tray.get("tray_type") is None
+        assert tray.get("remain") is None
+
+
+def test_ams_ht_state_9_with_a_type_stays_slot_17():
+    """A loaded AMS-HT tray reports state 9, not 11. That state stays occupied."""
+    status = {"print": {"ams": {"ams": [
+        {"id": "128", "tray": [
+            {"id": "0", "state": 9, "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+        ]},
+    ]}}}
+    assert parse_ams(status) == [
+        {"slot_number": 17, "color_hex": "E8AFCFFF", "filament_type": "PLA"},
+    ]
+    previous = {"ams": [
+        {"id": "128", "tray": [
+            {"id": "0", "state": 9, "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+        ]},
+    ]}
+    incoming = {"ams": [
+        {"id": "128", "tray": [{"id": "0", "state": 9}]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert merged["ams"][0]["tray"][0]["tray_color"] == "E8AFCFFF"
+    assert merged["ams"][0]["tray"][0]["tray_type"] == "PLA"
+
+
+def test_a2l_unit_16_uses_the_unit_6_slot_and_exist_bit():
+    """Physical unit 16 is read as unit 6. Slots are 25–28. The exist bit is
+    the unit-6 base (bit 24 for tray 0), not bit 64."""
+    assert ams_slot_number(16, 0) == 25
+    assert ams_slot_number(16, 1) == 26
+    assert ams_slot_number(16, 2) == 27
+    assert ams_slot_number(16, 3) == 28
+    unit_6_bit = {"print": {"ams": {
+        "tray_exist_bits": format(1 << 24, "x"),
+        "ams": [{"id": "16", "tray": [
+            {"id": "0", "tray_color": "FF0000FF", "tray_type": "PLA"},
+        ]}],
+    }}}
+    assert parse_ams(unit_6_bit) == [
+        {"slot_number": 25, "color_hex": "FF0000FF", "filament_type": "PLA"},
+    ]
+    bit_64 = {"print": {"ams": {
+        "tray_exist_bits": format(1 << 64, "x"),
+        "ams": [{"id": "16", "tray": [
+            {"id": "0", "tray_color": "FF0000FF", "tray_type": "PLA"},
+        ]}],
+    }}}
+    assert parse_ams(bit_64) == [
+        {"slot_number": 25, "color_hex": None, "filament_type": None},
+    ]
+
+
+def test_missing_unit_list_is_none_and_vt_tray_is_not_a_slot():
+    """No unit list is None. A unit list with no trays is []. The external
+    spool is not appended to slots."""
+    assert parse_ams({"print": {}}) is None
+    assert parse_ams({"print": {"vt_tray": {
+        "id": "254", "tray_color": "FF0000FF", "tray_type": "PLA",
+    }}}) is None
+    assert parse_ams({"print": {"ams": {"ams": []}}}) == []
+    status = {"print": {
+        "vt_tray": {"id": "254", "tray_color": "FF0000FF", "tray_type": "PETG"},
+        "vir_slot": [{"id": "255", "tray_color": "00FF00FF", "tray_type": "PLA"}],
+        "ams": {"ams": [
+            {"id": "0", "tray": [
+                {"id": "0", "tray_color": "000000FF", "tray_type": "PLA"},
+            ]},
+        ]},
+    }}
+    assert parse_ams(status) == [
+        {"slot_number": 1, "color_hex": "000000FF", "filament_type": "PLA"},
+    ]
