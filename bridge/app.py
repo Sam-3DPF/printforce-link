@@ -26,6 +26,7 @@ from .pairing import ensure_paired, maybe_repair
 from .reconciler import ConfigReconciler
 from .router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
 from .send_pipeline import (
+    MAX_ATTEMPTS,
     decide,
     discard_attempt,
     failure_latched,
@@ -1213,10 +1214,12 @@ def _cancel_cloud_send(spool_dir: str, key, started_sends, router) -> None:
 
 def _fail_cloud_send(key, dpf, spool_dir, started_sends, router, reason: str) -> None:
     batch_id, _bambu_id, plate_index = key
-    _clear_pending_cloud_send(spool_dir, key, started_sends, router)
     report_failed = getattr(dpf, "report_failed", None)
     if callable(report_failed):
-        report_failed(batch_id, plate_index, reason=reason)
+        acked = report_failed(batch_id, plate_index, reason=reason)
+        if not isinstance(acked, dict) or not acked:
+            return
+    _clear_pending_cloud_send(spool_dir, key, started_sends, router)
     latch_failure(_cloud_send_started_path(spool_dir, key), key, reason)
 
 
@@ -1289,6 +1292,25 @@ def _hard_reset_printer(fleet, bambu_id: str) -> None:
             return
 
 
+def _cloud_send_session_connected(fleet, bambu_id: str) -> bool:
+    """True when a republish may publish.
+
+    No printer, or a printer with no session, counts as connected so a fake
+    publishes on the republish pass. A real session waits until it is connected.
+    """
+    by_id = getattr(fleet, "by_id", None)
+    printer = by_id(bambu_id) if callable(by_id) else None
+    if printer is None:
+        return True
+    session = getattr(printer, "_session", None)
+    if session is None:
+        return True
+    connected = getattr(session, "connected", False)
+    if callable(connected):
+        connected = connected()
+    return bool(connected)
+
+
 def _republish_start(send, fleet, bambu_id: str, dest: str, plate_index: int) -> bool:
     if not hasattr(fleet, "start_print"):
         return False
@@ -1323,12 +1345,42 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
         record["last_failure"] = None
         save_attempt(started_path, router, str(bambu_id), record)
         return
-    if action in ("reset_retry", "retry"):
-        if action == "reset_retry":
-            _hard_reset_printer(fleet, bambu_id)
+    if action == "reset_retry":
+        if record.get("pending_republish"):
+            record["attempts"] = int(record.get("attempts") or 1) + 1
             record["last_failure"] = "no_echo"
-        else:
-            record["last_failure"] = "no_active"
+            if int(record["attempts"]) >= MAX_ATTEMPTS:
+                save_attempt(started_path, router, str(bambu_id), record)
+                _fail_cloud_send(
+                    key, dpf, spool_dir, started_sends, router,
+                    failure_reason(record, snapshot),
+                )
+                return
+        _hard_reset_printer(fleet, bambu_id)
+        record["pending_republish"] = True
+        record["last_failure"] = "no_echo"
+        record["phase"] = "A"
+        record["phase_started_at"] = now
+        save_attempt(started_path, router, str(bambu_id), record)
+        return
+    if action == "republish":
+        if not _cloud_send_session_connected(fleet, bambu_id):
+            return
+        dest = os.path.join(spool_dir, f"{batch_id}.3mf")
+        if not _republish_start(send, fleet, bambu_id, dest, plate_index):
+            return
+        record["pending_republish"] = False
+        record["attempts"] = int(record.get("attempts") or 1) + 1
+        record["phase"] = "A"
+        record["phase_started_at"] = now
+        fresh = _submission_on_printer(fleet, bambu_id)
+        if fresh is not None:
+            record["submission_id"] = fresh
+        record["uploaded"] = True
+        save_attempt(started_path, router, str(bambu_id), record)
+        return
+    if action == "retry":
+        record["last_failure"] = "no_active"
         dest = os.path.join(spool_dir, f"{batch_id}.3mf")
         if not _republish_start(send, fleet, bambu_id, dest, plate_index):
             _fail_cloud_send(

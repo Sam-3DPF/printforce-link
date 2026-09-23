@@ -4,10 +4,11 @@ Phase A lasts 90 seconds. An active printer state confirms the send. An echo
 of this send's submission id, with no active state yet, moves to phase B.
 Phase B lasts 180 seconds and only confirms on an active state.
 
-A phase A timeout hard-resets the session and publishes the start again.
-A phase B timeout publishes again without a reset: resetting while the
-printer is still parsing the file is what produces 0500_4003. Three attempts
-and the send fails with the last reason. The file is uploaded once.
+A phase A timeout hard-resets the session and waits until the session is
+connected before publishing again. A phase B timeout publishes again without
+a reset: resetting while the printer is still parsing the file is what
+produces 0500_4003. Three attempts and the send fails with the last reason.
+The file is uploaded once.
 """
 
 import json
@@ -23,7 +24,7 @@ _READY_GCODE = frozenset({"IDLE", "FINISH", "FAILED"})
 _BUSY_STATUS = frozenset({"PRINTING", "PAUSED", "OFFLINE"})
 _ATTEMPT_FIELDS = (
     "submission_id", "attempts", "phase", "phase_started_at",
-    "last_failure", "uploaded",
+    "last_failure", "uploaded", "pending_republish",
 )
 
 
@@ -96,9 +97,9 @@ def decide(record, snapshot, now, *, phase_a=PHASE_A_SECONDS,
     """What the watchdog should do on this pass.
 
     ``confirm`` the printer is active. ``enter_b`` the printer echoed our id.
-    ``reset_retry`` phase A ran out. ``retry`` phase B ran out. ``fail`` the
-    attempt budget is spent or the printer is refusing commands. ``wait``
-    otherwise.
+    ``reset_retry`` phase A ran out. ``republish`` a reset is waiting on a
+    connected session. ``retry`` phase B ran out. ``fail`` the attempt budget
+    is spent or the printer is refusing commands. ``wait`` otherwise.
     """
     if snapshot_commands_rejected(snapshot):
         return "fail"
@@ -114,6 +115,12 @@ def decide(record, snapshot, now, *, phase_a=PHASE_A_SECONDS,
         attempts = int(record.get("attempts") or 1)
     except (TypeError, ValueError):
         attempts = 1
+    if record.get("pending_republish"):
+        if attempts >= max_attempts:
+            return "fail"
+        if age >= phase_a:
+            return "reset_retry"
+        return "republish"
     if phase == "B":
         if age >= phase_b:
             return "fail" if attempts >= max_attempts else "retry"
@@ -155,6 +162,7 @@ def load_attempt(started_path: str, router, bambu_id: str, now: float) -> dict:
     data.setdefault("uploaded", os.path.exists(started_path))
     data.setdefault("last_failure", None)
     data.setdefault("submission_id", None)
+    data.setdefault("pending_republish", False)
     return data
 
 

@@ -346,7 +346,15 @@ def test_idle_after_start_timeout_clears_marker_and_reports_failed(tmp_path):
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
     clock.advance(PHASE_A_SECONDS)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
     _handle_cloud_sends(
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
@@ -1081,6 +1089,7 @@ def test_cloud_send_retries_start_while_printer_stays_idle(tmp_path):
     fleet = _ConfirmFleet()
     dpf = _FakeDpf()
     _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), {key})
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), {key})
     assert fleet.uploads == []
     assert fleet.starts[0][2] == [-1, -1, -1, 0, -1, -1, -1, -1, 2]
     assert fleet.starts[0][3] == 2
@@ -1110,6 +1119,10 @@ def test_idle_retry_does_not_reset_startup_grace(tmp_path):
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
     assert len(fleet.starts) == 2
     assert len(fleet.uploads) == 1
     assert dpf.dispatched == []
@@ -1124,6 +1137,10 @@ def test_idle_retry_does_not_reset_startup_grace(tmp_path):
     assert dpf.failed == []
 
     clock.advance(1)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
     _handle_cloud_sends(
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
@@ -1191,6 +1208,10 @@ def test_idle_retry_does_not_stop_leftover_finished_before_the_second_start(tmp_
     from bridge.send_pipeline import PHASE_A_SECONDS
 
     clock.advance(PHASE_A_SECONDS)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
     _handle_cloud_sends(
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,

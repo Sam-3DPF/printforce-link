@@ -111,6 +111,35 @@ def test_commands_rejected_fails_the_send_without_an_upload(tmp_path):
     assert dpf.failed == [("B1", 2, "commands_rejected")]
 
 
+def test_unacked_failure_is_reported_again_then_latched(tmp_path):
+    fleet = _ConfirmFleet()
+    fleet._printer._snapshot = _legacy_ready_snapshot(
+        commands_rejected=True, connection="live",
+    )
+
+    class _RetryAck(_FakeDpf):
+        def report_failed(self, batch_id, plate_number=None, reason=None):
+            self.failed.append((batch_id, plate_number, reason))
+            if len(self.failed) == 1:
+                return {}
+            return {"batch_id": batch_id}
+
+    dpf = _RetryAck()
+    spool = str(tmp_path)
+    started_path = _cloud_send_started_path(spool, ("B1", "P1", 2))
+    _handle_cloud_sends(_desired(), fleet, dpf, spool, set())
+    assert dpf.failed == [("B1", 2, "commands_rejected")]
+    assert failure_latched(started_path) is False
+    _handle_cloud_sends(_desired(), fleet, dpf, spool, set())
+    assert dpf.failed == [
+        ("B1", 2, "commands_rejected"),
+        ("B1", 2, "commands_rejected"),
+    ]
+    assert failure_latched(started_path) is True
+    _handle_cloud_sends(_desired(), fleet, dpf, spool, set())
+    assert len(dpf.failed) == 2
+
+
 def test_a_printing_printer_never_gets_an_upload(tmp_path):
     fleet = _ConfirmFleet(status="PRINTING")
     fleet._printer._snapshot["connection"] = "live"
@@ -148,36 +177,77 @@ def test_stop_during_phase_a_abandons_without_a_failure(tmp_path):
     assert started == set()
 
 
+def test_pending_republish_waits_then_resets_or_fails():
+    record = _record(submission_id="42")
+    record["pending_republish"] = True
+    idle = {"status": "IDLE"}
+    assert decide(record, idle, PHASE_A_SECONDS - 1) == "republish"
+    assert decide(
+        record, {"status": "IDLE", "gcode_state": "RUNNING"}, 1,
+    ) == "confirm"
+    assert decide(
+        record, {"status": "IDLE", "print_submission_id": "42"}, 1,
+    ) == "republish"
+    assert decide(record, idle, PHASE_A_SECONDS) == "reset_retry"
+    record["attempts"] = MAX_ATTEMPTS
+    assert decide(record, idle, 1) == "fail"
+
+
 def test_phase_a_timeout_resets_once_and_does_not_upload_again(tmp_path):
+    class _Session:
+        def __init__(self):
+            self.connected = True
+            self.resets = 0
+
+        def hard_reset(self):
+            self.resets += 1
+            self.connected = False
+
     class _ResetFleet(_ConfirmFleet):
         def __init__(self):
             super().__init__()
             self.resets = 0
+            self._printer._session = _Session()
 
         def hard_reset(self):
             self.resets += 1
 
     clock = _Clock()
     fleet = _ResetFleet()
+    session = fleet._printer._session
     dpf = _FakeDpf()
     router = Router(str(tmp_path / "queue.json"))
     started = set()
-    _handle_cloud_sends(
-        _desired(), fleet, dpf, str(tmp_path), started, router=router,
-        wall_time=lambda: clock.now,
-    )
+    kwargs = {
+        "router": router,
+        "wall_time": lambda: clock.now,
+    }
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started, **kwargs)
     clock.advance(PHASE_A_SECONDS)
-    _handle_cloud_sends(
-        _desired(), fleet, dpf, str(tmp_path), started, router=router,
-        wall_time=lambda: clock.now,
-    )
-    assert fleet.resets == 1
-    assert len(fleet.starts) == 2
-    assert len(fleet.uploads) == 1
-    assert dpf.failed == []
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started, **kwargs)
     stored = router.assignments_snapshot()["P1"]
+    assert session.resets == 1
+    assert fleet.resets == 0
+    assert len(fleet.starts) == 1
+    assert dpf.failed == []
+    assert stored["attempts"] == 1
+    assert stored["pending_republish"] is True
+
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started, **kwargs)
+    assert len(fleet.starts) == 1
+    assert dpf.failed == []
+    assert session.resets == 1
+    assert fleet.resets == 0
+
+    session.connected = True
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started, **kwargs)
+    stored = router.assignments_snapshot()["P1"]
+    assert len(fleet.starts) == 2
     assert stored["attempts"] == 2
-    assert stored["phase"] == "A"
+    assert stored["pending_republish"] is False
+    assert len(fleet.uploads) == 1
+    assert fleet.resets == 0
+    assert dpf.failed == []
 
 
 def test_phase_b_timeout_retries_without_resetting(tmp_path):
