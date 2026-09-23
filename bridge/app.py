@@ -6,6 +6,7 @@ interval. Run with: `python -m bridge.app config.toml`.
 """
 
 from collections import OrderedDict
+import inspect
 import logging
 import os
 import re
@@ -24,6 +25,22 @@ from .printer import BambuPrinter
 from .pairing import ensure_paired, maybe_repair
 from .reconciler import ConfigReconciler
 from .router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
+from .send_pipeline import (
+    MAX_ATTEMPTS,
+    decide,
+    discard_attempt,
+    failure_latched,
+    failure_reason,
+    latch_failure,
+    load_attempt,
+    mark_uploaded,
+    printer_is_held,
+    ready_for_upload,
+    release_settled_attempts,
+    save_attempt,
+    snapshot_commands_rejected,
+    uploaded_already,
+)
 from .store import PrinterStore
 from .updater import SelfUpdater, default_state_path
 
@@ -38,13 +55,11 @@ _FILAMENT_FAMILIES = ("PETG", "PLA", "ABS", "ASA", "TPU", "PA", "PC", "PVA", "HI
 LEGACY_MARKER_MIN_AGE_SECONDS = ASSIGNMENT_STARTUP_GRACE_SECONDS
 LEGACY_READY_OBSERVATION_MIN_GAP_SECONDS = 5.0
 LEGACY_READY_OBSERVATION_LIMIT = 256
-# MQTT start_print True is not an ack. Poll this long for PRINTING/PAUSED, then
-# leave the send pending until the next loop or the startup-grace timeout.
+# MQTT start_print True is not an ack. Callers may still pass
+# confirm_wait_seconds; the watchdog decides when the send is confirmed.
 CLOUD_SEND_CONFIRM_WAIT_SECONDS = 8.0
-CLOUD_SEND_CONFIRM_POLL_SECONDS = 0.5
 STARTED_MARKER_COMMANDED = "commanded"
 STARTED_MARKER_CONFIRMED = "confirmed"
-RETRY_IDLE_START_AFTER_SECONDS = 20.0
 
 
 class _LegacyMarkerReadiness:
@@ -180,6 +195,119 @@ def _start_printhost(cfg: Config, dpf: Optional["DpfClient"] = None) -> Optional
     return router
 
 
+_OFFLINE_DIAGNOSTIC_AFTER_SECONDS = 300.0
+
+
+class _OfflineDiagnosticTrigger:
+    """One automatic diagnostic per offline spell.
+
+    The clock starts the first time a serial is reported OFFLINE. More than
+    five minutes later, one run is queued. Further OFFLINE reports in that
+    spell do not queue another. Any other status clears the spell, so the
+    next long outage can run again. A worker that is already busy is left
+    for this pass: the check waits on the printer, and it is not marked done
+    until a worker actually accepts it.
+    """
+
+    def __init__(self, monotonic=time.monotonic,
+                 offline_after_seconds=_OFFLINE_DIAGNOSTIC_AFTER_SECONDS):
+        self._monotonic = monotonic
+        self._offline_after = float(offline_after_seconds)
+        self._since = {}
+        self._ran = set()
+
+    def consider(self, reports, fleet, dpf) -> None:
+        now = float(self._monotonic())
+        for report in reports or []:
+            if not isinstance(report, dict):
+                continue
+            serial = report.get("bambu_id")
+            if not serial:
+                continue
+            serial = str(serial)
+            if report.get("status") != "OFFLINE":
+                self._since.pop(serial, None)
+                self._ran.discard(serial)
+                continue
+            since = self._since.get(serial)
+            if since is None:
+                self._since[serial] = now
+                continue
+            if serial in self._ran:
+                continue
+            if now - since <= self._offline_after:
+                continue
+            busy = getattr(fleet, "worker_busy", None)
+            if callable(busy) and busy(serial):
+                continue
+            by_id = getattr(fleet, "by_id", None)
+            printer = by_id(serial) if callable(by_id) else None
+            if printer is None:
+                continue
+            if _queue_diagnose(
+                fleet, printer, dpf, serial, None, trigger="auto_offline",
+            ):
+                self._ran.add(serial)
+
+
+def _ack_reported_events(fleet, response, reports) -> None:
+    """Drop lifecycle events only after ``report_state`` accepts the POST.
+
+    A failed POST returns an empty dict. The same event ids go out on the
+    next pass. Acking before the accept would lose the edge.
+    """
+    if not isinstance(response, dict) or not response:
+        return
+    ack = getattr(fleet, "ack_events", None)
+    if not callable(ack):
+        return
+    by_printer = {}
+    for report in reports or []:
+        if not isinstance(report, dict):
+            continue
+        bambu_id = report.get("bambu_id")
+        events = report.get("events")
+        if not bambu_id or not isinstance(events, list):
+            continue
+        ids = [
+            event.get("id")
+            for event in events
+            if isinstance(event, dict) and isinstance(event.get("id"), str) and event.get("id")
+        ]
+        if ids:
+            by_printer[bambu_id] = ids
+    if by_printer:
+        ack(by_printer)
+
+
+def _register_persisted_submissions(fleet, router) -> None:
+    """Register submission ids loaded from the assignment file.
+
+    Has to happen before the printer's first report of this process. A
+    finish seen before the id is registered is classified external, and an
+    external finish does not close the batch.
+    """
+    if router is None or fleet is None:
+        return
+    snapshot = getattr(router, "assignments_snapshot", None)
+    register = getattr(fleet, "register_submission", None)
+    if not callable(snapshot) or not callable(register):
+        return
+    try:
+        assignments = snapshot()
+    except Exception:
+        logger.exception("could not read assignments to register submission ids")
+        return
+    if not isinstance(assignments, dict):
+        return
+    for bambu_id, assignment in assignments.items():
+        if not isinstance(assignment, dict):
+            continue
+        submission_id = assignment.get("submission_id")
+        if submission_id:
+            register(bambu_id, submission_id)
+
+
 def main(config_path: str = "config.toml") -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     cfg = load_config(config_path)
@@ -209,10 +337,16 @@ def main(config_path: str = "config.toml") -> None:
     # store (U4) — the store is how the onboarding wizard's printers reach the bridge
     # without a file edit. On restart the store re-connects everything already onboarded.
     printer_configs = _merge_printer_configs(cfg.printers, store.configs())
-    ams_cache_path = os.path.join(os.path.dirname(os.path.abspath(config_path)) or ".", "ams-cache.json")
+    config_dir = os.path.dirname(os.path.abspath(config_path)) or "."
+    ams_cache_path = os.path.join(config_dir, "ams-cache.json")
+    log_dir = os.path.join(config_dir, "logs")
+    os.makedirs(log_dir, exist_ok=True)
 
     def make_printer(printer_cfg, stale_after_seconds=None):
-        kwargs = {"ams_cache_path": ams_cache_path}
+        kwargs = {
+            "ams_cache_path": ams_cache_path,
+            "log_path": _printer_log_path(log_dir, printer_cfg.bambu_id),
+        }
         if stale_after_seconds is not None:
             kwargs["stale_after_seconds"] = stale_after_seconds
         return BambuPrinter(printer_cfg, **kwargs)
@@ -228,26 +362,42 @@ def main(config_path: str = "config.toml") -> None:
     # within two minutes. connect_all can sit on a half-open printer socket for
     # that whole window, so reach 3DPF before connecting printers.
     _confirm_startup_health(dpf, updater)
-    fleet.connect_all()
-    reconciler = ConfigReconciler(dpf, fleet, store)
-    discovery_reporter = DiscoveryReporter(dpf)
-    logger.info("%d printer(s) at startup (%d from config.toml, %d from the local store)",
-                len(printer_configs), len(cfg.printers), len(store.configs()))
-
     # Print-host accepts OrcaSlicer uploads and forwards them into the cloud
     # Sliced Queue. Local auto-dispatch is off; start is a cloud send command.
+    # The router is loaded before connect_all so a persisted submission id is
+    # registered before the printer's first report. A finish that arrives
+    # first would otherwise be classified external.
     router = _start_printhost(cfg, dpf)
     dispatcher = None
     if router is not None:
         dispatcher = Dispatcher(router, fleet, dpf)
+        router.set_submission_registrar(fleet.register_submission)
+        _register_persisted_submissions(fleet, router)
         logger.info("print-host enabled; %d job(s) restored from the queue",
                     len(router.pending()))
+    fleet.connect_all()
+    reconciler = ConfigReconciler(dpf, fleet, store)
+    def _remember_models(found) -> None:
+        for printer in found:
+            serial = getattr(printer, "serial", None)
+            model = getattr(printer, "model", None)
+            if serial and model:
+                store.set_model(serial, model)
+                fleet.set_model(serial, model)
+
+    discovery_reporter = DiscoveryReporter(dpf, on_found=_remember_models)
+    logger.info("%d printer(s) at startup (%d from config.toml, %d from the local store)",
+                len(printer_configs), len(cfg.printers), len(store.configs()))
 
     last_heartbeat = 0.0
     last_repair_attempt = None
     started_sends = set()
     applied_controls = set()
-    legacy_marker_readiness = _LegacyMarkerReadiness()
+    offline_diagnostics = _OfflineDiagnosticTrigger()
+    # One readiness object per serial. retain() drops keys this call did not see,
+    # so a shared object would forget another printer's legacy-marker observations.
+    legacy_marker_readiness = {}
+    cloud_send_jobs = {}
     spool_dir = cfg.printhost.spool_dir if cfg.printhost else "/tmp/printforce-spool"
     os.makedirs(spool_dir, exist_ok=True)
     logger.info("Reporting every %ss; heartbeat every %ss; a printer that says nothing "
@@ -259,12 +409,9 @@ def main(config_path: str = "config.toml") -> None:
         # this iteration has finished every irreversible printer action and durable marker.
         update_restart_lock.acquire()
         try:
+            if router is not None:
+                _register_persisted_submissions(fleet, router)
             reports = fleet.snapshot()
-            printers_busy = any(
-                isinstance(report, dict)
-                and report.get("status") in ("PRINTING", "PAUSED")
-                for report in reports
-            )
             wire_reports = (
                 router.annotate_reports(reports)
                 if router is not None
@@ -275,6 +422,7 @@ def main(config_path: str = "config.toml") -> None:
                 ]
             )
             response = dpf.report_state(wire_reports, link=updater.metadata())
+            _ack_reported_events(fleet, response, wire_reports)
             last_repair_attempt = maybe_repair(
                 dpf,
                 store,
@@ -289,7 +437,6 @@ def main(config_path: str = "config.toml") -> None:
             force_update = updater.apply_cloud_command(
                 response.get("update") if isinstance(response, dict) else None
             )
-            updater.tick_async(force=force_update, printers_busy=printers_busy)
             desired = response.get("printers") if isinstance(response, dict) else None
             # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
             # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
@@ -299,7 +446,15 @@ def main(config_path: str = "config.toml") -> None:
             _apply_desired(
                 desired or [], fleet, dpf, spool_dir, started_sends, applied_controls,
                 router=router, legacy_marker_readiness=legacy_marker_readiness,
+                cloud_send_jobs=cloud_send_jobs,
             )
+            # After sends are queued, so a worker already uploading is skipped
+            # this pass. One run per offline spell, not one per loop.
+            offline_diagnostics.consider(reports, fleet, dpf)
+            # After sends are queued: a worker that is mid-upload is busy even
+            # while the snapshot still says IDLE, and a restart must not kill it.
+            printers_busy = _printers_busy(reports, fleet)
+            updater.tick_async(force=force_update, printers_busy=printers_busy)
 
             # Drain queued uploads onto idle, color-matched printers, matching on THIS
             # pass's fresh reports (the KTD3 dispatch-time re-validation). U9.
@@ -331,7 +486,11 @@ def main(config_path: str = "config.toml") -> None:
             # Self-heal any printer that dropped off the network — re-discover it by
             # serial and reconnect at its new IP if DHCP moved it (U1). Throttled and only
             # when something is actually offline, so a healthy farm pays nothing.
+            # A client that already had a session and has been silent for minutes is
+            # rebuilt in place when its port still accepts TCP. That does not wait
+            # for SSDP and does not replace the printer object.
             fleet.reconcile_connections()
+            fleet.recover_dead_sessions()
 
             now = time.monotonic()
             if now - last_heartbeat >= cfg.heartbeat_interval_seconds:
@@ -341,7 +500,6 @@ def main(config_path: str = "config.toml") -> None:
                 force_update = updater.apply_cloud_command(
                     heartbeat.get("update") if isinstance(heartbeat, dict) else None
                 )
-                updater.tick_async(force=force_update, printers_busy=printers_busy)
                 heartbeat_desired = (
                     heartbeat.get("printers") if isinstance(heartbeat, dict) else None
                 )
@@ -349,7 +507,10 @@ def main(config_path: str = "config.toml") -> None:
                     heartbeat_desired or [], fleet, dpf, spool_dir, started_sends,
                     applied_controls, router=router,
                     legacy_marker_readiness=legacy_marker_readiness,
+                    cloud_send_jobs=cloud_send_jobs,
                 )
+                printers_busy = _printers_busy(reports, fleet)
+                updater.tick_async(force=force_update, printers_busy=printers_busy)
                 last_heartbeat = now
         except Exception:
             # Never let one bad iteration kill the long-running reporter — nothing
@@ -361,18 +522,116 @@ def main(config_path: str = "config.toml") -> None:
         time.sleep(cfg.state_interval_seconds)
 
 
-_CONTROL_ACTIONS = frozenset({"pause", "resume", "stop", "refresh"})
+_CONTROL_ACTIONS = frozenset({
+    "pause", "resume", "stop", "refresh", "collect_log", "diagnose",
+})
+
+
+def _printers_busy(reports, fleet) -> bool:
+    """True when a self-update restart could cut a print or an in-flight send.
+
+    PRINTING and PAUSED are the steady signal. A cloud upload occupies the
+    printer worker before the status changes, so a busy worker counts too.
+    """
+    if any(
+        isinstance(report, dict) and report.get("status") in ("PRINTING", "PAUSED")
+        for report in reports
+    ):
+        return True
+    busy = getattr(fleet, "worker_busy", None)
+    if not callable(busy):
+        return False
+    for report in reports:
+        if not isinstance(report, dict):
+            continue
+        serial = report.get("bambu_id")
+        if serial and busy(serial):
+            return True
+    return False
+
+
+# started_sends is one set shared by every printer worker.
+_STARTED_SENDS_LOCK = threading.Lock()
+
+
+def _send_known(started_sends, key) -> bool:
+    with _STARTED_SENDS_LOCK:
+        return key in started_sends
+
+
+def _send_mark(started_sends, key) -> None:
+    with _STARTED_SENDS_LOCK:
+        started_sends.add(key)
+
+
+def _send_drop(started_sends, key) -> None:
+    with _STARTED_SENDS_LOCK:
+        started_sends.discard(key)
+
+
+def _send_keys(started_sends):
+    with _STARTED_SENDS_LOCK:
+        return list(started_sends)
 
 
 def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
                    started_sends, applied_controls, router=None,
-                   legacy_marker_readiness=None) -> None:
-    """Apply control then cloud sends from one desired-state payload."""
-    _handle_desired(desired, fleet, applied_controls, spool_dir, router=router)
-    _handle_cloud_sends(
-        desired, fleet, dpf, spool_dir, started_sends, router=router,
-        legacy_marker_readiness=legacy_marker_readiness,
-    )
+                   legacy_marker_readiness=None, cloud_send_jobs=None) -> None:
+    """Apply control on this thread, then cloud sends on each printer's worker.
+
+    Controls stay here: publish does not block, and refresh is queued inside
+    ``Fleet.apply_control``. Cloud sends do network I/O, so when the fleet has
+    ``submit`` each serial runs on its own worker. A serial whose send is still
+    queued or running is left for the next pass instead of being queued twice.
+    Fakes without ``submit`` keep the single inline call.
+    """
+    _handle_desired(desired, fleet, applied_controls, spool_dir, router=router, dpf=dpf)
+    submit = getattr(fleet, "submit", None)
+    if not callable(submit):
+        _handle_cloud_sends(
+            desired, fleet, dpf, spool_dir, started_sends, router=router,
+            legacy_marker_readiness=legacy_marker_readiness,
+        )
+        return
+    if cloud_send_jobs is None:
+        cloud_send_jobs = {}
+    if not isinstance(legacy_marker_readiness, dict):
+        legacy_marker_readiness = {}
+    grouped = {}
+    order = []
+    for row in desired or []:
+        if not isinstance(row, dict) or not row.get("bambu_id"):
+            continue
+        serial = str(row["bambu_id"])
+        if serial not in grouped:
+            order.append(serial)
+            grouped[serial] = []
+        grouped[serial].append(row)
+    for serial in order:
+        inflight = cloud_send_jobs.get(serial)
+        if inflight is not None and not inflight.done():
+            continue
+        readiness = legacy_marker_readiness.get(serial)
+        if not isinstance(readiness, _LegacyMarkerReadiness):
+            readiness = _LegacyMarkerReadiness()
+            legacy_marker_readiness[serial] = readiness
+        future = submit(
+            serial,
+            _handle_cloud_sends,
+            grouped[serial],
+            fleet,
+            dpf,
+            spool_dir,
+            started_sends,
+            router=router,
+            legacy_marker_readiness=readiness,
+            release_failures=False,
+        )
+        if future is not None:
+            cloud_send_jobs[serial] = future
+    # Each worker sees only its own serial. Releasing here, with every send
+    # still in desired, is what keeps one printer from clearing another's latch.
+    release_settled_attempts(spool_dir, _desired_cloud_send_keys(desired))
 
 
 def _control_from_row(row: dict):
@@ -421,7 +680,7 @@ def _authorized_send(desired: List[Dict], bambu_id: str, batch_id: str,
 
 
 def _handle_desired(desired: List[Dict], fleet=None, applied_controls=None,
-                    spool_dir: Optional[str] = None, router=None) -> None:
+                    spool_dir: Optional[str] = None, router=None, dpf=None) -> None:
     """Act on the authoritative desired-state 3DPF returns.
 
     `control` is one-shot: the same id is published once, then remembered like
@@ -439,11 +698,119 @@ def _handle_desired(desired: List[Dict], fleet=None, applied_controls=None,
         bambu_id = row.get("bambu_id")
         if control is None or not bambu_id:
             continue
-        _apply_control(fleet, str(bambu_id), control, applied_controls, spool_dir, router)
+        _apply_control(
+            fleet, str(bambu_id), control, applied_controls, spool_dir, router, dpf=dpf,
+        )
+
+
+def _printer_log_path(log_dir: str, serial: str) -> str:
+    """One jsonl file per serial. The serial is a path segment, so it is sanitized."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", str(serial))[:128] or "printer"
+    return os.path.join(log_dir, f"printer-{safe}.jsonl")
+
+
+def _log_upload_accepted(result) -> bool:
+    return isinstance(result, dict) and bool(result)
+
+
+def _queue_collect_log(fleet, printer, dpf, bambu_id: str, control_id: str) -> bool:
+    """Upload off the report loop.
+
+    A queued POST counts as applied, the same way refresh does: this pass must
+    not wait on 3DPF. A printer with no ``collect_log`` is a no-op. No uploader,
+    or an empty response, leaves the id unmarked so the next pass retries.
+    """
+    collect = getattr(printer, "collect_log", None)
+    if not callable(collect):
+        logger.warning("printer %s: collect_log is not available", bambu_id)
+        return True
+    try:
+        payload = collect()
+    except Exception:
+        logger.exception(
+            "printer %s: collect_log failed; will retry this control.id", bambu_id,
+        )
+        return False
+    upload = getattr(dpf, "upload_printer_log", None) if dpf is not None else None
+    if not callable(upload):
+        logger.warning(
+            "printer %s: collect_log has nowhere to upload; will retry", bambu_id,
+        )
+        return False
+
+    def _send():
+        return upload(bambu_id, payload, control_id=control_id)
+
+    submit = getattr(fleet, "submit", None)
+    if callable(submit):
+        future = submit(bambu_id, _send)
+        if future is None or future.cancelled():
+            return False
+        if future.done():
+            if future.exception() is not None:
+                return False
+            return _log_upload_accepted(future.result())
+        return True
+    try:
+        result = _send()
+    except Exception:
+        logger.exception(
+            "printer %s: collect_log upload failed; will retry this control.id",
+            bambu_id,
+        )
+        return False
+    return _log_upload_accepted(result)
+
+
+def _diagnostic_posted(result) -> bool:
+    return isinstance(result, dict) and bool(result)
+
+
+def _queue_diagnose(fleet, printer, dpf, bambu_id: str, control_id, *, trigger) -> bool:
+    """Run the check off the report loop, then POST it.
+
+    The MQTT windows alone can take 30 seconds. Doing that here would stall
+    every other printer. A queued run counts as applied, the same way
+    collect_log's upload does: this pass must not wait on the printer or on
+    3DPF. No reporter, or an empty response from an inline call, leaves the
+    id unmarked so the next pass retries.
+    """
+    report = getattr(dpf, "report_diagnostic", None) if dpf is not None else None
+    if not callable(report):
+        logger.warning(
+            "printer %s: diagnose has nowhere to report; will retry", bambu_id,
+        )
+        return False
+    diagnose = getattr(printer, "diagnose", None)
+    if not callable(diagnose):
+        logger.warning("printer %s: diagnose is not available", bambu_id)
+        return True
+
+    def _run():
+        return report(bambu_id, diagnose(trigger=trigger), control_id=control_id)
+
+    submit = getattr(fleet, "submit", None)
+    if callable(submit):
+        future = submit(bambu_id, _run)
+        if future is None or future.cancelled():
+            return False
+        if future.done():
+            if future.exception() is not None:
+                return False
+            return _diagnostic_posted(future.result())
+        return True
+    try:
+        result = _run()
+    except Exception:
+        logger.exception(
+            "printer %s: diagnose failed; will retry this control.id", bambu_id,
+        )
+        return False
+    return _diagnostic_posted(result)
 
 
 def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
-                   spool_dir: Optional[str], router) -> None:
+                   spool_dir: Optional[str], router, dpf=None) -> None:
     control_id = control["id"]
     marker = (
         os.path.join(spool_dir, f"control-{control_id}.applied")
@@ -457,36 +824,45 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
         logger.warning("control %s for unknown printer %s", control["action"], bambu_id)
         return
     action = control["action"]
-    result = None
-    try:
-        if callable(getattr(fleet, "apply_control", None)):
-            result = fleet.apply_control(bambu_id, action)
-        elif action == "pause":
-            result = printer.pause_print()
-        elif action == "resume":
-            result = (
-                printer.resume_from_stage()
-                if hasattr(printer, "resume_from_stage")
-                else printer.resume_print()
-            )
-        elif action == "stop":
-            result = printer.stop_print()
-        elif action == "refresh":
-            result = (
-                printer.request_full_status()
-                if hasattr(printer, "request_full_status")
-                else False
-            )
-    except Exception:
-        logger.exception("printer %s: %s failed; will retry this control.id",
-                         bambu_id, action)
-        return
-    if result is False:
-        logger.warning("printer %s: %s was not published; will retry this control.id",
-                       bambu_id, action)
-        return
-    if action == "stop" and router is not None and hasattr(router, "clear_assignment"):
-        router.clear_assignment(bambu_id)
+    if action == "collect_log":
+        if not _queue_collect_log(fleet, printer, dpf, bambu_id, control_id):
+            return
+    elif action == "diagnose":
+        if not _queue_diagnose(
+            fleet, printer, dpf, bambu_id, control_id, trigger="operator",
+        ):
+            return
+    else:
+        result = None
+        try:
+            if callable(getattr(fleet, "apply_control", None)):
+                result = fleet.apply_control(bambu_id, action)
+            elif action == "pause":
+                result = printer.pause_print()
+            elif action == "resume":
+                result = (
+                    printer.resume_from_stage()
+                    if hasattr(printer, "resume_from_stage")
+                    else printer.resume_print()
+                )
+            elif action == "stop":
+                result = printer.stop_print()
+            elif action == "refresh":
+                result = (
+                    printer.request_full_status()
+                    if hasattr(printer, "request_full_status")
+                    else False
+                )
+        except Exception:
+            logger.exception("printer %s: %s failed; will retry this control.id",
+                             bambu_id, action)
+            return
+        if result is False:
+            logger.warning("printer %s: %s was not published; will retry this control.id",
+                           bambu_id, action)
+            return
+        if action == "stop" and router is not None and hasattr(router, "clear_assignment"):
+            router.clear_assignment(bambu_id)
     applied_controls.add(control_id)
     if marker:
         try:
@@ -496,18 +872,35 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
             pass
 
 
+def _desired_cloud_send_keys(desired) -> set:
+    """Send keys the cloud is still asking for, on every printer."""
+    live = set()
+    for row in desired or []:
+        if not isinstance(row, dict):
+            continue
+        send = row.get("send")
+        if not isinstance(send, dict):
+            continue
+        bambu_id = row.get("bambu_id")
+        batch_id = send.get("batch_id")
+        if not bambu_id or not batch_id:
+            continue
+        live.add((str(batch_id), str(bambu_id), int(send.get("plate_index") or 1)))
+    return live
+
+
 def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                        started_sends=None, router=None,
                        legacy_marker_readiness=None,
                        wall_time=time.time,
                        confirm_wait_seconds=CLOUD_SEND_CONFIRM_WAIT_SECONDS,
-                       sleep_fn=time.sleep) -> None:
+                       sleep_fn=time.sleep,
+                       release_failures: bool = True) -> None:
     """Start a print only when the cloud Sliced Queue says so.
 
     MQTT publish True is not a physical start. DISPATCHED is reported only after
-    the printer snapshot shows PRINTING or PAUSED. A commanded-but-idle send is
-    left pending (never started twice) until that proof arrives, or the startup
-    grace expires and local start state is cleared so the cloud can keep SENDING.
+    the printer snapshot shows PRINTING or PAUSED. A commanded send stays in the
+    watchdog until an active snapshot confirms it or the attempt budget fails it.
     """
     import os
     if started_sends is None:
@@ -535,6 +928,8 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             continue
         key = (str(batch_id), str(bambu_id), plate_index)
         live.add(key)
+        if failure_latched(_cloud_send_started_path(spool_dir, key)):
+            continue
         dest = os.path.join(spool_dir, f"{batch_id}.3mf")
         started_path = _cloud_send_started_path(spool_dir, key)
         legacy_started_path = dest + ".started"
@@ -595,21 +990,19 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     batch_id,
                 )
                 continue
-        if key in started_sends or os.path.exists(started_path) or assignment_matches:
-            started_sends.add(key)
+        if _send_known(started_sends, key) or os.path.exists(started_path) or assignment_matches:
+            _send_mark(started_sends, key)
+            if _row_has_stop(row):
+                logger.info("cloud send %s: stop during confirmation; abandoning", batch_id)
+                _cancel_cloud_send(spool_dir, key, started_sends, router)
+                continue
             if router is not None and not assignment_matches:
                 router.record_assignment(
                     str(bambu_id), str(batch_id), plate_index,
                     started_at=_cloud_send_started_at(started_path, wall_time),
                 )
-            if _should_retry_idle_start(
-                fleet, bambu_id, started_path, wall_time, router,
-            ):
-                _retry_idle_mqtt_start(
-                    send, fleet, bambu_id, dest, plate_index,
-                )
-            _confirm_or_abandon_cloud_send(
-                key, fleet, dpf, spool_dir, started_sends, router, wall_time,
+            _advance_cloud_send(
+                key, send, fleet, dpf, spool_dir, started_sends, router, wall_time,
             )
             continue
         if _row_has_stop(row):
@@ -618,9 +1011,19 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         if str(row.get("desired_status") or "IDLE") != "IDLE":
             continue
         snapshot = _live_snapshot(fleet, str(bambu_id))
-        if isinstance(snapshot, dict) and snapshot.get("status") == "OFFLINE":
+        if not ready_for_upload(snapshot):
             logger.warning(
-                "cloud send %s: printer %s is offline; not uploading",
+                "cloud send %s: printer %s is not idle and live; not uploading",
+                batch_id, bambu_id,
+            )
+            if snapshot_commands_rejected(snapshot):
+                _fail_cloud_send(
+                    key, dpf, spool_dir, started_sends, router, "commands_rejected",
+                )
+            continue
+        if printer_is_held(_send_keys(started_sends), bambu_id, key, live):
+            logger.info(
+                "cloud send %s: printer %s already has a send in progress",
                 batch_id, bambu_id,
             )
             continue
@@ -652,7 +1055,11 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         remote_name = _cloud_remote_name(send)
         uploaded = None
         if hasattr(fleet, "upload") and hasattr(fleet, "start_print"):
-            uploaded = fleet.upload(bambu_id, dest, remote_name=remote_name)
+            if uploaded_already(started_path):
+                uploaded = remote_name or os.path.basename(dest)
+            else:
+                uploaded = fleet.upload(bambu_id, dest, remote_name=remote_name)
+                mark_uploaded(started_path)
             latest = dpf.heartbeat() if hasattr(dpf, "heartbeat") else {}
             latest_rows = latest.get("printers") if isinstance(latest, dict) else None
             fresh_send = _authorized_send(
@@ -689,32 +1096,38 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 remote_name=remote_name,
             )
         if started:
-            started_sends.add(key)
+            _send_mark(started_sends, key)
             try:
                 _write_cloud_send_marker(started_path, STARTED_MARKER_COMMANDED)
             except OSError:
                 pass
+            submission_id = _submission_on_printer(fleet, bambu_id)
             if router is not None:
-                router.record_assignment(
-                    str(bambu_id), str(batch_id), plate_index,
-                    started_at=float(wall_time()),
+                _record_cloud_assignment(
+                    router, str(bambu_id), str(batch_id), plate_index,
+                    started_at=float(wall_time()), submission_id=submission_id,
                 )
-            if _wait_for_active_print(
-                fleet, str(bambu_id), wall_time, sleep_fn, confirm_wait_seconds,
-            ):
+            _remember_attempt(
+                started_path, router, bambu_id, wall_time,
+                submission_id=submission_id, uploaded=True,
+            )
+            if _snapshot_shows_active(_live_snapshot(fleet, str(bambu_id))):
                 _report_confirmed_dispatch(key, dpf, spool_dir, router)
         else:
             logger.warning("printer %s did not start batch %s", bambu_id, batch_id)
-    for key in list(started_sends):
+    for key in _send_keys(started_sends):
         _batch_id, bambu_id, _plate_index = key
         if bambu_id in seen_serials and key not in live:
-            started_sends.discard(key)
+            _send_drop(started_sends, key)
             leftover = _cloud_send_started_path(spool_dir, key)
             try:
                 os.unlink(leftover)
             except OSError:
                 pass
+            discard_attempt(leftover)
     _cleanup_orphaned_cloud_send_markers(spool_dir, live, seen_serials)
+    if release_failures:
+        release_settled_attempts(spool_dir, live)
     legacy_marker_readiness.retain(pending_legacy_markers)
 
 
@@ -766,41 +1179,6 @@ def _cloud_send_already_confirmed(started_path: str, router, bambu_id: str) -> b
     )
 
 
-def _cloud_send_start_age_seconds(started_path: str, router, bambu_id: str,
-                                 wall_time) -> float:
-    now = float(wall_time())
-    if router is not None and callable(getattr(router, "assignments_snapshot", None)):
-        assignment = router.assignments_snapshot().get(str(bambu_id))
-        if isinstance(assignment, dict):
-            try:
-                started_at = float(assignment.get("started_at"))
-            except (TypeError, ValueError):
-                started_at = float("nan")
-            if started_at == started_at and started_at >= 0:
-                return max(0.0, now - started_at)
-    return max(0.0, now - _cloud_send_started_at(started_path, wall_time))
-
-
-def _wait_for_active_print(fleet, bambu_id: str, wall_time, sleep_fn,
-                          wait_seconds) -> bool:
-    if _snapshot_shows_active(_live_snapshot(fleet, bambu_id)):
-        return True
-    try:
-        remaining_budget = float(wait_seconds)
-    except (TypeError, ValueError):
-        return False
-    if remaining_budget <= 0:
-        return False
-    deadline = float(wall_time()) + remaining_budget
-    while True:
-        remaining = deadline - float(wall_time())
-        if remaining <= 0:
-            return _snapshot_shows_active(_live_snapshot(fleet, bambu_id))
-        sleep_fn(min(CLOUD_SEND_CONFIRM_POLL_SECONDS, remaining))
-        if _snapshot_shows_active(_live_snapshot(fleet, bambu_id)):
-            return True
-
-
 def _report_confirmed_dispatch(key, dpf, spool_dir: str, router) -> None:
     batch_id, bambu_id, _plate_index = key
     if router is not None and hasattr(router, "mark_assignment_active"):
@@ -816,44 +1194,217 @@ def _report_confirmed_dispatch(key, dpf, spool_dir: str, router) -> None:
 
 def _clear_pending_cloud_send(spool_dir: str, key, started_sends, router) -> None:
     _batch_id, bambu_id, _plate_index = key
-    started_sends.discard(key)
+    _send_drop(started_sends, key)
     leftover = _cloud_send_started_path(spool_dir, key)
     try:
         os.unlink(leftover)
     except OSError:
         pass
+    discard_attempt(leftover)
     if router is not None and _router_assignment_matches(router, key):
         clearer = getattr(router, "clear_assignment", None)
         if callable(clearer):
             clearer(str(bambu_id))
 
 
-def _confirm_or_abandon_cloud_send(key, fleet, dpf, spool_dir: str,
-                                  started_sends, router, wall_time) -> None:
+def _cancel_cloud_send(spool_dir: str, key, started_sends, router) -> None:
+    """Drop a send the operator stopped or removed. No failure is reported."""
+    _clear_pending_cloud_send(spool_dir, key, started_sends, router)
+
+
+def _fail_cloud_send(key, dpf, spool_dir, started_sends, router, reason: str) -> None:
+    batch_id, _bambu_id, plate_index = key
+    report_failed = getattr(dpf, "report_failed", None)
+    if callable(report_failed):
+        acked = report_failed(batch_id, plate_index, reason=reason)
+        if not isinstance(acked, dict) or not acked:
+            return
+    _clear_pending_cloud_send(spool_dir, key, started_sends, router)
+    latch_failure(_cloud_send_started_path(spool_dir, key), key, reason)
+
+
+def _submission_on_printer(fleet, bambu_id: str):
+    by_id = getattr(fleet, "by_id", None)
+    printer = by_id(bambu_id) if callable(by_id) else None
+    if printer is None:
+        return None
+    return getattr(printer, "last_submission_id", None)
+
+
+def _record_cloud_assignment(router, bambu_id, batch_id, plate_index, *,
+                             started_at, submission_id) -> None:
+    kwargs = {
+        "started_at": started_at,
+    }
+    try:
+        params = inspect.signature(router.record_assignment).parameters
+    except (TypeError, ValueError):
+        params = None
+    accepts_submission = params is not None and (
+        "submission_id" in params
+        or any(param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values())
+    )
+    if params is None:
+        try:
+            router.record_assignment(
+                bambu_id, batch_id, plate_index, submission_id=submission_id, **kwargs,
+            )
+        except TypeError:
+            router.record_assignment(bambu_id, batch_id, plate_index, **kwargs)
+        return
+    if accepts_submission:
+        router.record_assignment(
+            bambu_id, batch_id, plate_index, submission_id=submission_id, **kwargs,
+        )
+        return
+    router.record_assignment(bambu_id, batch_id, plate_index, **kwargs)
+
+
+def _remember_attempt(started_path, router, bambu_id, wall_time, *,
+                      submission_id, uploaded) -> None:
+    now = float(wall_time())
+    record = load_attempt(started_path, router, str(bambu_id), now)
+    record["phase"] = "A"
+    record["phase_started_at"] = now
+    record["attempts"] = int(record.get("attempts") or 1)
+    record["uploaded"] = True if uploaded else record.get("uploaded")
+    if submission_id is not None:
+        record["submission_id"] = submission_id
+    record.setdefault("last_failure", None)
+    save_attempt(started_path, router, str(bambu_id), record)
+
+
+def _hard_reset_printer(fleet, bambu_id: str) -> None:
+    by_id = getattr(fleet, "by_id", None)
+    printer = by_id(bambu_id) if callable(by_id) else None
+    session = getattr(printer, "_session", None) if printer is not None else None
+    for candidate in (
+        getattr(session, "hard_reset", None),
+        getattr(printer, "hard_reset", None),
+        getattr(printer, "rebuild_session", None),
+        getattr(fleet, "hard_reset", None),
+    ):
+        if callable(candidate):
+            try:
+                candidate()
+            except Exception:
+                logger.exception("printer %s: hard reset failed", bambu_id)
+            return
+
+
+def _cloud_send_session_connected(fleet, bambu_id: str) -> bool:
+    """True when a republish may publish.
+
+    No printer, or a printer with no session, counts as connected so a fake
+    publishes on the republish pass. A real session waits until it is connected.
+    """
+    by_id = getattr(fleet, "by_id", None)
+    printer = by_id(bambu_id) if callable(by_id) else None
+    if printer is None:
+        return True
+    session = getattr(printer, "_session", None)
+    if session is None:
+        return True
+    connected = getattr(session, "connected", False)
+    if callable(connected):
+        connected = connected()
+    return bool(connected)
+
+
+def _republish_start(send, fleet, bambu_id: str, dest: str, plate_index: int) -> bool:
+    if not hasattr(fleet, "start_print"):
+        return False
+    ams_mapping = _resolve_cloud_ams_mapping(send, fleet, bambu_id)
+    if ams_mapping is None:
+        return False
+    remote_name = _cloud_remote_name(send)
+    return bool(_mqtt_start_print(
+        fleet, bambu_id, remote_name or os.path.basename(dest),
+        ams_mapping, plate_index,
+    ))
+
+
+def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
+                        wall_time) -> None:
+    """Move one in-flight send through the watchdog. Does not upload again."""
     batch_id, bambu_id, plate_index = key
     started_path = _cloud_send_started_path(spool_dir, key)
     if _cloud_send_already_confirmed(started_path, router, bambu_id):
         dpf.report_dispatched(batch_id, bambu_id)
         return
-    if _snapshot_shows_active(_live_snapshot(fleet, str(bambu_id))):
+    now = float(wall_time())
+    snapshot = _live_snapshot(fleet, str(bambu_id))
+    record = load_attempt(started_path, router, str(bambu_id), now)
+    action = decide(record, snapshot, now)
+    if action == "confirm":
         _report_confirmed_dispatch(key, dpf, spool_dir, router)
         return
-    if (
-        _cloud_send_start_age_seconds(started_path, router, str(bambu_id), wall_time)
-        < ASSIGNMENT_STARTUP_GRACE_SECONDS
-    ):
+    if action == "enter_b":
+        record["phase"] = "B"
+        record["phase_started_at"] = now
+        record["last_failure"] = None
+        save_attempt(started_path, router, str(bambu_id), record)
         return
-    logger.warning(
-        "cloud send %s: printer %s never left idle after start; "
-        "clearing local start so the cloud can retry SENDING",
-        batch_id, bambu_id,
-    )
-    _clear_pending_cloud_send(spool_dir, key, started_sends, router)
-    report_failed = getattr(dpf, "report_failed", None)
-    if callable(report_failed):
-        report_failed(
-            batch_id, plate_index,
-            reason="printer stayed idle after start command",
+    if action == "reset_retry":
+        if record.get("pending_republish"):
+            record["attempts"] = int(record.get("attempts") or 1) + 1
+            record["last_failure"] = "no_echo"
+            if int(record["attempts"]) >= MAX_ATTEMPTS:
+                save_attempt(started_path, router, str(bambu_id), record)
+                _fail_cloud_send(
+                    key, dpf, spool_dir, started_sends, router,
+                    failure_reason(record, snapshot),
+                )
+                return
+        _hard_reset_printer(fleet, bambu_id)
+        record["pending_republish"] = True
+        record["last_failure"] = "no_echo"
+        record["phase"] = "A"
+        record["phase_started_at"] = now
+        save_attempt(started_path, router, str(bambu_id), record)
+        return
+    if action == "republish":
+        if not _cloud_send_session_connected(fleet, bambu_id):
+            return
+        dest = os.path.join(spool_dir, f"{batch_id}.3mf")
+        if not _republish_start(send, fleet, bambu_id, dest, plate_index):
+            return
+        record["pending_republish"] = False
+        record["attempts"] = int(record.get("attempts") or 1) + 1
+        record["phase"] = "A"
+        record["phase_started_at"] = now
+        fresh = _submission_on_printer(fleet, bambu_id)
+        if fresh is not None:
+            record["submission_id"] = fresh
+        record["uploaded"] = True
+        save_attempt(started_path, router, str(bambu_id), record)
+        return
+    if action == "retry":
+        record["last_failure"] = "no_active"
+        dest = os.path.join(spool_dir, f"{batch_id}.3mf")
+        if not _republish_start(send, fleet, bambu_id, dest, plate_index):
+            _fail_cloud_send(
+                key, dpf, spool_dir, started_sends, router,
+                failure_reason(record, snapshot),
+            )
+            return
+        record["attempts"] = int(record.get("attempts") or 1) + 1
+        record["phase"] = "A"
+        record["phase_started_at"] = now
+        fresh = _submission_on_printer(fleet, bambu_id)
+        if fresh is not None:
+            record["submission_id"] = fresh
+        record["uploaded"] = True
+        save_attempt(started_path, router, str(bambu_id), record)
+        return
+    if action == "fail":
+        logger.warning(
+            "cloud send %s: printer %s did not start after %s attempts",
+            batch_id, bambu_id, record.get("attempts"),
+        )
+        _fail_cloud_send(
+            key, dpf, spool_dir, started_sends, router,
+            failure_reason(record, snapshot),
         )
 
 
@@ -1068,80 +1619,9 @@ def _legacy_marker_snapshot_allows_start(snapshot) -> bool:
     )
 
 
-def _leftover_named_file(snapshot: dict) -> bool:
-    if snapshot.get("has_active_file") is True:
-        return True
-    for key in ("gcode_file", "subtask_name", "current_file"):
-        value = snapshot.get(key)
-        if isinstance(value, str) and value.strip():
-            return True
-    return False
-
-
-def _leftover_finished_idle(snapshot) -> bool:
-    if not isinstance(snapshot, dict) or snapshot.get("status") != "IDLE":
-        return False
-    if not _leftover_named_file(snapshot):
-        return False
-    progress = snapshot.get("progress_percent")
-    # 255 is P1 idle "no stage", not leftover-finished. Progress 100 is the plate.
-    return progress == 100
-
-
-def _clear_leftover_finished(fleet, bambu_id: str) -> None:
-    if not _leftover_finished_idle(_live_snapshot(fleet, bambu_id)):
-        return
-    stopper = getattr(fleet, "stop_print", None)
-    if callable(stopper):
-        stopper(bambu_id)
-        return
-    apply_control = getattr(fleet, "apply_control", None)
-    if callable(apply_control):
-        apply_control(bambu_id, "stop")
-        return
-    by_id = getattr(fleet, "by_id", None)
-    printer = by_id(bambu_id) if callable(by_id) else None
-    printer_stop = getattr(printer, "stop_print", None) if printer is not None else None
-    if callable(printer_stop):
-        printer_stop()
-
-
 def _mqtt_start_print(fleet, bambu_id, remote_name, ams_mapping, plate_index):
-    _clear_leftover_finished(fleet, bambu_id)
+    """Publish the start. IDLE, FINISH, and FAILED need no stop first."""
     return fleet.start_print(bambu_id, remote_name, ams_mapping, plate_index)
-
-
-def _printer_still_idle(fleet, bambu_id: str) -> bool:
-    live = _live_snapshot(fleet, bambu_id)
-    return isinstance(live, dict) and live.get("status") == "IDLE"
-
-
-def _should_retry_idle_start(fleet, bambu_id: str, started_path: str, wall_time,
-                             router=None) -> bool:
-    if _cloud_send_already_confirmed(started_path, router, str(bambu_id)):
-        return False
-    if not _printer_still_idle(fleet, bambu_id):
-        return False
-    age = _cloud_send_start_age_seconds(
-        started_path, router, str(bambu_id), wall_time,
-    )
-    return (
-        RETRY_IDLE_START_AFTER_SECONDS <= age < ASSIGNMENT_STARTUP_GRACE_SECONDS
-    )
-
-
-def _retry_idle_mqtt_start(send, fleet, bambu_id: str, dest: str,
-                           plate_index: int) -> None:
-    if not os.path.exists(dest) or not hasattr(fleet, "start_print"):
-        return
-    ams_mapping = _resolve_cloud_ams_mapping(send, fleet, bambu_id)
-    if ams_mapping is None:
-        return
-    remote_name = _cloud_remote_name(send)
-    _mqtt_start_print(
-        fleet, bambu_id, remote_name or os.path.basename(dest),
-        ams_mapping, plate_index,
-    )
 
 
 def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[list]:

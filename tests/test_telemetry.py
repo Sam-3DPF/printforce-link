@@ -1,8 +1,9 @@
 """Telemetry, status mapping, the delta merge, and the observed print duration.
 
-Every function under test here is pure or clock-injected, so none of this needs
-`bambulabs_api` installed — the same property `test_ams.py` relies on. `BambuPrinter`
-only ever touches its client through `mqtt_dump()`, so a fake stands in for it.
+Every function under test here is pure or clock-injected, so none of this needs a
+live printer. `BambuPrinter` ingests reports through its session callback, so a
+fake session delivers one payload per snapshot — the same cadence the old dump
+poll used — and commands go out through `publish`.
 """
 
 import logging
@@ -34,66 +35,93 @@ class FakeClock:
         self._now += seconds
 
 
-class FakeClient:
-    """Stands in for `bambulabs_api.Printer`. Yields one payload per poll and then
-    repeats the last one — which is a printer that has stopped changing, and *also*
-    exactly what an unplugged printer looks like: `mqtt_dump()` is a dict read on a cache
-    the library already holds, so it keeps answering, cheerfully, long after the machine
-    is gone. It cannot raise. That is why the liveness tests below exist.
+class FakeSession:
+    """Stands in for `LinkSession`. One queued payload is delivered per snapshot,
+    through the printer's report callback, and then the queue stops — a printer
+    that has stopped changing. An empty dict is silence, not a report. Set
+    `connected` False to pull the printer off the LAN.
 
-    It returns each payload **raw**, i.e. as the delta it arrived as — the worst case
-    the merge exists to absorb — so the bridge's own merge is what these tests
-    exercise.
-
-    `mqtt_client_connected()` mirrors the real accessor (`Printer.mqtt_client_connected`
-    -> `PrinterMQTTClient.is_connected` -> paho). Set `connected = False` to pull the
-    printer off the LAN.
+    `after_pushall` / `absorb_dumps` are reports that arrive while a pushall is
+    being absorbed, in the order the printer sends them.
     """
 
     def __init__(self, payloads, connected=True, after_pushall=None,
                  absorb_dumps=None):
         self._payloads = list(payloads)
-        self._last = {}
-        self.connected = connected
+        self._connected = connected
         self.after_pushall = after_pushall
         self.absorb_dumps = list(absorb_dumps or [])
+        self._absorb_left = []
+        self.on_report = None
+        self.on_publish = None
+        self.published = []
+        self.pushall_calls = 0
+        self._in_publish = False
+        self._in_emit = False
+        self.last_message_at = None
+        self.last_connect_error = None
 
-    def mqtt_dump(self):
-        if getattr(self, "_absorbing", False):
-            remaining = getattr(self, "_absorb_remaining", None)
-            if remaining:
-                self._last = remaining.pop(0)
-            elif self.after_pushall is not None:
-                self._last = self.after_pushall
-            return self._last
-        if self._payloads:
-            self._last = self._payloads.pop(0)
-        return self._last
+    @property
+    def connected(self):
+        # A snapshot reads this once. That read is the poll: one report arrives.
+        self._deliver_poll_payload()
+        return self._connected
 
-    def mqtt_client_connected(self):
-        return self.connected
+    @connected.setter
+    def connected(self, value):
+        self._connected = bool(value)
 
-    def pushall(self):
-        self.pushall_calls = getattr(self, "pushall_calls", 0) + 1
-        self._absorbing = True
-        self._absorb_remaining = list(self.absorb_dumps)
-        return True
-
-    def publish_command(self, payload):
-        self.published = getattr(self, "published", [])
+    def publish(self, payload):
+        if not self._connected:
+            return False
         self.published.append(payload)
-        hook = getattr(self, "on_publish", None)
-        if hook is not None:
-            hook(payload)
+        self._in_publish = True
+        try:
+            pushing = payload.get("pushing") if isinstance(payload, dict) else None
+            if isinstance(pushing, dict) and pushing.get("command") == "pushall":
+                self.pushall_calls += 1
+                self._begin_absorb()
+            if self.on_publish is not None:
+                self.on_publish(payload)
+        finally:
+            self._in_publish = False
         return True
-
-    def finish_absorb(self):
-        self._absorbing = False
-        self._absorb_remaining = []
 
     def push(self, payload):
-        """The printer sends a new report."""
-        self._payloads.append(payload)
+        """The printer sends a new report, either now (during a command) or on the next poll."""
+        if self._in_publish:
+            self._emit(payload)
+        else:
+            self._payloads.append(payload)
+
+    def on_sample(self):
+        if self._absorb_left:
+            self._emit(self._absorb_left.pop(0))
+
+    def _begin_absorb(self):
+        self._absorb_left = list(self.absorb_dumps)
+        if self.after_pushall is not None and not self.absorb_dumps:
+            self._emit(self.after_pushall)
+            return
+        if self._absorb_left:
+            self._emit(self._absorb_left.pop(0))
+
+    def _deliver_poll_payload(self):
+        if self._in_emit or not self._connected or not self._payloads:
+            return
+        payload = self._payloads.pop(0)
+        self._emit(payload)
+
+    def _emit(self, payload):
+        if not isinstance(payload, dict) or not payload:
+            return
+        if self.on_report is None or self._in_emit:
+            return
+        self._in_emit = True
+        try:
+            self.on_report(payload)
+        finally:
+            self._in_emit = False
 
 
 def _stopwatch(monotonic=None, wall_clock=None) -> PrintStopwatch:
@@ -116,10 +144,16 @@ def _printer(payloads, monotonic=None, wall_clock=None, connected=True,
                            stale_after_seconds=stale_after_seconds,
                            monotonic=monotonic or (lambda: 0.0),
                            sleep=lambda _seconds: None)
-    printer._client = FakeClient(
-        payloads, connected=connected, after_pushall=after_pushall,
-        absorb_dumps=absorb_dumps,
-    )
+    _attach(printer, payloads, connected=connected, after_pushall=after_pushall,
+            absorb_dumps=absorb_dumps)
+    return printer
+
+
+def _attach(printer, payloads, **kwargs):
+    session = FakeSession(payloads, **kwargs)
+    session.on_report = printer._on_mqtt_report
+    printer._session = session
+    printer._sleep = lambda _seconds: session.on_sample()
     return printer
 
 
@@ -128,13 +162,16 @@ def _printer(payloads, monotonic=None, wall_clock=None, connected=True,
 #  snapshot-level behavior built on top of it.)
 
 def test_fresh_bridge_reports_offline_not_idle_even_mid_print():
-    """`mqtt_dump()` returns {} until the first MQTT push lands. Every printer —
-    including one mid-print — read IDLE during that window before this fix."""
+    """No report yet is OFFLINE, not IDLE. `slots` is None on that report: `[]`
+    would tell the cloud the AMS is unplugged and delete every slot row. None
+    means this cycle has no AMS information."""
     printer = _printer([{}])
     snapshot = printer.snapshot()
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["slots"] == []
+    assert snapshot["connection"] == "offline"
+    assert snapshot["slots"] is None
     assert snapshot["nozzle_temper"] is None
+    assert snapshot["last_message_age_seconds"] is None
 
 
 def test_unreadable_printer_reports_offline_and_never_raises():
@@ -143,11 +180,12 @@ def test_unreadable_printer_reports_offline_and_never_raises():
     `mqtt_dump()` does not raise once a printer has connected (it is a dict read), so a
     printer that was live and then went away never reaches here."""
     class Unreachable:
-        def mqtt_dump(self):
+        @property
+        def connected(self):
             raise OSError("no route to host")
 
     printer = _printer([])
-    printer._client = Unreachable()
+    printer._session = Unreachable()
     assert printer.snapshot()["status"] == "OFFLINE"
 
 
@@ -219,6 +257,10 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "hms_title": None,
         "hms_detail": None,
         "print_error": None,
+        # Additive. Legacy hms_* / print_error still carry cancel echoes.
+        "hms_faults": [],
+        "fault_print_error": None,
+        "commands_rejected": False,
         "gcode_state": "RUNNING",
         "hms_present": True,
         "hms_empty": True,
@@ -232,11 +274,25 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "print_duration_seconds": None,
         "print_duration_source": None,
         "local_ip": "10.0.0.5",
+        "connection": "live",
+        "last_message_age_seconds": 0.0,
+        "connect_error": None,
+        "session_started_at": None,
+        # First contact is already RUNNING, so there is no start edge.
+        # The print is not one Link submitted.
+        "events": [],
+        "print_origin": "external",
+        # No registered submission, so the matched id is absent. This printer's
+        # fake session has no CONNACK, so the session token is still 0; the
+        # payload did carry gcode_state.
+        "print_submission_id": None,
+        "session_seq": 0,
+        "session_gcode_seen": True,
     }
 
 
 def test_remaining_time_is_minutes_converted_to_seconds():
-    """bambulabs_api's own docstring says seconds and is wrong; ha-bambulab reads the
+    """The wire value is minutes. A client docstring that called it seconds was wrong; ha-bambulab reads the
     field as minutes. A 60x error on the number the operator looks at most."""
     assert parse_telemetry({"print": {"mc_remaining_time": 23}})["remaining_seconds"] == 1380
     assert parse_telemetry({"print": {"mc_remaining_time": 0}})["remaining_seconds"] == 0
@@ -279,11 +335,16 @@ def test_cancel_flash_latches_through_later_failed_with_cleared_error():
 
 
 def test_real_failed_snapshot_stays_error():
+    """FAILED without a cancel code stays ERROR.
+
+    12345 is 0x3039. A low word below 0x4000 is a status indicator, so the
+    wire field is empty. The gcode state is still a real fail.
+    """
     snapshot = _printer([{
         "print": {"gcode_state": "FAILED", "print_error": 12345},
     }]).snapshot()
     assert snapshot["status"] == "ERROR"
-    assert snapshot["print_error"] == "12345"
+    assert snapshot["print_error"] is None
 
 
 _P1S_10_HISTORICAL_FAILED = {
@@ -669,7 +730,7 @@ def test_partial_ams_with_loaded_bits_asks_the_printer_for_a_full_dump():
         {"slot_number": 3, "color_hex": None, "filament_type": None},
         {"slot_number": 4, "color_hex": None, "filament_type": None},
     ]
-    assert printer._client.pushall_calls == 1
+    assert printer._session.pushall_calls == 1
 
 
 def test_p1s6_partial_dump_does_not_store_empty_for_loaded_trays():
@@ -691,7 +752,7 @@ def test_p1s6_partial_dump_does_not_store_empty_for_loaded_trays():
     snapshot = printer.snapshot()
     assert snapshot["slots"] is None
     assert snapshot["tray_exist_bits"] is None
-    assert printer._client.pushall_calls == 1
+    assert printer._session.pushall_calls == 1
 
 
 def test_integer_tray_exist_bits_are_reported_as_hex():
@@ -803,8 +864,8 @@ def test_mqtt_message_keeps_idle_hex_when_dump_is_already_a_stub():
         ]}]},
     }}
     printer = _printer([stub, stub])
-    printer._ingest_status(full)
-    printer._ingest_status(stub)
+    printer.state.ingest(full)
+    printer.state.ingest(stub)
     snapshot = printer.snapshot()
     assert [slot["color_hex"] for slot in snapshot["slots"]] == [
         "E8AFCFFF", "A3D8E1FF", "000000FF", "FFFFFFFF",
@@ -833,8 +894,9 @@ def test_snapshot_asks_rfid_for_p1s9_blank_loaded_trays():
     }}
     printer = _printer([stub], absorb_dumps=[stub, stub, stub])
     printer.snapshot()
-    published = getattr(printer._client, "published", [])
-    assert [(item["print"]["ams_id"], item["print"]["slot_id"]) for item in published] == [
+    published = getattr(printer._session, "published", [])
+    rfid = [item for item in published if "print" in item]
+    assert [(item["print"]["ams_id"], item["print"]["slot_id"]) for item in rfid] == [
         (0, 2), (0, 3), (1, 0), (1, 1),
     ]
 
@@ -851,10 +913,10 @@ def test_refresh_asks_ams_get_rfid_for_loaded_trays_without_hex():
     }}
     printer = _printer([stub], absorb_dumps=[stub, stub, stub])
     printer.snapshot()
-    printer._client.published = []
+    printer._session.published = []
     printer.request_full_status()
-    published = getattr(printer._client, "published", [])
-    commands = [item["print"] for item in published]
+    published = getattr(printer._session, "published", [])
+    commands = [item["print"] for item in published if "print" in item]
     assert [cmd["command"] for cmd in commands] == [
         "ams_get_rfid", "ams_get_rfid", "ams_get_rfid",
     ]
@@ -885,11 +947,11 @@ def test_print_end_asks_for_a_full_ams_dump_again():
     printer = _printer([stub, ended])
     printer.snapshot()
     printer._full_status_attempts = 3
-    printer._client.pushall_calls = 0
-    printer._client.published = []
+    printer._session.pushall_calls = 0
+    printer._session.published = []
     printer.snapshot()
-    assert printer._client.pushall_calls >= 1
-    assert [item["print"]["command"] for item in printer._client.published] == [
+    assert printer._session.pushall_calls >= 1
+    assert [item["print"]["command"] for item in printer._session.published if "print" in item] == [
         "ams_get_rfid", "ams_get_rfid", "ams_get_rfid",
     ]
 
@@ -901,7 +963,7 @@ def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(t
         cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache),
         sleep=lambda _seconds: None,
     )
-    first._client = FakeClient([{
+    _attach(first, [{
         "print": {"gcode_state": "IDLE", "ams": {"tray_exist_bits": "f", "ams": [
             {"id": "0", "tray": [
                 {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
@@ -917,7 +979,7 @@ def test_remembered_ams_hex_survives_a_new_process_seeing_only_the_active_tray(t
         cfg, stopwatch=_stopwatch(), monotonic=lambda: 0.0, ams_cache_path=str(cache),
         sleep=lambda _seconds: None,
     )
-    restarted._client = FakeClient([{
+    _attach(restarted, [{
         "print": {"gcode_state": "FINISH", "ams": {"tray_exist_bits": "f", "ams": [
             {"id": "0", "tray": [
                 {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
@@ -1200,10 +1262,12 @@ def test_a_gap_between_pushes_does_not_knock_a_live_printer_offline():
 
 
 def test_a_printer_that_dies_mid_print_goes_offline_not_printing_forever():
-    """Someone unplugs a printer that is PRINTING at 47%, 220°C. `mqtt_dump()` cannot
-    raise, so `except Exception -> OFFLINE` never fires; the cache is populated, so the
-    "no payload yet" branch never fires either. Before this, the bridge replayed that
-    same stale payload to the cloud every 10 seconds, forever.
+    """Someone unplugs a printer that is PRINTING at 47%, 220°C, and the socket
+    still looks up. Status stays OFFLINE so this is not a live print and not an
+    authorization to dispatch. The session has not been called unreachable, so
+    the report is ``connection: stale`` and keeps the last telemetry and the
+    last AMS slots. Nulling those, or sending ``slots: []``, would either hide
+    the last picture or tell the cloud the AMS was unplugged.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)   # then it repeats, i.e. freezes
@@ -1213,9 +1277,12 @@ def test_a_printer_that_dies_mid_print_goes_offline_not_printing_forever():
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["progress_percent"] is None            # not a frozen 47%
-    assert snapshot["nozzle_temper"] is None               # not a frozen 220°C
-    assert snapshot["slots"] == []                         # not a colour it no longer holds
+    assert snapshot["connection"] == "stale"
+    assert snapshot["progress_percent"] == 47
+    assert snapshot["nozzle_temper"] == 220.0
+    assert snapshot["slots"] == [
+        {"slot_number": 1, "color_hex": "FF6A13FF", "filament_type": "PLA"},
+    ]
 
 
 def test_stale_historical_failed_payload_never_becomes_ready():
@@ -1252,8 +1319,9 @@ def test_a_frozen_idle_printer_reports_offline_and_never_idle():
 
 
 def test_an_empty_dump_after_a_live_poll_is_not_replayed_from_the_cache():
-    """`mqtt_dump()` returning {} is silence, not news — and silence must not be answered
-    with the last thing the printer happened to say."""
+    """An empty dump is silence, not news. Status stays OFFLINE so the last
+    payload is not presented as a live print. It is still the last-known
+    picture, reported as stale rather than wiped."""
     clock = FakeClock()
     printer = _printer([_PRINTING, {}], monotonic=clock.now)
     assert printer.snapshot()["status"] == "PRINTING"
@@ -1262,17 +1330,14 @@ def test_an_empty_dump_after_a_live_poll_is_not_replayed_from_the_cache():
     snapshot = printer.snapshot()                          # mqtt_dump() -> {}
 
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["progress_percent"] is None
+    assert snapshot["connection"] == "stale"
+    assert snapshot["progress_percent"] == 47
 
 
 def test_offline_does_not_flap_back_to_printing_while_the_printer_stays_dead():
-    """Going OFFLINE drops `_cached` — but the *freshness baseline* must survive it.
-
-    A dead printer hands back the same dict on every poll. If dropping the cache also
-    reset "when did this last change?", the very next poll would merge that same dict into
-    an empty cache, read it as new data, and flap the printer back to PRINTING — then
-    OFFLINE, then PRINTING, every window, forever. The dispatcher would find an IDLE
-    window on a machine that is not there.
+    """Silence stays OFFLINE. The merged payload is kept, and the freshness
+    baseline is not reset, so a quiet printer is not reported live again just
+    because the same dict is still sitting there.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
@@ -1286,24 +1351,29 @@ def test_offline_does_not_flap_back_to_printing_while_the_printer_stays_dead():
 
 
 def test_a_printer_that_comes_back_reports_live_telemetry_again():
-    """Recovery. The cache was dropped on the way out, so the printer is rebuilt from what
-    it says NOW — the pre-outage 47% must not be resurrected alongside it. (The real
-    `mqtt_dump()` accumulates and the library re-pushes everything on connect, so a
-    reconnected printer's first dump is a full picture.)
+    """A new report after the quiet gap is live again. The gap does not drop
+    the merged payload, so a partial IDLE delta keeps the last percent. That
+    percent is still between 0 and 100, and ``promote_live_idle`` treats gcode
+    IDLE plus that percent as PRINTING — the same rule a live delta follows.
+    A full post-CONNACK recovery that must not look live *before* the new
+    message is covered in test_report_contract.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
     printer.snapshot()
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
-    assert printer.snapshot()["status"] == "OFFLINE"
+    quiet = printer.snapshot()
+    assert quiet["status"] == "OFFLINE"
+    assert quiet["connection"] == "stale"
 
-    printer._client.push({"print": {"gcode_state": "IDLE", "nozzle_temper": 24.0}})
+    printer._session.push({"print": {"gcode_state": "IDLE", "nozzle_temper": 24.0}})
     clock.advance(15)
     snapshot = printer.snapshot()
 
-    assert snapshot["status"] == "IDLE"
+    assert snapshot["connection"] == "live"
+    assert snapshot["status"] == "PRINTING"
     assert snapshot["nozzle_temper"] == 24.0
-    assert snapshot["progress_percent"] is None            # the stale 47% did not survive
+    assert snapshot["progress_percent"] == 47
 
 
 _FINISHED = {"print": {
@@ -1315,55 +1385,46 @@ _FINISHED = {"print": {
 }}
 
 
-def test_a_finished_printer_that_answers_push_start_stays_online():
-    """P1S-9, 2026-09-21: the plate was done, temperatures had settled, and the LAN
-    socket was still up. The printer had stopped pushing on its own — the same state
-    SimplyPrint was still reading — and Link called that silence OFFLINE, then never
-    asked again. `pushing.start` is how a quiet P1 resumes reports. An answer, even
-    one that only moves `sequence_id`, is a live printer and must stay NEEDS_CLEARING.
+def test_a_finished_printer_gone_quiet_reports_offline_without_publishing():
+    """A finished plate that stops talking is OFFLINE and stale: the last
+    temperatures stay on the report, and snapshot does not publish a command
+    to pretend they are a new reading.
     """
     clock = FakeClock()
     printer = _printer([_FINISHED], monotonic=clock.now)
     assert printer.snapshot()["status"] == "NEEDS_CLEARING"
+    before = list(printer._session.published)
 
-    def resume(_payload):
-        printer._client.push({
-            "print": {
-                "gcode_state": "FINISH",
-                "mc_percent": 100,
-                "nozzle_temper": 29.0,
-                "bed_temper": 28.0,
-                "sequence_id": "42",
-            },
-        })
-
-    printer._client.on_publish = resume
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    slept = []
+    printer._sleep = lambda seconds: slept.append(seconds)
     snapshot = printer.snapshot()
 
-    assert snapshot["status"] == "NEEDS_CLEARING"
+    assert snapshot["status"] == "OFFLINE"
+    assert snapshot["connection"] == "stale"
     assert snapshot["nozzle_temper"] == 29.0
     assert snapshot["progress_percent"] == 100
-    assert printer.needs_session_rebuild is False
-    assert printer._client.published[-1]["pushing"]["command"] == "start"
+    assert printer._session.published == before
+    assert slept == []
 
 
-def test_silence_on_a_live_socket_goes_offline_and_requests_a_rebuild():
-    """The nudge is not a way to keep a dead printer looking alive. If `pushing.start`
-    gets no new report, the frozen dump is still OFFLINE — and the session is marked
-    for rebuild, because paho will not reconnect a socket it still thinks is up.
+def test_silence_on_a_live_socket_reports_offline_without_publishing():
+    """Silence longer than the staleness window is OFFLINE even when the socket
+    still looks up. Status stays OFFLINE so the frozen dump is not a live print,
+    and snapshot must not publish while it decides that.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
     assert printer.snapshot()["status"] == "PRINTING"
+    before = list(printer._session.published)
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
-    assert snapshot["progress_percent"] is None
-    assert printer.needs_session_rebuild is True
-    assert printer._client.published[-1]["pushing"]["command"] == "start"
+    assert snapshot["connection"] == "stale"
+    assert snapshot["progress_percent"] == 47
+    assert printer._session.published == before
 
 
 def test_an_identical_report_still_counts_as_hearing_the_printer():
@@ -1375,90 +1436,87 @@ def test_an_identical_report_still_counts_as_hearing_the_printer():
     assert printer.snapshot()["status"] == "NEEDS_CLEARING"
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
-    printer._on_library_mqtt_message(None, None, None, _FINISHED)
+    printer._on_mqtt_report(_FINISHED)
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "NEEDS_CLEARING"
-    assert printer.needs_session_rebuild is False
 
 
-def test_a_link_down_past_the_window_requests_a_session_rebuild():
-    """A one-second drop is paho's to retry. A socket that is still down after the
-    staleness window is not retrying, and the fleet has to rebuild it at the same IP.
+def test_a_link_that_stays_down_does_not_publish():
+    """A dropped socket is OFFLINE on the next report. Snapshot does not publish
+    and does not sleep while it says so — recovery belongs to the session.
     """
     clock = FakeClock()
     printer = _printer([_PRINTING], monotonic=clock.now)
     assert printer.snapshot()["status"] == "PRINTING"
 
-    printer._client.connected = False
+    printer._session.connected = False
     clock.advance(1)
+    before = list(printer._session.published)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is False
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    slept = []
+    printer._sleep = lambda seconds: slept.append(seconds)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is True
+    assert printer._session.published == before
+    assert slept == []
 
 
-def test_a_printer_that_never_pushes_is_asked_then_rebuilt():
-    """After the 0.1.22 restart the quiet printers stayed OFFLINE. A fresh process
-    has not heard them, and a finished P1 does not push until asked. The empty
-    dump used to return before `pushing.start` and before the same-IP rebuild,
-    so SSDP seeing the current address did nothing.
+def test_a_printer_that_never_pushes_stays_offline_without_a_command():
+    """No report yet is OFFLINE. Snapshot must not invent a resume command to
+    fill that gap.
     """
     clock = FakeClock()
     printer = _printer([{}], monotonic=clock.now)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is False
-    assert getattr(printer._client, "published", []) == []
+    assert printer._session.published == []
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
     assert snapshot["nozzle_temper"] is None
-    assert printer.needs_session_rebuild is True
-    assert printer._client.published[-1]["pushing"]["command"] == "start"
+    assert printer._session.published == []
 
 
-def test_a_quiet_printer_that_answers_the_first_push_start_comes_online():
-    """The ask is enough when the socket is up. Do not rebuild a printer that
-    just answered, and do not leave it OFFLINE."""
+def test_a_quiet_socket_stays_offline_when_nothing_was_asked():
+    """An empty first dump stays OFFLINE. A publish hook that would have
+    answered a command must not run, because snapshot does not send one.
+    """
     clock = FakeClock()
     printer = _printer([{}], monotonic=clock.now)
     printer.snapshot()
 
     def resume(_payload):
-        printer._client.push({
+        printer._session.push({
             "print": {"gcode_state": "IDLE", "nozzle_temper": 31.0},
         })
 
-    printer._client.on_publish = resume
+    printer._session.on_publish = resume
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
     snapshot = printer.snapshot()
 
-    assert snapshot["status"] == "IDLE"
-    assert snapshot["nozzle_temper"] == 31.0
-    assert printer.needs_session_rebuild is False
+    assert snapshot["status"] == "OFFLINE"
+    assert snapshot["nozzle_temper"] is None
+    assert printer._session.published == []
 
 
-def test_a_socket_that_never_comes_up_requests_a_rebuild_after_the_window():
-    """A restart can fail the first connect and then sit on that dead client.
-    One second is still paho's. The staleness window means the session is not
-    coming up, even if this process has never heard the printer.
+def test_a_socket_that_never_comes_up_stays_offline():
+    """A connect that never succeeds is OFFLINE immediately and still OFFLINE
+    after the staleness window. Snapshot does not try to repair it.
     """
     clock = FakeClock()
     printer = _printer([{}], monotonic=clock.now, connected=False)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is False
 
     clock.advance(1)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is False
 
     clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
+    before = list(printer._session.published)
     assert printer.snapshot()["status"] == "OFFLINE"
-    assert printer.needs_session_rebuild is True
+    assert printer._session.published == before
 
 
 def test_a_dropped_mqtt_link_reports_offline_without_waiting_out_the_window():
@@ -1471,31 +1529,12 @@ def test_a_dropped_mqtt_link_reports_offline_without_waiting_out_the_window():
     printer = _printer([_PRINTING], monotonic=clock.now)
     assert printer.snapshot()["status"] == "PRINTING"
 
-    printer._client.connected = False                      # it drops off the LAN
+    printer._session.connected = False                      # it drops off the LAN
     clock.advance(1)                                       # ...well inside the window
     snapshot = printer.snapshot()
 
     assert snapshot["status"] == "OFFLINE"
     assert snapshot["progress_percent"] is None
-
-
-def test_staleness_alone_still_reports_offline_when_the_library_has_no_link_accessor():
-    """`_is_connected()` degrades to *unknown* if a future `bambulabs_api` renames or drops
-    `mqtt_client_connected()` — it must never degrade to *connected*, which would mark a
-    dead printer live. Staleness needs no library support at all, so the printer still goes
-    OFFLINE; it just takes the window to get there.
-    """
-    class NoProbeClient:                                   # only mqtt_dump(), like an older lib
-        def mqtt_dump(self):
-            return _PRINTING
-
-    clock = FakeClock()
-    printer = _printer([], monotonic=clock.now)
-    printer._client = NoProbeClient()
-    assert printer.snapshot()["status"] == "PRINTING"
-
-    clock.advance(_DEFAULT_STALE_AFTER_SECONDS + 1)
-    assert printer.snapshot()["status"] == "OFFLINE"
 
 
 def test_the_staleness_window_is_configurable():
@@ -1552,6 +1591,5 @@ def test_an_absent_printer_is_a_warning_not_a_bridge_bug(caplog):
 # --------------------------------------------------------------------- design guard
 
 def test_the_pure_logic_imports_without_the_vendor_library():
-    """`bambulabs_api` is imported lazily inside connect() on purpose, so the parsing
-    and status logic stays unit-testable (and CI needs no printer). Keep it that way."""
+    """Parsing and status stay importable with no vendor MQTT stack in `sys.modules`."""
     assert "bambulabs_api" not in sys.modules

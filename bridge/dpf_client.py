@@ -37,11 +37,6 @@ class DpfClient:
         # Persistent client reuses the keep-alive connection across the forever
         # report/heartbeat loop instead of a fresh TCP+TLS handshake per call.
         self._client = httpx.Client(timeout=timeout)
-        # Last farm report that reached 3DPF. After the report socket comes back,
-        # send this immediately so cards do not blink Offline waiting for the
-        # next live dump.
-        self._last_good_reports = []
-        self._report_socket_down = False
 
     def close(self) -> None:
         self._client.close()
@@ -55,25 +50,14 @@ class DpfClient:
     def report_state(self, reports: List[Dict], link: Optional[Dict] = None) -> Dict:
         """POST a batch of printer-state reports; returns the desired-state body.
 
-        After a drop, the first successful POST replays the last good snapshots
-        so 3DPF does not ingest a farm-wide Offline blink.
+        The body is the reports from this call. A copy kept from the previous
+        success would replay a printer that has since gone stale or offline,
+        which is the reading ``connection`` exists to prevent.
         """
-        outgoing = reports
-        if self._report_socket_down and self._last_good_reports:
-            outgoing = [dict(row) for row in self._last_good_reports]
-        result = self._post(
+        return self._post(
             "/api/bridge/printers/state",
-            {"printers": outgoing, "link": link or {}},
+            {"printers": reports, "link": link or {}},
         )
-        if result:
-            if not self._report_socket_down:
-                self._last_good_reports = [
-                    dict(row) for row in reports if isinstance(row, dict)
-                ]
-            self._report_socket_down = False
-        else:
-            self._report_socket_down = True
-        return result
 
     def heartbeat(self, link: Optional[Dict] = None) -> Dict:
         """Liveness ping; returns desired-state for all bridge-managed printers."""
@@ -105,7 +89,14 @@ class DpfClient:
 
     def report_failed(self, batch_id: str, plate_number: Optional[int] = None,
                       reason: Optional[str] = None) -> Dict:
-        """Tell 3DPF a batch's print failed (U12). Idempotent; retried until acked."""
+        """Tell 3DPF a batch's print failed. Idempotent; retried until acked.
+
+        ``reason`` is free text the cloud stores as-is. ``ended_unobserved``
+        means a persisted assignment was still open after a reconnect and the
+        printer's first steady report did not show that print. Link did not
+        see it end; the operator decides what happened. Other reasons are
+        unchanged.
+        """
         return self._post(f"/api/bridge/batches/{batch_id}/failed",
                           {"plate_number": plate_number, "reason": reason})
 
@@ -171,6 +162,21 @@ class DpfClient:
         except Exception as e:
             logger.warning("download of send file failed: %s", type(e).__name__)
             return False
+
+    def upload_printer_log(self, bambu_id: str, log: Dict, control_id: Optional[str] = None) -> Dict:
+        """POST one printer's ring. The body is never logged."""
+        return self._post(
+            f"/api/bridge/printers/{bambu_id}/log",
+            {"log": log, "control_id": control_id},
+        )
+
+    def report_diagnostic(self, bambu_id: str, diagnostic: Dict,
+                          control_id: Optional[str] = None) -> Dict:
+        """POST one connection diagnostic. The body is never logged."""
+        return self._post(
+            f"/api/bridge/printers/{bambu_id}/diagnostic",
+            {"diagnostic": diagnostic, "control_id": control_id},
+        )
 
     def report_discovered(self, printers: List[Dict]) -> Dict:
         """Report the LAN printers the bridge currently sees, for the onboarding wizard (U11).

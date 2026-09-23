@@ -1,0 +1,67 @@
+{
+  "source": "synthetic",
+  "note": "Synthetic P1S-shaped report sequence for the replay helper. Not a shop capture; no shop capture exists yet.",
+  "serial": "01P00C4A0000001",
+  "collected_at": "2026-09-22T12:00:03.000000Z",
+  "capacity": 100,
+  "messages": [
+    {
+      "t": 10.0,
+      "at": "2026-09-22T12:00:00.000000Z",
+      "direction": "out",
+      "topic": "device/01P00C4A0000001/request",
+      "payload": {"pushing": {"sequence_id": "0", "command": "pushall"}},
+      "accepted": true
+    },
+    {
+      "t": 10.4,
+      "at": "2026-09-22T12:00:00.400000Z",
+      "direction": "in",
+      "topic": "device/01P00C4A0000001/report",
+      "payload": {
+        "print": {
+          "gcode_state": "RUNNING",
+          "mc_percent": 42,
+          "mc_remaining_time": 30,
+          "nozzle_temper": 220.0,
+          "nozzle_target_temper": 220.0,
+          "bed_temper": 60.0,
+          "bed_target_temper": 60.0,
+          "layer_num": 12,
+          "total_layer_num": 80,
+          "subtask_name": "benchy",
+          "stg_cur": 0,
+          "print_error": 0
+        }
+      }
+    },
+    {
+      "t": 12.0,
+      "at": "2026-09-22T12:00:02.000000Z",
+      "direction": "in",
+      "topic": "device/01P00C4A0000001/report",
+      "payload": {
+        "print": {
+          "gcode_state": "RUNNING",
+          "mc_percent": 43
+        }
+      }
+    }
+  ],
+  "events": [
+    {
+      "t": 9.0,
+      "at": "2026-09-22T11:59:59.000000Z",
+      "kind": "connect",
+      "host": "10.0.0.51",
+      "client_id": "link-synthetic-1"
+    },
+    {
+      "t": 9.2,
+      "at": "2026-09-22T11:59:59.200000Z",
+      "kind": "connack",
+      "result": "ok",
+      "code": 0
+    }
+  ]
+}

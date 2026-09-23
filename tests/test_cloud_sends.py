@@ -300,22 +300,14 @@ def test_paused_after_mqtt_true_reports_dispatched(tmp_path):
     assert dpf.dispatched == [("B1", "P1")]
 
 
-def test_confirm_wait_reports_when_printer_becomes_printing(tmp_path):
+def test_the_next_pass_reports_when_the_printer_becomes_printing(tmp_path):
     fleet = _ConfirmFleet()
     dpf = _FakeDpf()
-    polls = {"n": 0}
-
-    def sleep_fn(_seconds):
-        polls["n"] += 1
-        if polls["n"] >= 2:
-            fleet.set_status("PRINTING")
-
-    _handle_cloud_sends_impl(
-        _desired(), fleet, dpf, str(tmp_path), set(),
-        confirm_wait_seconds=2.0, sleep_fn=sleep_fn,
-    )
-
-    assert polls["n"] >= 2
+    started = set()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started)
+    assert dpf.dispatched == []
+    fleet.set_status("PRINTING")
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started)
     assert dpf.dispatched == [("B1", "P1")]
 
 
@@ -336,12 +328,15 @@ def test_idle_after_start_timeout_clears_marker_and_reports_failed(tmp_path):
     assert dpf.dispatched == []
     assert "P1" in router.assignments_snapshot()
 
-    clock.advance(ASSIGNMENT_STARTUP_GRACE_SECONDS - 1)
+    from bridge.send_pipeline import PHASE_A_SECONDS
+
+    clock.advance(PHASE_A_SECONDS - 1)
     _handle_cloud_sends(
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
     assert marker.exists()
+    assert len(fleet.starts) == 1
     assert dpf.dispatched == []
     assert dpf.failed == []
     assert started == {("B1", "P1", 2)}
@@ -351,9 +346,29 @@ def test_idle_after_start_timeout_clears_marker_and_reports_failed(tmp_path):
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    clock.advance(PHASE_A_SECONDS)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    clock.advance(PHASE_A_SECONDS)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
 
     assert dpf.dispatched == []
-    assert dpf.failed == [("B1", 2, "printer stayed idle after start command")]
+    assert dpf.failed == [("B1", 2, "no_echo")]
+    assert len(fleet.uploads) == 1
+    assert len(fleet.starts) == 3
     assert not marker.exists()
     assert "P1" not in router.assignments_snapshot()
     assert started == set()
@@ -987,9 +1002,9 @@ class _MissingDesiredAfterUploadDpf(_FakeDpf):
 
 def test_cloud_send_fails_closed_when_desired_refresh_fails_after_upload(tmp_path):
     fleet = _FakeFleet()
-    _handle_cloud_sends(
-        _desired(), fleet, _MissingDesiredAfterUploadDpf(), str(tmp_path), set(),
-    )
+    dpf = _MissingDesiredAfterUploadDpf()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set())
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), set())
     assert len(fleet.uploads) == 1
     assert fleet.starts == []
     assert fleet.calls == []
@@ -1068,11 +1083,12 @@ def test_cloud_send_retries_start_while_printer_stays_idle(tmp_path):
     started_path = _cloud_send_started_path(str(tmp_path), key)
     with open(started_path, "w") as handle:
         handle.write(STARTED_MARKER_COMMANDED)
-    aged = time.time() - 20.0
+    aged = time.time() - 90.0
     os.utime(started_path, (aged, aged))
     mtime_before = os.stat(started_path).st_mtime
     fleet = _ConfirmFleet()
     dpf = _FakeDpf()
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), {key})
     _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), {key})
     assert fleet.uploads == []
     assert fleet.starts[0][2] == [-1, -1, -1, 0, -1, -1, -1, -1, 2]
@@ -1096,22 +1112,49 @@ def test_idle_retry_does_not_reset_startup_grace(tmp_path):
     assert len(fleet.starts) == 1
     assert dpf.failed == []
 
-    clock.advance(20)
+    from bridge.send_pipeline import PHASE_A_SECONDS
+
+    clock.advance(PHASE_A_SECONDS)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
     _handle_cloud_sends(
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
     assert len(fleet.starts) == 2
+    assert len(fleet.uploads) == 1
     assert dpf.dispatched == []
     assert dpf.failed == []
 
-    clock.advance(ASSIGNMENT_STARTUP_GRACE_SECONDS - 20)
+    clock.advance(PHASE_A_SECONDS - 1)
     _handle_cloud_sends(
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
     assert len(fleet.starts) == 2
-    assert dpf.failed == [("B1", 2, "printer stayed idle after start command")]
+    assert dpf.failed == []
+
+    clock.advance(1)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert len(fleet.starts) == 3
+    assert dpf.failed == []
+
+    clock.advance(PHASE_A_SECONDS)
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert dpf.failed == [("B1", 2, "no_echo")]
+    assert len(fleet.uploads) == 1
 
 
 def _leftover_finished_snapshot(**overrides):
@@ -1125,12 +1168,12 @@ def _leftover_finished_snapshot(**overrides):
     return snapshot
 
 
-def test_leftover_finished_idle_stops_before_mqtt_start(tmp_path):
+def test_leftover_finished_idle_starts_without_a_stop(tmp_path):
     fleet = _ConfirmFleet()
     fleet._printer._snapshot = _leftover_finished_snapshot()
     _handle_cloud_sends(_desired(), fleet, _FakeDpf(), str(tmp_path), set())
-    assert fleet.stops == ["P1"]
-    assert fleet.commands[:2] == ["stop_print", "start_print"]
+    assert fleet.stops == []
+    assert fleet.commands == ["start_print"]
     assert len(fleet.starts) == 1
 
 
@@ -1147,7 +1190,7 @@ def test_empty_finished_idle_does_not_stop_before_start(tmp_path):
     assert fleet.commands == ["start_print"]
 
 
-def test_idle_retry_stops_leftover_finished_before_second_start(tmp_path):
+def test_idle_retry_does_not_stop_leftover_finished_before_the_second_start(tmp_path):
     clock = _FakeClock()
     fleet = _ConfirmFleet()
     fleet._printer._snapshot = _leftover_finished_snapshot()
@@ -1159,16 +1202,20 @@ def test_idle_retry_stops_leftover_finished_before_second_start(tmp_path):
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
-    assert fleet.stops == ["P1"]
+    assert fleet.stops == []
     assert len(fleet.starts) == 1
 
-    clock.advance(20)
+    from bridge.send_pipeline import PHASE_A_SECONDS
+
+    clock.advance(PHASE_A_SECONDS)
     _handle_cloud_sends(
         _desired(), fleet, dpf, str(tmp_path), started, router=router,
         wall_time=lambda: clock.now,
     )
-    assert fleet.stops == ["P1", "P1"]
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    assert fleet.stops == []
     assert len(fleet.starts) == 2
-    assert fleet.commands == [
-        "stop_print", "start_print", "stop_print", "start_print",
-    ]
+    assert fleet.commands == ["start_print", "start_print"]

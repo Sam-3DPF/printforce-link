@@ -1,39 +1,34 @@
-"""LAN file push: FTPS store and the MQTT start URL a P1/X1/A1 expects.
+"""LAN start URL and the prepare-percent rule for a file already on the printer.
 
-Bambulabs-api hides some of this. The shop printers are P1-family, so Link owns
-the P1 rules: `file:///sdcard/` on start, do not hang the TLS data socket on
-close, treat a trailing 426 as success when SIZE matches, and treat prepare
-percent 99 as the file already on disk.
+The upload itself is ``bridge.bambu.ftps``: port 990 is implicit TLS, and a
+trailing 426 is only success when SIZE matches. P1 / X1 / A1 start from
+``file:///sdcard/``. H2-family printers use an FTP URL. P1 prepare percent 99
+means the 3mf is already on disk.
 """
 
 from __future__ import annotations
 
-import ftplib
-import os
-import ssl
-from typing import Optional
-
+# Defined next to the uploader. Callers still import it from here.
+from .bambu.commands import project_file_url
+from .bambu.ftps import UploadCancelled
 from .coerce import as_int
 
-_FTPS_PORT = 990
-_FTPS_USER = "bblp"
+# Kept for callers that name a family. A start uses the model profile's scheme.
+_FAMILY_SCHEME = {
+    "h2": "ftp:///",
+    "p1": "file:///sdcard/",
+}
 
 
 def lan_start_url(remote_name: str, *, family: str = "p1") -> str:
     """MQTT `project_file` URL for a file already on the printer.
 
-    P1 / X1 / A1 start from the SD card path. H2-family printers use an FTP
-    URL. A caller that already passed a scheme (`//` in the name) is left alone.
+    The scheme is the same one the model profile carries. P1 / X1 / A1 start
+    from the SD card path. H2-family printers use an FTP URL. A caller that
+    already passed a scheme (`//` in the name) is left alone.
     """
-    name = (remote_name or "").strip()
-    if not name:
-        raise ValueError("remote file name is required")
-    if "//" in name:
-        return name
-    name = name.lstrip("/")
-    if family == "h2":
-        return f"ftp:///{name}"
-    return f"file:///sdcard/{name}"
+    scheme = _FAMILY_SCHEME.get(family, _FAMILY_SCHEME["p1"])
+    return project_file_url(remote_name, scheme)
 
 
 def prepare_download_complete(percent) -> bool:
@@ -45,125 +40,6 @@ def prepare_download_complete(percent) -> bool:
     """
     value = as_int(percent, None)
     return value is not None and value >= 99
-
-
-class _ShopFtps(ftplib.FTP_TLS):
-    """Implicit-TLS FTPS that does not unwrap the data connection.
-
-    Some P1 firmware hangs on the SSL shutdown after STOR. The bytes are
-    already on disk by then; hanging the upload thread looks like a failed send.
-    """
-
-    def storbinary(self, cmd, fp, blocksize=8192, callback=None, rest=None):
-        self.voidcmd("TYPE I")
-        with self.transfercmd(cmd, rest) as conn:
-            while True:
-                buf = fp.read(blocksize)
-                if not buf:
-                    break
-                conn.sendall(buf)
-                if callback:
-                    callback(buf)
-        try:
-            return self.voidresp()
-        except ftplib.error_temp as exc:
-            if "426" not in str(exc):
-                raise
-            return str(exc)
-
-
-def _tls_context() -> ssl.SSLContext:
-    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    context.check_hostname = False
-    context.verify_mode = ssl.CERT_NONE
-    return context
-
-
-def store_on_printer(
-    host: str,
-    access_code: str,
-    local_path: str,
-    remote_name: str,
-    *,
-    port: int = _FTPS_PORT,
-    timeout: float = 30.0,
-    ftp_factory=None,
-) -> str:
-    """STOR `local_path` as `remote_name`. Raises if the remote size does not match."""
-    if not host:
-        raise ValueError("printer address is required")
-    if not os.path.isfile(local_path):
-        raise FileNotFoundError(local_path)
-    expected = os.path.getsize(local_path)
-    factory = ftp_factory or _ShopFtps
-    ftp = factory()
-    try:
-        if hasattr(ftp, "ssl_version"):
-            try:
-                ftp.context = _tls_context()
-            except Exception:
-                pass
-        ftp.connect(host, port, timeout=timeout)
-        if callable(getattr(ftp, "auth", None)):
-            try:
-                ftp.auth()
-            except Exception:
-                pass
-        ftp.login(_FTPS_USER, access_code)
-        if callable(getattr(ftp, "prot_p", None)):
-            try:
-                ftp.prot_p()
-            except Exception:
-                pass
-        with open(local_path, "rb") as handle:
-            try:
-                reply = ftp.storbinary(f"STOR {remote_name}", handle)
-            except (ftplib.error_temp, ftplib.error_reply, ftplib.error_perm) as exc:
-                if "426" not in str(exc):
-                    raise
-                reply = str(exc)
-        if not remote_size_matches(ftp, remote_name, expected):
-            raise RuntimeError(
-                f"remote size of {remote_name} does not match {expected} bytes"
-            )
-        return str(reply or "")
-    finally:
-        try:
-            ftp.quit()
-        except Exception:
-            try:
-                ftp.close()
-            except Exception:
-                pass
-
-
-def remote_size_matches(ftp, remote_name: str, expected: int) -> bool:
-    """True when the printer's SIZE for `remote_name` equals `expected`."""
-    size = remote_file_size(ftp, remote_name)
-    return size is not None and size == expected
-
-
-def remote_file_size(ftp, remote_name: str) -> Optional[int]:
-    size_fn = getattr(ftp, "size", None)
-    if callable(size_fn):
-        try:
-            value = size_fn(remote_name)
-            return as_int(value, None)
-        except Exception:
-            pass
-    send = getattr(ftp, "sendcmd", None)
-    if not callable(send):
-        return None
-    try:
-        reply = send(f"SIZE {remote_name}")
-    except Exception:
-        return None
-    if not isinstance(reply, str):
-        return None
-    parts = reply.split()
-    if len(parts) < 2:
-        return None
-    return as_int(parts[-1], None)
 
 
 def listing_has_file(names, remote_name: str) -> bool:

@@ -12,6 +12,14 @@ from bridge.discover import DiscoveredPrinter
 from bridge.fleet import Fleet
 
 
+class _EventLog:
+    def __init__(self):
+        self.events = []
+
+    def record_event(self, kind, **fields):
+        self.events.append((kind, dict(fields)))
+
+
 class FakePrinter:
     """Stand-in for BambuPrinter with the surface the Fleet uses."""
 
@@ -20,11 +28,27 @@ class FakePrinter:
         self.bambu_id = cfg.bambu_id
         self.current_ip = cfg.ip
         self.is_offline = False
-        self.needs_session_rebuild = False
+        self.had_session = False
+        self.silent_seconds = None
+        self.rebuild_calls = 0
         self.connect_calls = 0
         self.disconnect_calls = 0
         self.reconnects = []            # new_ip passed to each reconnect()
         self.connect_hook = connect_hook
+        self.address_candidate_ips = []
+        self.proofs = []
+        self.proof_result = True
+        self.proof_hook = None
+        self.log = _EventLog()
+
+    def address_candidates(self):
+        return list(self.address_candidate_ips)
+
+    def proves_serial_at(self, ip):
+        self.proofs.append(ip)
+        if self.proof_hook is not None:
+            return self.proof_hook(ip)
+        return self.proof_result
 
     def connect(self):
         self.connect_calls += 1
@@ -41,6 +65,12 @@ class FakePrinter:
         if new_ip:
             self.current_ip = new_ip
         self.is_offline = False
+
+    def silent_for(self, now):
+        return self.silent_seconds
+
+    def rebuild_session(self):
+        self.rebuild_calls += 1
 
     def snapshot(self):
         return {"bambu_id": self.bambu_id, "status": "OFFLINE" if self.is_offline else "IDLE"}
@@ -74,7 +104,8 @@ def _cfg(serial, ip, name=""):
 
 
 def _fleet(configs, discovered=None, clock=None, rediscover_interval=60.0,
-           printer_factory=None, on_address=None, connect_timeout_seconds=12.0):
+           printer_factory=None, on_address=None, connect_timeout_seconds=12.0,
+           tcp_probe=None):
     calls = {"count": 0, "probe_ips": []}
 
     def discover_fn(timeout, probe_ips=None):
@@ -83,11 +114,17 @@ def _fleet(configs, discovered=None, clock=None, rediscover_interval=60.0,
         return list(discovered() if callable(discovered) else (discovered or []))
 
     clock = clock or Clock()
+    # A stored address that refuses 8883 is the case the older swap tests cover.
+    # An answering port is opted in per test. No test opens a real socket.
+    if tcp_probe is None:
+        def tcp_probe(_ip):
+            return False
     fleet = Fleet(configs, printer_factory=printer_factory or FakePrinter,
                   discover_fn=discover_fn,
                   rediscover_interval_seconds=rediscover_interval, monotonic=clock,
                   on_address=on_address,
-                  connect_timeout_seconds=connect_timeout_seconds)
+                  connect_timeout_seconds=connect_timeout_seconds,
+                  tcp_probe=tcp_probe)
     return fleet, calls, clock
 
 
@@ -129,9 +166,18 @@ def test_reconnects_printer_that_moved_ip():
     assert old.disconnect_calls == 1
 
 
-def test_same_ip_offline_retries_stored_address():
-    # Silent at the address we already have (reserved 192.168.8.x included).
-    # Do not wait for a wedged flag — retry the stored IP on the fleet timer.
+def _assert_printer_stays(fleet, old):
+    """Same-IP recovery must not swap the printer object out from under the fleet."""
+    assert not _wait_for(lambda: fleet.by_id(old.bambu_id) is not old, timeout=0.15)
+    assert fleet.by_id(old.bambu_id) is old
+    assert old.disconnect_calls == 0
+    assert old.reconnects == []
+    assert old.rebuild_calls == 0
+
+
+def test_same_ip_offline_is_not_rebuilt():
+    # SSDP still names the address we are dialing. A new printer object would drop
+    # the stopwatch and the cancel latch; same-IP recovery is not this path.
     factory = FakePrinterFactory()
     fleet, calls, _ = _fleet(
         [_cfg("S1", "192.168.8.236")],
@@ -142,16 +188,12 @@ def test_same_ip_offline_retries_stored_address():
     old.is_offline = True
     fleet.reconcile_connections()
 
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
     assert calls["count"] == 1
-    assert fleet.by_id("S1").current_ip == "192.168.8.236"
-    assert fleet.by_id("S1").connect_calls == 1
-    assert old.disconnect_calls == 1
+    _assert_printer_stays(fleet, old)
+    assert len(factory.created) == 1
 
 
-def test_same_ip_wedged_session_is_reconnected():
-    # P1S-9 stayed OFFLINE at the address it was already using. paho will not rebuild
-    # a socket it still considers healthy, so a wedged session has to be replaced here.
+def test_same_ip_ssdp_hit_does_not_rebuild():
     factory = FakePrinterFactory()
     fleet, calls, _ = _fleet(
         [_cfg("S1", "192.168.1.10")],
@@ -160,19 +202,13 @@ def test_same_ip_wedged_session_is_reconnected():
     )
     old = fleet.by_id("S1")
     old.is_offline = True
-    old.needs_session_rebuild = True
     fleet.reconcile_connections()
 
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
-    replacement = fleet.by_id("S1")
     assert calls["count"] == 1
-    assert replacement.current_ip == "192.168.1.10"
-    assert replacement.connect_calls == 1
-    assert old.disconnect_calls == 1
+    _assert_printer_stays(fleet, old)
 
 
-def test_silent_session_retries_stored_ip_without_ssdp():
-    # No announcement this pass. Still dial the address we already stored.
+def test_no_ssdp_hit_does_not_rebuild_stored_ip():
     factory = FakePrinterFactory()
     fleet, calls, _ = _fleet(
         [_cfg("S1", "192.168.1.10")],
@@ -182,16 +218,11 @@ def test_silent_session_retries_stored_ip_without_ssdp():
     old = fleet.by_id("S1")
     old.is_offline = True
     fleet.reconcile_connections()
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
     assert calls["count"] == 1
-    assert fleet.by_id("S1").current_ip == "192.168.1.10"
-    assert fleet.by_id("S1").connect_calls == 1
+    _assert_printer_stays(fleet, old)
 
 
-def test_wedged_printer_rebuilds_when_ssdp_misses_it():
-    # v0.1.23 only rebuilt a wedged session when SSDP answered. A 5s listen was
-    # hearing nothing, so the quiet printers stayed OFFLINE at the IP we already
-    # had. A missed announcement is not proof the printer left the network.
+def test_ssdp_miss_does_not_rebuild_stored_ip():
     factory = FakePrinterFactory()
     fleet, calls, _ = _fleet(
         [_cfg("S1", "192.168.1.10")],
@@ -200,18 +231,13 @@ def test_wedged_printer_rebuilds_when_ssdp_misses_it():
     )
     old = fleet.by_id("S1")
     old.is_offline = True
-    old.needs_session_rebuild = True
     fleet.reconcile_connections()
 
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
-    replacement = fleet.by_id("S1")
     assert calls["count"] == 1
-    assert replacement.current_ip == "192.168.1.10"
-    assert replacement.connect_calls == 1
-    assert old.disconnect_calls == 1
+    _assert_printer_stays(fleet, old)
 
 
-def test_wedged_printer_rebuilds_when_the_scan_fails():
+def test_scan_failure_does_not_rebuild_stored_ip():
     factory = FakePrinterFactory()
 
     def boom(_timeout, probe_ips=None):
@@ -225,12 +251,10 @@ def test_wedged_printer_rebuilds_when_the_scan_fails():
     )
     old = fleet.by_id("S1")
     old.is_offline = True
-    old.needs_session_rebuild = True
     fleet.reconcile_connections()
 
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+    _assert_printer_stays(fleet, old)
     assert fleet.by_id("S1").current_ip == "192.168.8.223"
-    assert fleet.by_id("S1").connect_calls == 1
 
 
 def test_stale_ip_reconnects_when_reserved_address_is_on_a_known_lan():
@@ -253,6 +277,7 @@ def test_stale_ip_reconnects_when_reserved_address_is_on_a_known_lan():
         printer_factory=factory,
         discover_fn=discover_fn,
         monotonic=Clock(),
+        tcp_probe=lambda _ip: False,
     )
     old = fleet.by_id("S5")
     old.is_offline = True
@@ -317,13 +342,12 @@ def test_hung_reconnect_releases_the_slot():
     factory = FakePrinterFactory(connect_hook=hang)
     fleet, _, _ = _fleet(
         [_cfg("S1", "192.168.8.223")],
-        discovered=[],
+        discovered=[DiscoveredPrinter(ip="192.168.8.250", serial="S1")],
         printer_factory=factory,
         connect_timeout_seconds=0.05,
     )
     old = fleet.by_id("S1")
     old.is_offline = True
-    old.needs_session_rebuild = True
     fleet.reconcile_connections()
     assert started.wait(1.0)
     assert _wait_for(lambda: fleet._reconnects_in_flight == {} and
@@ -345,11 +369,12 @@ def test_scan_is_throttled():
     fleet.reconcile_connections()       # scans at t=1000
     fleet.reconcile_connections()       # within the interval -> no second scan
     assert calls["count"] == 1
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+    _assert_printer_stays(fleet, old)   # no SSDP hit -> no printer swap
     clock.t = 1000.0 + 61               # past the 60s interval
     fleet.by_id("S1").is_offline = True
     fleet.reconcile_connections()
     assert calls["count"] == 2
+    assert fleet.by_id("S1") is old
 
 
 def test_two_printers_swap_ips():
@@ -385,8 +410,12 @@ def test_discovery_failure_is_swallowed_and_still_throttled():
     fleet.reconcile_connections()            # scan raises internally -> swallowed, not re-raised
     fleet.reconcile_connections()            # within the interval -> must NOT scan again
     assert calls["count"] == 1               # throttle timestamp advanced despite the failure
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+    _assert_printer_stays(fleet, old)
     assert fleet.by_id("S1").current_ip == "192.168.1.10"
+    clock.t = 1000.0 + 61
+    fleet.by_id("S1").is_offline = True
+    fleet.reconcile_connections()
+    assert calls["count"] == 2
 
 
 def test_old_object_remains_stable_during_blocked_replacement_connect():
@@ -729,28 +758,17 @@ def test_blocked_printers_do_not_starve_unrelated_reconnect():
         release.set()
 
 
-def test_control_keeps_reconnect_swap_waiting_until_command_returns():
+def test_control_does_not_hold_the_fleet_lock_across_the_command():
+    """Pause publishes outside the membership lock.
+
+    A reconnect swap and the next snapshot must not wait for the command to
+    return. The command still completes on the printer it looked up.
+    """
     replacement_ready = threading.Event()
     allow_replacement_connect = threading.Event()
     replacement_connected = threading.Event()
     control_started = threading.Event()
     release_control = threading.Event()
-    swap_lock_attempted = threading.Event()
-
-    class SwapBoundaryLock:
-        def __init__(self):
-            self._lock = threading.RLock()
-            self._worker_entries = 0
-
-        def __enter__(self):
-            if threading.current_thread().name == "printer-reconnect-S1":
-                self._worker_entries += 1
-                if self._worker_entries == 2:
-                    swap_lock_attempted.set()
-            return self._lock.__enter__()
-
-        def __exit__(self, exc_type, exc_value, traceback):
-            return self._lock.__exit__(exc_type, exc_value, traceback)
 
     class ControlPrinter(FakePrinter):
         def pause_print(self):
@@ -780,7 +798,6 @@ def test_control_keeps_reconnect_swap_waiting_until_command_returns():
         discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
         printer_factory=factory,
     )
-    fleet._lock = SwapBoundaryLock()
     old = fleet.by_id("S1")
     old.is_offline = True
     fleet.reconcile_connections()
@@ -791,13 +808,20 @@ def test_control_keeps_reconnect_swap_waiting_until_command_returns():
         target=lambda: results.append(fleet.apply_control("S1", "pause")),
     )
     control_thread.start()
+    snapshot_done = threading.Event()
+
+    def take_snapshot():
+        fleet.snapshot()
+        snapshot_done.set()
+
     try:
         assert control_started.wait(1.0)
         allow_replacement_connect.set()
         assert replacement_connected.wait(1.0)
-        assert swap_lock_attempted.wait(1.0)
-        assert fleet._printers[0] is old
-        assert old.disconnect_calls == 0
+        assert control_thread.is_alive()
+        threading.Thread(target=take_snapshot, daemon=True).start()
+        assert snapshot_done.wait(0.5), "snapshot blocked behind the in-flight command"
+        assert _wait_for(lambda: fleet.by_id("S1") is not old)
     finally:
         allow_replacement_connect.set()
         release_control.set()
@@ -805,7 +829,6 @@ def test_control_keeps_reconnect_swap_waiting_until_command_returns():
 
     assert not control_thread.is_alive()
     assert results == [True]
-    assert _wait_for(lambda: fleet.by_id("S1") is not old)
 
 
 # ---- U2: dynamic fleet membership --------------------------------------------------
@@ -874,3 +897,408 @@ def test_remove_cancels_add_that_is_still_connecting():
     assert not add_thread.is_alive()
     assert fleet.by_id("S1") is None
     assert factory.created[0].disconnect_calls == 1
+
+
+# ---- dead-session backstop ---------------------------------------------------------
+
+def test_backstop_skips_a_closed_port_and_rebuilds_an_open_one_once_per_300s():
+    clock = Clock(5000.0)
+    probed = []
+
+    def tcp_probe(ip):
+        probed.append(ip)
+        return ip.endswith(".10")
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10"), _cfg("S2", "192.168.1.11")],
+        clock=clock,
+        tcp_probe=tcp_probe,
+    )
+    open_printer = fleet.by_id("S1")
+    closed_printer = fleet.by_id("S2")
+    open_printer.had_session = True
+    closed_printer.had_session = True
+    open_printer.silent_seconds = 300
+    closed_printer.silent_seconds = 300
+    fleet.recover_dead_sessions()
+    assert not _wait_for(lambda: len(probed) > 0, timeout=0.15)
+    assert open_printer.rebuild_calls == 0
+
+    open_printer.silent_seconds = 301
+    closed_printer.silent_seconds = 301
+    clock.t = 5000.0 + 60
+    fleet.recover_dead_sessions()
+    assert _wait_for(lambda: open_printer.rebuild_calls == 1)
+    assert closed_printer.rebuild_calls == 0
+    assert set(probed) == {"192.168.1.10", "192.168.1.11"}
+    assert fleet.by_id("S1") is open_printer
+
+    fleet.recover_dead_sessions()
+    assert open_printer.rebuild_calls == 1
+
+    clock.t = 5000.0 + 60 + 299
+    fleet.recover_dead_sessions()
+    assert open_printer.rebuild_calls == 1
+
+    # That pass consumed the fleet's 60s slot, so one second later is too soon
+    # even though the per-printer wait has elapsed.
+    clock.t = 5000.0 + 60 + 300
+    fleet.recover_dead_sessions()
+    assert open_printer.rebuild_calls == 1
+
+    clock.t = 5000.0 + 60 + 299 + 60
+    fleet.recover_dead_sessions()
+    assert _wait_for(lambda: open_printer.rebuild_calls == 2)
+    assert fleet.by_id("S1") is open_printer
+
+
+def test_backstop_leaves_a_printer_that_never_had_a_session():
+    clock = Clock(8000.0)
+    probed = []
+
+    def tcp_probe(ip):
+        probed.append(ip)
+        return True
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        clock=clock,
+        tcp_probe=tcp_probe,
+    )
+    printer = fleet.by_id("S1")
+    printer.had_session = False
+    printer.silent_seconds = 9999
+    fleet.recover_dead_sessions()
+    assert not _wait_for(lambda: len(probed) > 0, timeout=0.15)
+    assert printer.rebuild_calls == 0
+    assert fleet.by_id("S1") is printer
+
+
+def test_backstop_records_an_event_on_the_printer_log():
+    clock = Clock(5000.0)
+    events = []
+
+    class _Log:
+        def record_event(self, kind, **fields):
+            events.append((kind, fields))
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        clock=clock,
+        tcp_probe=lambda _ip: True,
+    )
+    printer = fleet.by_id("S1")
+    printer.had_session = True
+    printer.silent_seconds = 301
+    printer.log = _Log()
+    clock.t = 5000.0 + 60
+    fleet.recover_dead_sessions()
+    assert _wait_for(lambda: events == [("backstop", {})])
+    assert printer.rebuild_calls == 1
+    assert fleet.by_id("S1") is printer
+
+
+def test_backstop_returns_without_waiting_on_the_tcp_probe():
+    clock = Clock(9000.0)
+    started = threading.Event()
+    release = threading.Event()
+
+    def tcp_probe(ip):
+        started.set()
+        release.wait(1.0)
+        return False
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        clock=clock,
+        tcp_probe=tcp_probe,
+    )
+    printer = fleet.by_id("S1")
+    printer.had_session = True
+    printer.silent_seconds = 301
+    try:
+        began = time.monotonic()
+        fleet.recover_dead_sessions()
+        elapsed = time.monotonic() - began
+        assert elapsed < 0.15
+        assert started.wait(1.0)
+        assert printer.rebuild_calls == 0
+    finally:
+        release.set()
+
+
+# ---- U10: address policy -----------------------------------------------------------
+
+def _events(printer, kind):
+    return [fields for name, fields in printer.log.events if name == kind]
+
+
+def test_answering_stored_ip_is_kept_when_ssdp_sees_another_address():
+    # DHCP noise must not move a printer whose MQTT port still accepts.
+    remembered = []
+    probes = []
+
+    def tcp_probe(ip):
+        probes.append(ip)
+        return True
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        tcp_probe=tcp_probe,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: _events(old, "address_kept") == [{
+        "ip": "192.168.1.10",
+        "candidate": "192.168.1.55",
+        "source": "ssdp",
+    }])
+    assert probes == ["192.168.1.10"]
+    assert fleet.by_id("S1") is old
+    assert old.current_ip == "192.168.1.10"
+    assert old.disconnect_calls == 0
+    assert old.proofs == []
+    assert remembered == []
+
+
+def test_dead_stored_ip_switches_when_the_ssdp_candidate_proves_the_serial():
+    remembered = []
+    probes = []
+
+    def tcp_probe(ip):
+        probes.append(ip)
+        return False
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        tcp_probe=tcp_probe,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: remembered == [("S1", "192.168.1.55")])
+    assert probes == ["192.168.1.10"]
+    assert old.proofs == ["192.168.1.55"]
+    assert fleet.by_id("S1") is not old
+    assert fleet.by_id("S1").current_ip == "192.168.1.55"
+    assert _events(fleet.by_id("S1"), "address_switched") == [{
+        "ip": "192.168.1.55",
+        "previous": "192.168.1.10",
+        "source": "ssdp",
+    }]
+
+
+def test_ssdp_candidate_that_does_not_prove_the_serial_is_rejected():
+    # CONNACK refused, or CONNACK with no report on this serial, is a False proof.
+    remembered = []
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        tcp_probe=lambda _ip: False,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.proof_result = False
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: old.proofs == ["192.168.1.55"])
+    assert _wait_for(lambda: not fleet._reconnects_in_flight)
+    assert fleet.by_id("S1") is old
+    assert old.current_ip == "192.168.1.10"
+    assert old.disconnect_calls == 0
+    assert remembered == []
+    assert _events(old, "address_rejected") == [{
+        "ip": "192.168.1.10",
+        "candidate": "192.168.1.55",
+        "source": "ssdp",
+    }]
+
+
+def test_address_proof_does_not_block_reconcile_connections():
+    started = threading.Event()
+    release = threading.Event()
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        tcp_probe=lambda _ip: False,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+
+    def proof(_ip):
+        started.set()
+        release.wait(2.0)
+        return True
+
+    old.proof_hook = proof
+    try:
+        began = time.monotonic()
+        fleet.reconcile_connections()
+        elapsed = time.monotonic() - began
+        assert elapsed < 0.3
+        assert started.wait(1.0)
+        assert fleet.by_id("S1") is old
+    finally:
+        release.set()
+    assert _wait_for(lambda: fleet.by_id("S1") is not old)
+
+
+def test_a_failed_proof_is_not_repeated_for_five_minutes():
+    clock = Clock(1000.0)
+    fleet, calls, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[DiscoveredPrinter(ip="192.168.1.55", serial="S1")],
+        clock=clock,
+        tcp_probe=lambda _ip: False,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.proof_result = False
+    fleet.reconcile_connections()
+    assert _wait_for(lambda: old.proofs == ["192.168.1.55"])
+    assert _wait_for(lambda: not fleet._reconnects_in_flight)
+    assert fleet.by_id("S1") is old
+
+    clock.t = 1000.0 + 61
+    fleet.reconcile_connections()
+    assert calls["count"] == 2
+    assert not _wait_for(lambda: len(old.proofs) > 1, timeout=0.2)
+    assert old.proofs == ["192.168.1.55"]
+
+    clock.t = 1000.0 + 61 + 300
+    fleet.reconcile_connections()
+    assert _wait_for(lambda: old.proofs == ["192.168.1.55", "192.168.1.55"])
+    assert fleet.by_id("S1") is old
+
+
+def test_offline_printer_adopts_a_net_info_candidate_that_proves_the_serial():
+    remembered = []
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[],
+        tcp_probe=lambda _ip: False,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.address_candidate_ips = ["192.168.8.10"]
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: remembered == [("S1", "192.168.8.10")])
+    assert fleet.by_id("S1") is not old
+    assert fleet.by_id("S1").current_ip == "192.168.8.10"
+    assert old.proofs == ["192.168.8.10"]
+    assert _events(fleet.by_id("S1"), "address_switched") == [{
+        "ip": "192.168.8.10",
+        "previous": "192.168.1.10",
+        "source": "net_info",
+    }]
+
+
+def test_net_info_matching_the_stored_ip_is_not_a_candidate():
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        discovered=[],
+        tcp_probe=lambda _ip: False,
+    )
+    old = fleet.by_id("S1")
+    old.is_offline = True
+    old.address_candidate_ips = ["192.168.1.10"]
+    fleet.reconcile_connections()
+
+    assert not _wait_for(lambda: len(old.proofs) > 0, timeout=0.15)
+    assert fleet.by_id("S1") is old
+    assert old.disconnect_calls == 0
+
+
+def test_propose_address_ignores_the_address_already_in_use():
+    probes = []
+
+    def tcp_probe(ip):
+        probes.append(ip)
+        return False
+
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        tcp_probe=tcp_probe,
+    )
+    printer = fleet.by_id("S1")
+    fleet.propose_address("S1", printer.current_ip, "pin")
+    fleet.propose_address("S1", "", "pin")
+    fleet.propose_address("NOPE", "192.168.1.55", "pin")
+    fleet.propose_address("S1", "192.168.1.55", "nope")
+
+    assert not _wait_for(lambda: probes or printer.proofs, timeout=0.15)
+    assert fleet.by_id("S1") is printer
+
+
+def test_pin_keeps_a_stored_ip_that_still_answers():
+    remembered = []
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        tcp_probe=lambda _ip: True,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    printer = fleet.by_id("S1")
+    fleet.propose_address("S1", "192.168.8.246", "pin")
+
+    assert _wait_for(lambda: _events(printer, "address_kept"))
+    assert fleet.by_id("S1") is printer
+    assert printer.current_ip == "192.168.1.10"
+    assert printer.proofs == []
+    assert remembered == []
+    assert _events(printer, "address_kept") == [{
+        "ip": "192.168.1.10",
+        "candidate": "192.168.8.246",
+        "source": "pin",
+    }]
+
+
+def test_pin_switches_when_the_stored_ip_is_dead_and_the_serial_proves():
+    remembered = []
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.86.28")],
+        tcp_probe=lambda _ip: False,
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    old = fleet.by_id("S1")
+    fleet.propose_address("S1", "192.168.8.246", "pin")
+
+    assert _wait_for(lambda: remembered == [("S1", "192.168.8.246")])
+    assert fleet.by_id("S1") is not old
+    assert old.proofs == ["192.168.8.246"]
+    assert fleet.by_id("S1").current_ip == "192.168.8.246"
+    assert _events(fleet.by_id("S1"), "address_switched") == [{
+        "ip": "192.168.8.246",
+        "previous": "192.168.86.28",
+        "source": "pin",
+    }]
+
+
+def test_a_kept_pin_is_proposed_again_once_the_printer_goes_offline():
+    remembered = []
+    stored_answers = {"value": True}
+    fleet, _, _ = _fleet(
+        [_cfg("S1", "192.168.1.10")],
+        tcp_probe=lambda _ip: stored_answers["value"],
+        on_address=lambda bambu_id, ip: remembered.append((bambu_id, ip)),
+    )
+    printer = fleet.by_id("S1")
+    fleet.propose_address("S1", "192.168.8.246", "pin")
+    assert _wait_for(lambda: _events(printer, "address_kept"))
+    assert _wait_for(lambda: fleet._reconnects_in_flight == {})
+
+    stored_answers["value"] = False
+    printer.is_offline = True
+    fleet.reconcile_connections()
+
+    assert _wait_for(lambda: remembered == [("S1", "192.168.8.246")])
+    assert fleet.by_id("S1").current_ip == "192.168.8.246"

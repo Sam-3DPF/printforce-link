@@ -53,8 +53,10 @@ class DiscoveryReporter:
                  ramp_seconds: float = _DEFAULT_RAMP_SECONDS,
                  burst_seconds: float = _DEFAULT_BURST_SECONDS,
                  discover_timeout_seconds: float = _DEFAULT_DISCOVER_TIMEOUT_SECONDS,
-                 monotonic=time.monotonic):
+                 monotonic=time.monotonic, on_found=None):
         self._dpf = dpf
+        # Gets every scan's DiscoveredPrinters so the store can keep each model code.
+        self._on_found = on_found
         self._discover = discover_fn if discover_fn is not None else _default_discover
         self._interval = interval_seconds  # unused by tick() post-U7; kept for compatibility
         self._fast_interval = fast_interval_seconds
@@ -71,6 +73,14 @@ class DiscoveryReporter:
 
     def _in_burst(self, now: float) -> bool:
         return self._burst_until is not None and now < self._burst_until
+
+    def _note_found(self, found) -> None:
+        if self._on_found is None:
+            return
+        try:
+            self._on_found(list(found))
+        except Exception as e:
+            logger.warning("recording discovered models failed (%s)", type(e).__name__)
 
     def tick(self, scan_requested: bool = False, probe_ips=None) -> None:
         """Throttled LAN scan + report. Never raises.
@@ -99,6 +109,7 @@ class DiscoveryReporter:
                 found = self._discover(self._timeout, probe_ips)
             except TypeError:
                 found = self._discover(self._timeout)
+            self._note_found(found)
             self._dpf.report_discovered([
                 {"bambu_id": d.serial, "ip": d.ip, "model": d.model, "name": d.name}
                 for d in found

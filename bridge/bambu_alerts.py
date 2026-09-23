@@ -38,6 +38,12 @@ _EXPLICIT = {
         "Bed leveling failed",
         "The printer could not level the bed. Clear the plate and check for debris, then retry.",
     ),
+    "0500050000010007": (
+        "Printer is refusing commands",
+        "MQTT command verification failed. Status still updates, but starts and "
+        "controls are ignored. Power-cycle the printer or re-check LAN-only mode "
+        "and the access code.",
+    ),
 }
 
 

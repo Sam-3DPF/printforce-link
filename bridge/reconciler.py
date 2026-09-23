@@ -9,11 +9,14 @@ every printer the cloud is delivering a NOT-yet-delivered access code for, it:
   3. ACKs the delivery so the cloud deletes its copy of the code (courier hand-off done).
 
 A printer WITH an access code is stored, added, and ACKed. Once the code is
-delivered, later pulls still carry `local_ip` with no code — apply that pin
-when it *changes* (an operator reserved-IP edit). An unchanged stale pin
-must not overwrite an address SSDP or a live session just learned. The
-store, not this pull, is what re-connects stored printers after a restart
-(app.py builds the fleet from it at startup).
+delivered, later pulls still carry `local_ip` with no code. An unchanged
+stale pin must not overwrite an address SSDP or a live session just learned.
+A changed pin for a printer already in the fleet is only a candidate: the
+fleet adopts it after the stored address fails and the pin proves the serial.
+A stored printer that is not running has nothing connected to prove against,
+so that pin is applied directly. The store, not this pull, is what
+re-connects stored printers after a restart (app.py builds the fleet from it
+at startup).
 """
 import logging
 import time
@@ -24,6 +27,22 @@ from .config import PrinterConfig
 logger = logging.getLogger(__name__)
 
 _DEFAULT_RECONCILE_INTERVAL_SECONDS = 60.0
+
+
+def _model_code(entry) -> str:
+    """A DevModel code 3DPF may carry. 3DPF's config pull does not send one yet."""
+    for key in ("model", "model_name"):
+        value = entry.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def _stored_model(store, bambu_id: str) -> str:
+    for cfg in store.configs():
+        if cfg.bambu_id == bambu_id:
+            return cfg.model
+    return ""
 
 
 class ConfigReconciler:
@@ -81,6 +100,9 @@ class ConfigReconciler:
             if not bambu_id:
                 continue
             local_ip = p.get("local_ip")
+            model = _model_code(p)
+            if model:
+                self._store.set_model(bambu_id, model)
             if not access_code:
                 # Already delivered: 3DPF still sends the pinned local_ip. Apply a
                 # reserved-IP edit without waiting for a new access code or a restart.
@@ -89,6 +111,8 @@ class ConfigReconciler:
             # 1. Durably store the code first — the store is its permanent home, so we
             #    must have written it before ACKing the cloud to delete its copy.
             self._store.upsert(bambu_id, access_code, local_ip)
+            if model:
+                self._store.set_model(bambu_id, model)
             # 2. Push the code into the running fleet so the printer connects without a
             #    restart (U2). The cloud only sends a code while it is UNdelivered, so a code
             #    arriving here for a printer ALREADY in the fleet means the operator
@@ -100,8 +124,10 @@ class ConfigReconciler:
             if local_ip:
                 if self._fleet.by_id(bambu_id) is not None:
                     self._fleet.remove_printer(bambu_id)
-                self._fleet.add_printer(
-                    PrinterConfig(bambu_id=bambu_id, ip=local_ip, access_code=access_code))
+                self._fleet.add_printer(PrinterConfig(
+                    bambu_id=bambu_id, ip=local_ip, access_code=access_code,
+                    model=model or _stored_model(self._store, bambu_id),
+                ))
             # 3. Queue the ACK so the cloud deletes the code.
             printer_id, config_version = p.get("printer_id"), p.get("config_version")
             if printer_id and config_version:
@@ -110,7 +136,12 @@ class ConfigReconciler:
             self._dpf.ack_printers_config(acks, removed=removed)
 
     def _refresh_stored_ip(self, bambu_id: str, local_ip: Optional[str]) -> None:
-        """Rebuild a stored printer when 3DPF pins a new LAN address."""
+        """Hand a changed 3DPF pin to the fleet, or apply it when nothing is connected.
+
+        ``_cloud_pins`` remembers the last pin so an unchanged stale address
+        cannot yank a learned one back. The store is not written here for a
+        running printer: ``on_address`` does that after the proof.
+        """
         if not local_ip or not self._store.has(bambu_id):
             return
         current = None
@@ -124,6 +155,11 @@ class ConfigReconciler:
             return
         if current is None or current.ip == local_ip:
             return
+        if self._fleet.by_id(bambu_id) is not None:
+            propose = getattr(self._fleet, "propose_address", None)
+            if callable(propose):
+                propose(bambu_id, local_ip, "pin")
+                return
         self._store.update_ip(bambu_id, local_ip)
         if self._fleet.by_id(bambu_id) is not None:
             self._fleet.remove_printer(bambu_id)
@@ -132,6 +168,7 @@ class ConfigReconciler:
             ip=local_ip,
             access_code=current.access_code,
             name=current.name,
+            model=current.model,
         ))
         logger.info("printer %s moved to reserved/current IP %s (was %s)",
                     bambu_id, local_ip, current.ip)

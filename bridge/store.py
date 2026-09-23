@@ -25,7 +25,7 @@ _DEFAULT_STORE_PATH = "printers.json"
 class PrinterStore:
     def __init__(self, path: str = _DEFAULT_STORE_PATH):
         self._path = path
-        self._printers: Dict[str, Dict] = {}   # bambu_id -> {access_code, local_ip?, name?}
+        self._printers: Dict[str, Dict] = {}   # bambu_id -> {access_code, local_ip?, name?, model?}
         self._cloud_token: Optional[str] = None  # the paired durable credential (U6)
         self._load()
 
@@ -98,6 +98,16 @@ class PrinterStore:
         self._printers[bambu_id] = entry
         self._save()
 
+    def set_model(self, bambu_id: str, model: str) -> None:
+        """Remember a stored printer's DevModel code. Unknown serials and blanks are ignored."""
+        if not model or bambu_id not in self._printers:
+            return
+        entry = self._printers[bambu_id]
+        if entry.get("model") == model:
+            return
+        entry["model"] = model
+        self._save()
+
     def get_cloud_token(self) -> Optional[str]:
         """The durable cloud credential from pairing (U6), or None if not yet paired."""
         return self._cloud_token
@@ -119,5 +129,6 @@ class PrinterStore:
             if not code or not ip:
                 continue
             out.append(PrinterConfig(bambu_id=bambu_id, ip=ip, access_code=code,
-                                     name=entry.get("name", "")))
+                                     name=entry.get("name", ""),
+                                     model=entry.get("model", "")))
         return out

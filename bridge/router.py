@@ -30,6 +30,12 @@ from .printer import is_cancel_failed
 
 logger = logging.getLogger(__name__)
 
+# Watchdog fields stored beside an assignment. Other keys stay untouched.
+_SEND_ATTEMPT_FIELDS = frozenset({
+    "submission_id", "attempts", "phase", "phase_started_at",
+    "last_failure", "uploaded", "pending_republish",
+})
+
 
 def is_cancel_failed_snapshot(snap: Optional[Dict]) -> bool:
     """True when a drain snapshot is a user-cancel, not a real fail."""
@@ -59,6 +65,27 @@ DISPATCHED = "dispatched"
 # A start can succeed before the printer publishes its first state for the new job.
 # During this bounded window, a terminal snapshot may still describe the old print.
 ASSIGNMENT_STARTUP_GRACE_SECONDS = 60.0
+
+# A restart close needs the same live state twice, at least this far apart.
+# One report, or a gap that is still inside the window, is not steady.
+RESTART_RECONCILE_STEADY_SECONDS = 30.0
+
+_RESTART_ACTIVE_STATES = frozenset({"PREPARE", "SLICING", "RUNNING", "PAUSE"})
+_RESTART_KNOWN_STATES = _RESTART_ACTIVE_STATES | frozenset({"FINISH", "IDLE", "FAILED"})
+
+
+def _normalize_submission_id(value) -> Optional[str]:
+    """String form of a Link submission id. Zero and blank are absent."""
+    if value is None or isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        if value == 0:
+            return None
+        return str(value)
+    if isinstance(value, str):
+        text = value.strip()
+        return text or None
+    return None
 
 
 @dataclass
@@ -110,8 +137,12 @@ class Router:
         self._lock = threading.Lock()
         self.jobs: List[Job] = self._load()
         # {bambu_id: {"batch_id", "plate_number", "terminal",
-        #             "started_at", "observed_active"}}
+        #             "started_at", "observed_active", "submission_id",
+        #             "observed_running", "recovered"}}
         self.assignments: dict = self._load_assignments()
+        # Optional. Set by the app so a recorded submission id is registered
+        # on the printer before the next report. None in unit tests.
+        self._submission_registrar = None
 
     def enqueue(self, job: Job) -> Job:
         with self._lock:
@@ -163,18 +194,58 @@ class Router:
 
     # --- printer->batch assignments (U11 completion tracking) ----------------
 
+    def set_submission_registrar(self, registrar) -> None:
+        """Called with ``(bambu_id, submission_id)`` after a submission is recorded.
+
+        The printer matches ``subtask_id`` against ids it has been given.
+        Recording the assignment without telling the printer would make the
+        finish look external.
+        """
+        self._submission_registrar = registrar
+
     def record_assignment(self, bambu_id: str, batch_id: str,
                           plate_number: Optional[int] = None,
-                          started_at: Optional[float] = None) -> None:
+                          started_at: Optional[float] = None,
+                          submission_id: Optional[str] = None) -> None:
         """Remember that `batch_id` is now printing on `bambu_id`, so its completion can be
         reported after the job has left the queue. Recorded at physical start; persisted so
-        a restart mid-print can still report the finish."""
+        a restart mid-print can still report the finish.
+
+        ``submission_id`` is the id Link sent on the start, when it sent one.
+        None keeps today's status-based completion. A present id makes
+        completion follow lifecycle events for that id only.
+        """
+        sid = _normalize_submission_id(submission_id)
         with self._lock:
             self.assignments[bambu_id] = {
                 "batch_id": batch_id, "plate_number": plate_number, "terminal": None,
                 "started_at": time.time() if started_at is None else float(started_at),
                 "observed_active": False,
+                "submission_id": sid,
+                "observed_running": False,
             }
+            self._persist_assignments()
+            registrar = self._submission_registrar
+        if sid and registrar is not None:
+            registrar(bambu_id, sid)
+
+    def update_send_attempt(self, bambu_id: str, **fields) -> None:
+        """Record the send watchdog beside this printer's assignment.
+
+        The attempt count, phase, and last failure live on the same object as
+        the batch assignment, so a restart continues the same send instead of
+        uploading the file again. Only those attempt fields are written.
+        """
+        fields = {
+            key: value for key, value in fields.items() if key in _SEND_ATTEMPT_FIELDS
+        }
+        if not fields:
+            return
+        with self._lock:
+            assignment = self.assignments.get(bambu_id)
+            if assignment is None:
+                return
+            assignment.update(fields)
             self._persist_assignments()
 
     def mark_assignment_active(self, bambu_id: str) -> None:
@@ -183,6 +254,39 @@ class Router:
             assignment = self.assignments.get(bambu_id)
             if assignment is not None and not assignment.get("observed_active"):
                 assignment["observed_active"] = True
+                self._persist_assignments()
+
+    def mark_assignment_recovered(self, bambu_id: str) -> None:
+        """The first live report of this session still shows this submission.
+
+        ``recovered`` is how a later reader tells a restart-keep from a start
+        that has not been seen yet. ``observed_running`` is set too: the print
+        is on the machine, so the next terminal edge belongs to this submission.
+        """
+        with self._lock:
+            assignment = self.assignments.get(bambu_id)
+            if assignment is None:
+                return
+            changed = False
+            if assignment.get("recovered") is not True:
+                assignment["recovered"] = True
+                changed = True
+            if assignment.get("observed_running") is not True:
+                assignment["observed_running"] = True
+                changed = True
+            if changed:
+                self._persist_assignments()
+
+    def mark_assignment_running(self, bambu_id: str) -> None:
+        """Persist proof that a ``print_started`` event matched this submission.
+
+        Separate from ``observed_active``, which is the status-based proof
+        used when the assignment has no submission id.
+        """
+        with self._lock:
+            assignment = self.assignments.get(bambu_id)
+            if assignment is not None and assignment.get("observed_running") is not True:
+                assignment["observed_running"] = True
                 self._persist_assignments()
 
     def set_assignment_terminal(self, bambu_id: str, kind: str) -> None:
@@ -256,16 +360,36 @@ class Router:
                 assignment["started_at"] = 0.0
                 assignment["observed_active"] = True
                 changed = True
-                continue
-            if not isinstance(assignment.get("observed_active"), bool):
-                assignment["observed_active"] = False
+            else:
+                if not isinstance(assignment.get("observed_active"), bool):
+                    assignment["observed_active"] = False
+                    changed = True
+                try:
+                    started_at = float(assignment.get("started_at"))
+                except (TypeError, ValueError):
+                    started_at = float("nan")
+                if not math.isfinite(started_at) or started_at < 0:
+                    assignment["started_at"] = time.time()
+                    changed = True
+            # Old files have observed_active and no submission id. Copy the
+            # active bit so a later reader sees the same proof under the new
+            # name, and keep reading the old key for status-based completion.
+            if "observed_running" not in assignment:
+                assignment["observed_running"] = assignment.get("observed_active") is True
                 changed = True
-            try:
-                started_at = float(assignment.get("started_at"))
-            except (TypeError, ValueError):
-                started_at = float("nan")
-            if not math.isfinite(started_at) or started_at < 0:
-                assignment["started_at"] = time.time()
+            elif not isinstance(assignment.get("observed_running"), bool):
+                assignment["observed_running"] = False
+                changed = True
+            if "submission_id" not in assignment:
+                assignment["submission_id"] = None
+                changed = True
+            else:
+                normalized = _normalize_submission_id(assignment.get("submission_id"))
+                if normalized != assignment.get("submission_id"):
+                    assignment["submission_id"] = normalized
+                    changed = True
+            if "recovered" in assignment and not isinstance(assignment.get("recovered"), bool):
+                assignment["recovered"] = False
                 changed = True
         if changed:
             self._atomic_write(self.assignments_path, raw)
@@ -310,6 +434,196 @@ class Router:
             raise
 
 
+def _gcode_state_token(value) -> str:
+    if not isinstance(value, str):
+        return ""
+    return value.strip().upper()
+
+
+def _session_token(snap: Dict):
+    """Identity of the MQTT session this report belongs to.
+
+    ``session_seq`` wins when it is present, including 0 (no CONNACK yet).
+    A report with neither token cannot be reconciled once: there is nothing
+    to remember the decision against.
+    """
+    seq = snap.get("session_seq")
+    if isinstance(seq, int) and not isinstance(seq, bool):
+        return ("seq", seq)
+    started = snap.get("session_started_at")
+    if isinstance(started, str) and started.strip():
+        return ("at", started.strip())
+    return None
+
+
+def _stop_serials(desired) -> set:
+    return {
+        row.get("bambu_id")
+        for row in (desired or [])
+        if isinstance(row, dict)
+        and isinstance(row.get("control"), dict)
+        and row["control"].get("action") == "stop"
+        and row.get("bambu_id")
+    }
+
+
+class RestartReconciler:
+    """Close a persisted assignment the printer's first steady report contradicts.
+
+    Runs once per session, and only on a live report whose session has carried
+    ``gcode_state``. A CONNACK, a stale or offline report, and a live delta
+    that never included ``gcode_state`` make no decision and do not consume
+    that once. A close also waits until the same state and the same matched
+    submission id have been live at least ``RESTART_RECONCILE_STEADY_SECONDS``
+    apart, and until the assignment is older than the startup grace: a
+    just-sent file still reads IDLE while it downloads.
+
+    An assignment Link submitted follows its submission id. A legacy assignment
+    (no id) is closed here only when it was already confirmed and the steady
+    state is IDLE or FAILED. Every other legacy case stays on the status path.
+    """
+
+    def __init__(self, router: Router, fleet, dpf, now_fn=time.time, monotonic=None):
+        self._router = router
+        self._fleet = fleet
+        self._dpf = dpf
+        self._now = now_fn
+        self._monotonic = monotonic or time.monotonic
+        # bambu_id -> session token already decided.
+        self._reconciled: Dict = {}
+        # bambu_id -> (steady key, monotonic time of the first live sample).
+        self._steady: Dict = {}
+
+    def reconcile(self, snapshots: List[Dict], desired: Optional[List[Dict]] = None) -> None:
+        stops = _stop_serials(desired)
+        snaps = {
+            snap.get("bambu_id"): snap
+            for snap in snapshots
+            if isinstance(snap, dict) and snap.get("bambu_id")
+        }
+        for bambu_id, assignment in self._router.assignments_snapshot().items():
+            if not isinstance(assignment, dict):
+                continue
+            try:
+                self._consider(bambu_id, assignment, snaps.get(bambu_id), bambu_id in stops)
+            except Exception:
+                logger.exception(
+                    "restart reconcile for printer %s failed; will retry", bambu_id,
+                )
+
+    def _consider(self, bambu_id: str, assignment: Dict, snap, stop_in_flight: bool) -> None:
+        if stop_in_flight or not isinstance(snap, dict):
+            return
+        if snap.get("connection") != "live":
+            return
+        state = _gcode_state_token(snap.get("gcode_state"))
+        if not state or snap.get("session_gcode_seen") is not True:
+            return
+        session = _session_token(snap)
+        if session is None or self._reconciled.get(bambu_id) == session:
+            return
+        if assignment.get("terminal") is not None:
+            self._reconciled[bambu_id] = session
+            self._steady.pop(bambu_id, None)
+            return
+
+        matched = _normalize_submission_id(snap.get("print_submission_id"))
+        action = self._action(assignment, state, matched)
+        if action is None:
+            return
+        if action == "keep":
+            self._router.mark_assignment_recovered(bambu_id)
+            logger.info(
+                "printer %s: submission %s still on the machine after reconnect; assignment kept",
+                bambu_id, _normalize_submission_id(assignment.get("submission_id")),
+            )
+            self._finish_decision(bambu_id, session)
+            return
+        if action == "leave":
+            self._finish_decision(bambu_id, session)
+            return
+        if not self._is_steady(bambu_id, session, state, matched):
+            return
+        if self._assignment_age(assignment) < ASSIGNMENT_STARTUP_GRACE_SECONDS:
+            return
+        if action == "finish":
+            if not self._emit_finish(bambu_id, assignment):
+                return
+        else:
+            self._router.set_assignment_terminal(bambu_id, "ended_unobserved")
+        self._finish_decision(bambu_id, session)
+
+    def _finish_decision(self, bambu_id: str, session) -> None:
+        self._reconciled[bambu_id] = session
+        self._steady.pop(bambu_id, None)
+
+    def _emit_finish(self, bambu_id: str, assignment: Dict) -> bool:
+        """Queue the unobserved finish. False leaves the session unreconciled.
+
+        A fleet that cannot take the event must not consume the once-per-session
+        decision: the next live report still has to be able to queue it.
+        """
+        submission_id = _normalize_submission_id(assignment.get("submission_id"))
+        emit = getattr(self._fleet, "emit_recovered_event", None)
+        if not callable(emit) or not submission_id:
+            return False
+        logger.info(
+            "printer %s: submission %s already finished after reconnect; "
+            "queueing unobserved finish",
+            bambu_id, submission_id,
+        )
+        emit(bambu_id, "print_finished", submission_id)
+        return True
+
+    def _action(self, assignment: Dict, state: str, matched: Optional[str]) -> Optional[str]:
+        """``keep``, ``finish``, ``unobserved``, ``leave``, or None (not yet known).
+
+        Only a confirmed assignment — seen running, or recovered — can end
+        unobserved. An unconfirmed one is a start the send path is still
+        confirming; a reset during that watchdog is a new session too, and
+        closing it here would race the retry.
+        """
+        sid = _normalize_submission_id(assignment.get("submission_id"))
+        confirmed = (
+            assignment.get("observed_active") is True
+            or assignment.get("observed_running") is True
+            or assignment.get("recovered") is True
+        )
+        if sid:
+            if state in _RESTART_ACTIVE_STATES and matched == sid:
+                return "keep"
+            if state == "FINISH" and matched == sid:
+                return "finish"
+            if state in {"IDLE", "FAILED"} or (
+                state in _RESTART_KNOWN_STATES and matched != sid
+            ):
+                return "unobserved" if confirmed else "leave"
+            return None
+        if confirmed and state in {"IDLE", "FAILED"}:
+            return "unobserved"
+        if state in _RESTART_KNOWN_STATES:
+            return "leave"
+        return None
+
+    def _is_steady(self, bambu_id: str, session, state: str, matched: Optional[str]) -> bool:
+        now = float(self._monotonic())
+        key = (session, state, matched)
+        previous = self._steady.get(bambu_id)
+        if previous is None or previous[0] != key:
+            self._steady[bambu_id] = (key, now)
+            return False
+        return now - previous[1] >= RESTART_RECONCILE_STEADY_SECONDS
+
+    def _assignment_age(self, assignment: Dict) -> float:
+        try:
+            started = float(assignment.get("started_at"))
+        except (TypeError, ValueError):
+            return 0.0
+        if not math.isfinite(started):
+            return 0.0
+        return max(0.0, self._now() - started)
+
+
 class Dispatcher:
     """Drains the Router's queue onto idle, color-satisfying printers (U9).
 
@@ -329,11 +643,14 @@ class Dispatcher:
     next reports IDLE.
     """
 
-    def __init__(self, router: Router, fleet, dpf, now_fn=time.time):
+    def __init__(self, router: Router, fleet, dpf, now_fn=time.time, monotonic=None):
         self._router = router
         self._fleet = fleet
         self._dpf = dpf
         self._now = now_fn
+        self._reconciler = RestartReconciler(
+            router, fleet, dpf, now_fn=now_fn, monotonic=monotonic,
+        )
         # Job ids we've already logged as "waiting for a color", so a job that waits hours
         # for a filament swap logs once, not an identical line every ~15s pass.
         self._waiting_logged: set = set()
@@ -351,6 +668,10 @@ class Dispatcher:
                     self._send_report(job.id, job.batch_id, job.dispatched_to)
                 except Exception:
                     logger.exception("re-report of dispatched job %s failed; will retry", job.id)
+
+        # A persisted assignment the first steady report of this session contradicts
+        # is latched here, before the completion pass reports that latch.
+        self._reconciler.reconcile(snapshots, desired or [])
 
         # Then detect finished/failed prints and report them (U11) — also independent of
         # idle printers, and durable: a latched completion is retried until 3DPF acks.
@@ -436,14 +757,7 @@ class Dispatcher:
         assignment so a later wire FINISH cannot report_complete a send that
         return-to-queue already released.
         """
-        stop_serials = {
-            row.get("bambu_id")
-            for row in (desired or [])
-            if isinstance(row, dict)
-            and isinstance(row.get("control"), dict)
-            and row["control"].get("action") == "stop"
-            and row.get("bambu_id")
-        }
+        stop_serials = _stop_serials(desired)
         snap_by_id = {
             s.get("bambu_id"): s
             for s in snapshots
@@ -461,6 +775,14 @@ class Dispatcher:
     def _detect_and_report_completion(self, bambu_id: str, assignment: Dict,
                                       snap: Optional[Dict],
                                       stop_in_flight: bool = False) -> None:
+        # A submission id means Link started this print and can see its edges.
+        # Status alone would close the batch on someone else's FINISH. Assignments
+        # with no id are today's sends: they still complete from status.
+        if _normalize_submission_id(assignment.get("submission_id")):
+            self._detect_submission_completion(
+                bambu_id, assignment, snap, stop_in_flight=stop_in_flight,
+            )
+            return
         terminal = assignment.get("terminal")
         if terminal is None:
             status = snap.get("status") if isinstance(snap, dict) else None
@@ -514,18 +836,93 @@ class Dispatcher:
                 return  # pre-start terminal, idle, or unreadable — not terminal yet
             self._router.set_assignment_terminal(bambu_id, terminal)
 
+        self._ack_terminal(bambu_id, assignment, terminal)
+
+    def _detect_submission_completion(self, bambu_id: str, assignment: Dict,
+                                      snap: Optional[Dict],
+                                      stop_in_flight: bool = False) -> None:
+        """Complete, fail, or clear from this pass's lifecycle events only.
+
+        A ``print_finished`` / ``print_failed`` / ``print_cancelled`` counts
+        only when its ``submission_id`` is this assignment's and its origin
+        is ``link``. An external finish, or a finish for another submission,
+        leaves the assignment alone even if the printer's status is terminal.
+        A standing terminal status with no matching event is not a completion:
+        the first report after a restart often is.
+        """
+        terminal = assignment.get("terminal")
+        submission_id = _normalize_submission_id(assignment.get("submission_id"))
+        if terminal is None:
+            if stop_in_flight:
+                self._router.clear_assignment(bambu_id)
+                logger.info(
+                    "printer %s: explicit cloud stop; not reporting failed or complete",
+                    bambu_id,
+                )
+                return
+            terminal = self._terminal_from_events(bambu_id, submission_id, snap)
+            if terminal is None:
+                return
+            self._router.set_assignment_terminal(bambu_id, terminal)
+
+        self._ack_terminal(bambu_id, assignment, terminal)
+
+    def _ack_terminal(self, bambu_id: str, assignment: Dict, terminal: str) -> None:
+        """POST a latched outcome and drop the assignment once 3DPF acks it.
+
+        ``ended_unobserved`` is a failure reason, not a second endpoint. It is
+        retried on later passes until the ack, the same way ``failed`` is.
+        """
         batch_id = assignment.get("batch_id")
         if not batch_id:
-            self._router.clear_assignment(bambu_id)  # nothing to report against
+            self._router.clear_assignment(bambu_id)
             return
         plate = assignment.get("plate_number")
         if terminal == "complete":
             acked = self._dpf.report_complete(batch_id, plate)
+        elif terminal == "ended_unobserved":
+            acked = self._dpf.report_failed(
+                batch_id, plate, reason="ended_unobserved",
+            )
         else:
             acked = self._dpf.report_failed(batch_id, plate)
         if isinstance(acked, dict) and acked.get("batch_id"):
-            self._router.clear_assignment(bambu_id)  # 3DPF has it — the report is no longer owed
+            self._router.clear_assignment(bambu_id)
             logger.info("reported %s of batch %s on printer %s", terminal, batch_id, bambu_id)
+
+    def _terminal_from_events(self, bambu_id: str, submission_id: str,
+                              snap: Optional[Dict]) -> Optional[str]:
+        """``complete``, ``failed``, or None. A matching cancel clears and returns None.
+
+        Events are in queue order. A cancel later in the same pass drops the
+        assignment instead of reporting a finish that the cancel superseded.
+        """
+        events = snap.get("events") if isinstance(snap, dict) else None
+        if not isinstance(events, list):
+            return None
+        terminal = None
+        for event in events:
+            if not isinstance(event, dict):
+                continue
+            if event.get("origin") != "link":
+                continue
+            if _normalize_submission_id(event.get("submission_id")) != submission_id:
+                continue
+            kind = event.get("type")
+            if kind == "print_started":
+                self._router.mark_assignment_running(bambu_id)
+            elif kind == "print_cancelled":
+                self._router.clear_assignment(bambu_id)
+                logger.info(
+                    "printer %s: submission %s cancelled; not reporting failed or complete",
+                    bambu_id, submission_id,
+                )
+                return None
+            elif kind == "print_finished":
+                terminal = "complete"
+            elif kind == "print_failed":
+                terminal = "failed"
+        return terminal
 
     def _send_report(self, job_id: str, batch_id: Optional[str], bambu_id: Optional[str]) -> None:
         """POST the `dispatched` report; on a 3DPF ack, drop the job from the queue. A
