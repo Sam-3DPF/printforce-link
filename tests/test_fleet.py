@@ -1302,3 +1302,76 @@ def test_a_kept_pin_is_proposed_again_once_the_printer_goes_offline():
 
     assert _wait_for(lambda: remembered == [("S1", "192.168.8.246")])
     assert fleet.by_id("S1").current_ip == "192.168.8.246"
+
+
+def test_stop_during_upload_cancels_that_transfer_only(tmp_path):
+    from bridge.bambu.ftps import UploadCancelled
+
+    entered = threading.Event()
+    release = threading.Event()
+    seen = []
+
+    class _UploadPrinter(FakePrinter):
+        def __init__(self, cfg, stale_after_seconds=None):
+            super().__init__(cfg, stale_after_seconds=stale_after_seconds)
+            self.stop_calls = 0
+
+        def upload_file(self, file_path, remote_name=None, cancel=None):
+            seen.append(bool(cancel and cancel.is_set()))
+            entered.set()
+            if not release.is_set():
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    if cancel is not None and cancel.is_set():
+                        raise UploadCancelled("stopped")
+                    if release.is_set():
+                        break
+                    time.sleep(0.01)
+            if cancel is not None and cancel.is_set():
+                raise UploadCancelled("stopped")
+            return "file.3mf"
+
+        def stop_print(self):
+            self.stop_calls += 1
+            return True
+
+        def set_defer(self, defer):
+            return None
+
+    path = str(tmp_path / "job.3mf")
+    fleet = Fleet(
+        [PrinterConfig(bambu_id="S1", ip="10.0.0.5", access_code="x")],
+        printer_factory=_UploadPrinter,
+    )
+    worker = fleet._workers["S1"]
+    stopped = {"called": False}
+    original_stop = worker.stop
+
+    def _spy_stop():
+        stopped["called"] = True
+        original_stop()
+
+    worker.stop = _spy_stop
+    box = {}
+
+    def _run():
+        try:
+            box["result"] = fleet.upload("S1", path)
+        except UploadCancelled as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=_run)
+    thread.start()
+    assert entered.wait(1)
+    assert fleet.apply_control("S1", "stop") is True
+    thread.join(2)
+    assert "error" in box
+    assert seen == [False]
+    assert fleet.by_id("S1").stop_calls == 1
+    assert stopped["called"] is False
+    entered.clear()
+    release.set()
+    assert fleet.upload("S1", path) == "file.3mf"
+    assert seen[1] is False
+    assert fleet.apply_control("S1", "stop") is True
+    assert worker.cancel_event.is_set() is False

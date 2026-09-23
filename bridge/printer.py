@@ -7,6 +7,7 @@ published to `device/{serial}/request`. The session opens no camera socket.
 without a printer.
 """
 
+import copy
 import logging
 import os
 import threading
@@ -22,10 +23,34 @@ from .ams import (
     save_remembered_ams,
 )
 from .bambu.commands import (
+    build_airduct,
+    build_ams_control,
+    build_calibration,
+    build_change_filament,
+    build_drying,
+    build_extrusion_cali_sel,
+    build_filament_reset,
+    build_filament_setting,
+    build_gcode_line,
+    build_print_speed,
     build_project_file,
+    build_select_extruder,
+    build_skip_objects,
+    fan_part_allowed,
+    fan_speed_allowed,
+    filament_load_target,
     fresh_submission_id,
     gcode_state_of,
     project_file_refused,
+    skip_objects_allowed,
+)
+from .bambu.hms_actions import (
+    build_chamber_light,
+    build_clean_print_error,
+    build_idle_ignore,
+    build_ignore,
+    is_calibration_table_reply,
+    ui_only_action,
 )
 from .bambu.log import PrinterLog
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
@@ -104,10 +129,12 @@ _ABSORB_SAMPLES = 6
 _ABSORB_SAMPLE_SECONDS = 0.4
 
 _MQTT_COMMANDS = {
-    "pause_print": {"print": {"command": "pause"}},
-    "resume_print": {"print": {"command": "resume"}},
-    "stop_print": {"print": {"command": "stop"}},
-    "retry_filament_action": {"print": {"command": "ams_control", "param": "resume"}},
+    "pause_print": {"print": {"sequence_id": "0", "command": "pause"}},
+    "resume_print": {"print": {"sequence_id": "0", "command": "resume"}},
+    "stop_print": {"print": {"sequence_id": "0", "command": "stop"}},
+    "retry_filament_action": {
+        "print": {"sequence_id": "0", "command": "ams_control", "param": "resume"},
+    },
 }
 
 
@@ -329,7 +356,9 @@ def parse_telemetry(status: dict) -> Dict:
         # 0 and a low word below 0x4000 are status, not a fault. Cancel codes
         # stay so an older ingest can still tell 50348044 from a real fail.
         "print_error": _print_error_str(print_obj.get("print_error")),
+        "stage_name": _stage_name(print_obj.get("stg_cur")),
     }
+    telemetry.update(_report_fields(status, print_obj))
     raw_hms = print_obj.get("hms")
     telemetry.update(decode_hms(raw_hms))
     telemetry.update(describe_hms(
@@ -529,6 +558,8 @@ class BambuPrinter:
         # Last submission id this printer published, so two starts in the
         # same millisecond still differ.
         self._last_submission_id = None
+        # gcode_line sequence. Separate from the project_file sequence "20000".
+        self._line_sequence = 0
 
     @property
     def last_submission_id(self):
@@ -853,6 +884,330 @@ class BambuPrinter:
         """Publish stop. True is not an ack — confirm via the next gcode_state."""
         return self._mqtt_command("stop_print")
 
+    def handle_control(self, action: str, params=None) -> bool:
+        """Publish one direct command. A purposeful refusal returns True.
+
+        True means the control id is consumed. False means this pass did not
+        publish and the report loop may try the same id again.
+        """
+        params = params if isinstance(params, dict) else {}
+        if ui_only_action(action):
+            return True
+        method = {
+            "gcode_line": self.send_gcode,
+            "bed_temperature": self.set_bed_temperature,
+            "nozzle_temperature": self.set_nozzle_temperature,
+            "chamber_temperature": self.set_chamber_temperature,
+            "print_speed": self.set_print_speed,
+            "fan_speed": self.set_fan_speed,
+            "airduct": self.set_airduct,
+            "home": self.home_axes,
+            "move": self.move_axis,
+            "motors_off": self.disable_motors,
+            "motors_on": self.enable_motors,
+            "skip_objects": self.skip_objects,
+            "select_extruder": self.select_extruder,
+            "timelapse": self.set_timelapse,
+            "calibration": self.start_calibration,
+            "chamber_light": self.set_chamber_light,
+            "drying": self.send_drying,
+            "filament_load": self.load_filament,
+            "filament_unload": self.unload_filament,
+            "ams_control": self.ams_control,
+            "filament_setting": self.set_filament,
+            "filament_setting_reset": self.reset_filament,
+            "extrusion_cali_sel": self.select_extrusion_cali,
+            "ignore": self.ignore_hms,
+            "idle_ignore": self.idle_ignore_hms,
+            "clean_print_error": self.clean_print_error,
+        }.get(action)
+        if method is None:
+            return False
+        return bool(method(params))
+
+    def send_gcode(self, params) -> bool:
+        text = params.get("param", params.get("text", params.get("line", "")))
+        return self._publish_line(text)
+
+    def set_bed_temperature(self, params) -> bool:
+        target = _control_int(params, "target", "temperature", "s")
+        if target is None:
+            return True
+        return self._publish_line(f"M140 S{target}")
+
+    def set_nozzle_temperature(self, params) -> bool:
+        target = _control_int(params, "target", "temperature", "s")
+        nozzle = _control_int(params, "nozzle", "extruder", "t")
+        if target is None:
+            return True
+        if nozzle is None:
+            nozzle = 0
+        return self._publish_line(f"M104 T{nozzle} S{target}")
+
+    def set_chamber_temperature(self, params) -> bool:
+        target = _control_int(params, "target", "temperature", "s")
+        if target is None:
+            return True
+        return self._publish_line(f"M141 S{target}")
+
+    def set_print_speed(self, params) -> bool:
+        level = params.get("param", params.get("level", params.get("speed")))
+        text = str(level).strip() if level is not None else ""
+        if text not in {"1", "2", "3", "4"}:
+            return True
+        self._require_session()
+        return self._publish_command(build_print_speed(text))
+
+    def set_fan_speed(self, params) -> bool:
+        part = _control_int(params, "fan", "p", "part")
+        speed = _control_int(params, "speed", "s")
+        if not fan_part_allowed(part) or not fan_speed_allowed(speed):
+            return True
+        return self._publish_line(f"M106 P{part} S{speed}")
+
+    def set_airduct(self, params) -> bool:
+        mode = _control_int(params, "modeId", "mode")
+        if mode not in (0, 1):
+            return True
+        self._require_session()
+        return self._publish_command(build_airduct(mode))
+
+    def home_axes(self, params) -> bool:
+        """``G28`` only. An axis argument is ignored."""
+        return self._publish_line("G28")
+
+    def move_axis(self, params) -> bool:
+        axis = params.get("axis", "X")
+        distance = params.get("distance", params.get("dist", 0))
+        speed = params.get("speed", params.get("feed", params.get("f", 1000)))
+        letter = str(axis).strip().upper()[:1] or "X"
+        lines = ("G91", f"G0 {letter}{distance} F{speed}", "G90")
+        return self._publish_lines(lines)
+
+    def disable_motors(self, params) -> bool:
+        return self._publish_line("M18")
+
+    def enable_motors(self, params) -> bool:
+        return self._publish_line("M17")
+
+    def skip_objects(self, params) -> bool:
+        state = gcode_state_of(self.state.view().get("payload"))
+        if not skip_objects_allowed(state):
+            return True
+        raw = params.get("obj_list", params.get("objects"))
+        if not isinstance(raw, list) or not raw:
+            return True
+        objects = []
+        for item in raw:
+            if isinstance(item, bool) or not isinstance(item, int):
+                return True
+            objects.append(item)
+        self._require_session()
+        return self._publish_command(build_skip_objects(objects))
+
+    def select_extruder(self, params) -> bool:
+        index = _control_int(params, "extruder_index", "index")
+        if index not in (0, 1):
+            return True
+        self._require_session()
+        return self._publish_command(build_select_extruder(index))
+
+    def set_timelapse(self, params) -> bool:
+        enabled = params.get("on", params.get("enabled", False))
+        flag = 1 if enabled else 0
+        if not self._publish_line(f"M981 S{flag} P20000"):
+            return False
+        return self._publish_command({
+            "pushing": {"sequence_id": "0", "command": "pushall"},
+        })
+
+    def start_calibration(self, params) -> bool:
+        option = _control_int(params, "option")
+        if option is None:
+            return True
+        self._require_session()
+        return self._publish_command(build_calibration(option))
+
+    def set_chamber_light(self, params) -> bool:
+        mode = params.get("led_mode", params.get("on", params.get("mode")))
+        on = mode == "on" if isinstance(mode, str) else bool(mode)
+        self._require_session()
+        published = True
+        for payload in build_chamber_light(on):
+            if not self._publish_command(payload):
+                published = False
+        return published
+
+    def send_drying(self, params) -> bool:
+        """Publish drying, except on a P1 profile, which consumes the control id.
+
+        C11, C12, and every code that still uses the P1 profile publish nothing.
+        """
+        code = ""
+        model = getattr(self._cfg, "model", None)
+        if isinstance(model, str):
+            code = model.strip().upper()
+        if self.profile.family == "p1" or code in {"C11", "C12"}:
+            logger.info(
+                "printer %s: drying is not published on this model", self.bambu_id,
+            )
+            return True
+        mode = _control_int(params, "mode")
+        temp = _control_int(params, "temp", "temperature")
+        duration = _control_int(params, "duration")
+        if mode not in (0, 1) or temp is None or duration is None:
+            return True
+        self._require_session()
+        payload = build_drying(
+            mode=mode,
+            temp=temp,
+            duration=duration,
+            filament=params.get("filament", ""),
+            loaded_type=self._loaded_tray_type(),
+            ams_id=_control_int(params, "ams_id") or 0,
+            rotate_tray=bool(params.get("rotate_tray", False)),
+            sequence_id=self._next_line_sequence(),
+        )
+        return self._publish_command(payload)
+
+    def load_filament(self, params) -> bool:
+        tray = _control_int(params, "tray", "tray_id", "target")
+        if tray is None:
+            return True
+        ams_id, slot_id, target = filament_load_target(tray)
+        self._require_session()
+        return self._publish_command(build_change_filament(
+            ams_id=ams_id, slot_id=slot_id, target=target,
+        ))
+
+    def unload_filament(self, params) -> bool:
+        """Unload. A named slot on a single-nozzle profile is not a holder lookup.
+
+        Every current profile is single-nozzle, so the wire is always
+        ``slot_id`` 255 and ``target`` 255.
+        """
+        self._require_session()
+        return self._publish_command(build_change_filament(
+            ams_id=255, slot_id=255, target=255,
+        ))
+
+    def ams_control(self, params) -> bool:
+        param = params.get("param")
+        if param not in {"resume", "reset", "pause"}:
+            return True
+        self._require_session()
+        return self._publish_command(build_ams_control(param))
+
+    def set_filament(self, params) -> bool:
+        external = bool(params.get("external"))
+        tray = _control_int(params, "tray_id", "tray")
+        if external or tray == 254:
+            ams_id, tray_id = 255, 254
+        else:
+            ams_id = _control_int(params, "ams_id")
+            tray_id = tray
+            if ams_id is None or tray_id is None:
+                return True
+        self._require_session()
+        return self._publish_command(build_filament_setting(
+            ams_id=ams_id,
+            tray_id=tray_id,
+            tray_info_idx=params.get("tray_info_idx", ""),
+            tray_color=params.get("tray_color", params.get("color", "")),
+            tray_type=params.get("tray_type", params.get("type", "")),
+            nozzle_temp_min=params.get("nozzle_temp_min", ""),
+            nozzle_temp_max=params.get("nozzle_temp_max", ""),
+        ))
+
+    def reset_filament(self, params) -> bool:
+        ams_id = _control_int(params, "ams_id")
+        tray_id = _control_int(params, "tray_id", "tray")
+        if params.get("external") or tray_id == 254:
+            ams_id, tray_id = 255, 254
+        if ams_id is None or tray_id is None:
+            return True
+        self._require_session()
+        return self._publish_command(build_filament_reset(ams_id=ams_id, tray_id=tray_id))
+
+    def select_extrusion_cali(self, params) -> bool:
+        tray = _control_int(params, "tray_id", "tray")
+        if tray is None:
+            return True
+        extra = {
+            key: value for key, value in params.items()
+            if key not in {"tray_id", "tray", "setting_id"}
+        }
+        self._require_session()
+        return self._publish_command(build_extrusion_cali_sel(tray_id=tray, **extra))
+
+    def ignore_hms(self, params) -> bool:
+        """``job_id`` is the merged firmware ``subtask_id``, not Link's submission id."""
+        self._require_session()
+        return self._publish_command(build_ignore(
+            err=params.get("err"),
+            job_id=self._merged_subtask_id(),
+        ))
+
+    def idle_ignore_hms(self, params) -> bool:
+        dismiss = _control_int(params, "type")
+        self._require_session()
+        return self._publish_command(build_idle_ignore(
+            err=params.get("err"),
+            dismiss_type=0 if dismiss is None else dismiss,
+        ))
+
+    def clean_print_error(self, params) -> bool:
+        self._require_session()
+        return self._publish_command(build_clean_print_error())
+
+    def _publish_line(self, text) -> bool:
+        self._require_session()
+        return self._publish_command(build_gcode_line(text, self._next_line_sequence()))
+
+    def _publish_lines(self, lines) -> bool:
+        published = True
+        for text in lines:
+            if not self._publish_line(text):
+                published = False
+        return published
+
+    def _next_line_sequence(self) -> str:
+        self._line_sequence += 1
+        return str(self._line_sequence)
+
+    def _require_session(self) -> None:
+        if self._session is None:
+            raise RuntimeError("printer not connected")
+
+    def _merged_subtask_id(self):
+        payload = self.state.view().get("payload")
+        if not isinstance(payload, dict):
+            return "0"
+        print_obj = payload.get("print")
+        if not isinstance(print_obj, dict):
+            return "0"
+        subtask = print_obj.get("subtask_id")
+        if subtask is None or subtask == "":
+            return "0"
+        return subtask
+
+    def _loaded_tray_type(self):
+        payload = self.state.view().get("payload") or {}
+        print_obj = payload.get("print") if isinstance(payload, dict) else None
+        ams = print_obj.get("ams") if isinstance(print_obj, dict) else None
+        if not isinstance(ams, dict):
+            return None
+        for unit in ams.get("ams") or []:
+            if not isinstance(unit, dict):
+                continue
+            for tray in unit.get("tray") or []:
+                if not isinstance(tray, dict):
+                    continue
+                kind = tray.get("tray_type")
+                if isinstance(kind, str) and kind.strip():
+                    return kind.strip()
+        return None
+
     def request_full_status(self, *, read_idle_rfid: bool = True) -> bool:
         """Ask the printer for a full MQTT dump so AMS trays land in the next snapshot.
 
@@ -909,11 +1264,33 @@ class BambuPrinter:
         self.state.emit_recovered(kind, submission_id)
 
     def _on_mqtt_report(self, doc) -> None:
-        """Ingest one report. Runs on the paho network thread."""
+        """Ingest one report. Runs on the paho network thread.
+
+        A calibration-table reply is not ingested: it echoes a nozzle diameter
+        and would replace the fitted one. This callback does not rebuild the
+        session. ``hard_reset`` joins the network thread.
+        """
         self._note_session_boundary()
+        if is_calibration_table_reply(doc):
+            self._note_commands_rejected_on_session()
+            return
         self.state.ingest(doc, self._monotonic())
         self._observe_stopwatch()
         self._note_command_acceptance()
+        self._note_commands_rejected_on_session()
+
+    def _note_commands_rejected_on_session(self) -> None:
+        """Tell the session about the merged fault, not only this datagram."""
+        session = self._session
+        note = getattr(session, "note_commands_rejected", None)
+        if not callable(note):
+            return
+        try:
+            note(self.commands_rejected is True)
+        except Exception:
+            logger.debug(
+                "printer %s: command-rejection flag was not recorded", self.bambu_id,
+            )
 
     def _note_command_acceptance(self) -> None:
         """Log when the printer starts or stops refusing commands.
@@ -1127,6 +1504,20 @@ class BambuPrinter:
         whose low 16 bits are below 0x4000, are dropped. Cancel echoes stay in
         those fields (`0300_400C`, `0500_400E`, print_error `50348044`) until
         3DPF reads `hms_faults`, `user_cancelled`, or the lifecycle events.
+
+        Additive report fields from the same merged payload: ``spd_lvl``,
+        fan percents (``cooling_fan_percent``, ``big_fan1_percent``,
+        ``big_fan2_percent``, ``heatbreak_fan_percent``), ``door_open``
+        (``stat`` bit 23), ``sdcard``, ``chamber_light``, ``wifi_signal``
+        (``-90`` is the wired mark, ``wifi_wired``), ``store_to_sdcard``
+        (``home_flag`` bit 11), ``lights_report``, ``airduct``, ``tray_now``,
+        ``tray_tar``, ``tray_pre``, ``ams_status``, ``dry_time``,
+        ``dry_status``, ``dry_sf_reason``, ``drying_unit``, ``stage_name``,
+        ``firmware_version``, ``unit_versions``, and ``external_spool``.
+        ``external_spool`` is the ``vt_tray`` / ``vir_slot`` object and is
+        never a ``slots`` row. ``job_id`` and the firmware ``subtask_id``
+        stay off this report. Offline reports null the new scalars and the
+        list-or-none fields.
 
         `hms_faults`, `fault_print_error`, and `commands_rejected` are additive.
         `hms_faults` is real faults only (severity 0 and cancel echoes removed),
@@ -1484,6 +1875,10 @@ class BambuPrinter:
             "hms_faults": None,
             "fault_print_error": None,
             "commands_rejected": None,
+            "lights_report": None,
+            "airduct": None,
+            "external_spool": None,
+            "unit_versions": None,
         }
         report.update(self._lifecycle_fields(view, connection="offline"))
         report.update(self._contract_fields(view, "offline"))
@@ -1533,6 +1928,203 @@ def _print_error_str(value) -> Optional[str]:
     ``50348044`` / ``0300400C`` here until it reads ``hms_faults``.
     """
     return reported_print_error(value)
+
+
+_STAGE_NAMES = {
+    0: "printing",
+    6: "filament runout",
+    16: "user pause",
+    35: "nozzle clog",
+}
+
+
+def _stage_name(value):
+    stage = _valid_stage(value)
+    if stage is None:
+        return None
+    return _STAGE_NAMES.get(stage)
+
+
+def _report_fields(status, print_obj) -> Dict:
+    """Additive scalars and list-or-none fields. Absent means null."""
+    if not isinstance(status, dict):
+        print_obj = {}
+        status = {}
+    if not isinstance(print_obj, dict):
+        print_obj = {}
+    ams = print_obj.get("ams") if isinstance(print_obj.get("ams"), dict) else {}
+    lights = _first_present(print_obj, status, "lights_report")
+    lights_copy = copy.deepcopy(lights) if isinstance(lights, list) else None
+    device = print_obj.get("device")
+    if not isinstance(device, dict):
+        device = status.get("device") if isinstance(status.get("device"), dict) else None
+    airduct = None
+    if isinstance(device, dict) and "airduct" in device:
+        airduct = copy.deepcopy(device.get("airduct"))
+    wifi = _first_present(print_obj, status, "wifi_signal")
+    wifi_signal = _numeric(wifi)
+    dry_time, dry_status, dry_sf_reason, drying_unit = _drying_fields(print_obj, ams)
+    info = status.get("info") if isinstance(status.get("info"), dict) else {}
+    firmware_version, unit_versions = _module_versions(info.get("module"))
+    return {
+        "spd_lvl": _optional_int(print_obj.get("spd_lvl")),
+        "cooling_fan_percent": _fan_percent(print_obj.get("cooling_fan_speed")),
+        "big_fan1_percent": _fan_percent(print_obj.get("big_fan1_speed")),
+        "big_fan2_percent": _fan_percent(print_obj.get("big_fan2_speed")),
+        "heatbreak_fan_percent": _fan_percent(print_obj.get("heatbreak_fan_speed")),
+        "door_open": _door_open(print_obj, status),
+        "sdcard": _first_present(print_obj, status, "sdcard"),
+        "chamber_light": _chamber_light(lights_copy),
+        "wifi_signal": wifi_signal,
+        "wifi_wired": None if wifi_signal is None else wifi_signal == -90,
+        "store_to_sdcard": _home_flag_bit(print_obj.get("home_flag"), 11),
+        "lights_report": lights_copy,
+        "airduct": airduct,
+        "tray_now": _optional_int(ams.get("tray_now")),
+        "tray_tar": _optional_int(ams.get("tray_tar")),
+        "tray_pre": _optional_int(ams.get("tray_pre")),
+        "ams_status": _optional_int(ams.get("ams_status")),
+        "dry_time": dry_time,
+        "dry_status": dry_status,
+        "dry_sf_reason": dry_sf_reason,
+        "drying_unit": drying_unit,
+        "firmware_version": firmware_version,
+        "unit_versions": unit_versions,
+        "external_spool": _external_spool(ams),
+    }
+
+
+def _first_present(primary, secondary, key):
+    if isinstance(primary, dict) and key in primary:
+        return primary.get(key)
+    if isinstance(secondary, dict) and key in secondary:
+        return secondary.get(key)
+    return None
+
+
+def _optional_int(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    return as_int(value, None)
+
+
+def _numeric(value):
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return value
+    if isinstance(value, str):
+        text = value.strip()
+        try:
+            if "." in text:
+                return float(text)
+            return int(text)
+        except ValueError:
+            return None
+    return None
+
+
+def _fan_percent(value):
+    speed = _optional_int(value)
+    if speed is None or speed < 0:
+        return None
+    if speed <= 15:
+        return (speed * 100) // 15
+    return (min(speed, 255) * 100) // 255
+
+
+def _door_open(print_obj, status):
+    """P1 door is ``stat`` bit 23, not ``home_flag``."""
+    stat = _first_present(print_obj, status, "stat")
+    value = _optional_int(stat)
+    if value is None:
+        return None
+    return bool(value & (1 << 23))
+
+
+def _home_flag_bit(value, bit: int):
+    flag = _optional_int(value)
+    if flag is None:
+        return None
+    return bool(flag & (1 << bit))
+
+
+def _chamber_light(lights):
+    if not isinstance(lights, list):
+        return None
+    for item in lights:
+        if not isinstance(item, dict):
+            continue
+        if item.get("node") != "chamber_light":
+            continue
+        return str(item.get("mode") or "").strip().lower() == "on"
+    return None
+
+
+def _drying_fields(print_obj, ams):
+    units = ams.get("ams") if isinstance(ams.get("ams"), list) else []
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        dry = _optional_int(unit.get("dry_time"))
+        if dry is not None and dry > 0:
+            return dry, unit.get("dry_status"), unit.get("dry_sf_reason"), unit.get("id")
+    dry = _optional_int(print_obj.get("dry_time"))
+    if dry is None:
+        dry = _optional_int(ams.get("dry_time"))
+    status = print_obj.get("dry_status", ams.get("dry_status"))
+    reason = print_obj.get("dry_sf_reason", ams.get("dry_sf_reason"))
+    unit_id = None
+    if dry is not None and dry > 0:
+        unit_id = print_obj.get("dry_ams_id", ams.get("ams_id"))
+    return dry, status, reason, unit_id
+
+
+def _module_versions(modules):
+    if not isinstance(modules, list):
+        return None, None
+    firmware = None
+    units = {}
+    for module in modules:
+        if not isinstance(module, dict):
+            continue
+        name = module.get("name")
+        version = module.get("sw_ver")
+        if not isinstance(name, str) or not isinstance(version, str):
+            continue
+        if name == "ota":
+            firmware = version
+        elif name.startswith(("ams/", "n3f/", "n3s/")):
+            units[name] = version
+    return firmware, units or None
+
+
+def _external_spool(ams):
+    """``vir_slot`` wins over ``vt_tray``. Neither becomes a ``slots`` row."""
+    if not isinstance(ams, dict):
+        return None
+    raw = ams.get("vir_slot")
+    if raw is None:
+        raw = ams.get("vt_tray")
+    if raw is None:
+        return None
+    return copy.deepcopy(raw)
+
+
+def _control_int(params, *keys):
+    if not isinstance(params, dict):
+        return None
+    for key in keys:
+        if key not in params:
+            continue
+        value = params.get(key)
+        if isinstance(value, bool) or value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _valid_stage(value) -> Optional[int]:

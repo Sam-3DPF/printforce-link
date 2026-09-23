@@ -6,6 +6,7 @@ interval. Run with: `python -m bridge.app config.toml`.
 """
 
 from collections import OrderedDict
+import faulthandler
 import inspect
 import logging
 import os
@@ -17,6 +18,7 @@ from typing import List, Dict, Optional
 
 from . import __version__
 from .ams import normalize_hex
+from .bambu.commands import live_slot_number_allowed, live_slot_to_tray, tray_index_allowed
 from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
@@ -47,7 +49,8 @@ from .updater import SelfUpdater, default_state_path
 logger = logging.getLogger(__name__)
 AMS_MAPPING_FORMAT = "filament-id-v1"
 MAX_LOGICAL_FILAMENT_ID = 256
-MAX_BAMBU_AMS_TRAY_INDEX = 15
+# Above the report interval. A stuck pass dumps its stacks and the process stays up.
+_REPORT_LOOP_DUMP_SECONDS = 30.0
 _FILAMENT_FAMILIES = ("PETG", "PLA", "ABS", "ASA", "TPU", "PA", "PC", "PVA", "HIPS")
 # A legacy marker was written immediately before a physical start. Do not reinterpret it
 # as stale residue during the same startup uncertainty window used by the assignment
@@ -405,6 +408,7 @@ def main(config_path: str = "config.toml") -> None:
                 cfg.state_interval_seconds, cfg.heartbeat_interval_seconds,
                 cfg.stale_after_seconds)
     while True:
+        arm_report_loop_dump()
         # The updater downloads concurrently, but its final swap/restart must wait until
         # this iteration has finished every irreversible printer action and durable marker.
         update_restart_lock.acquire()
@@ -524,7 +528,24 @@ def main(config_path: str = "config.toml") -> None:
 
 _CONTROL_ACTIONS = frozenset({
     "pause", "resume", "stop", "refresh", "collect_log", "diagnose",
+    "gcode_line", "bed_temperature", "nozzle_temperature", "chamber_temperature",
+    "print_speed", "fan_speed", "airduct", "home", "move",
+    "motors_off", "motors_on", "skip_objects", "select_extruder", "timelapse",
+    "calibration", "chamber_light", "drying", "filament_load", "filament_unload",
+    "ams_control", "filament_setting", "filament_setting_reset", "extrusion_cali_sel",
+    "ignore", "idle_ignore", "clean_print_error",
+    "check_assistant", "jump_to_liveview", "cancle",
 })
+
+
+def arm_report_loop_dump(timeout=_REPORT_LOOP_DUMP_SECONDS) -> None:
+    """Re-arm the report-loop stack dump. The previous arm is cancelled first.
+
+    The timeout stays above the report interval. ``exit`` is false: a stall
+    writes stacks and the process keeps running. Tests call this directly.
+    """
+    faulthandler.cancel_dump_traceback_later()
+    faulthandler.dump_traceback_later(timeout, exit=False)
 
 
 def _printers_busy(reports, fleet) -> bool:
@@ -642,7 +663,12 @@ def _control_from_row(row: dict):
     control_id = control.get("id")
     if action not in _CONTROL_ACTIONS or not control_id:
         return None
-    return {"id": str(control_id), "action": action}
+    control_out = {"id": str(control_id), "action": action}
+    for key, value in control.items():
+        if key in ("id", "action"):
+            continue
+        control_out[key] = value
+    return control_out
 
 
 def _row_has_stop(row: dict) -> bool:
@@ -834,9 +860,12 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
             return
     else:
         result = None
+        params = {
+            key: value for key, value in control.items() if key not in ("id", "action")
+        }
         try:
             if callable(getattr(fleet, "apply_control", None)):
-                result = fleet.apply_control(bambu_id, action)
+                result = fleet.apply_control(bambu_id, action, params)
             elif action == "pause":
                 result = printer.pause_print()
             elif action == "resume":
@@ -1107,11 +1136,13 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     router, str(bambu_id), str(batch_id), plate_index,
                     started_at=float(wall_time()), submission_id=submission_id,
                 )
+            live_snap = _live_snapshot(fleet, str(bambu_id))
             _remember_attempt(
                 started_path, router, bambu_id, wall_time,
                 submission_id=submission_id, uploaded=True,
+                gcode_file=live_snap.get("gcode_file") if isinstance(live_snap, dict) else None,
             )
-            if _snapshot_shows_active(_live_snapshot(fleet, str(bambu_id))):
+            if _snapshot_shows_active(live_snap):
                 _report_confirmed_dispatch(key, dpf, spool_dir, router)
         else:
             logger.warning("printer %s did not start batch %s", bambu_id, batch_id)
@@ -1261,7 +1292,12 @@ def _record_cloud_assignment(router, bambu_id, batch_id, plate_index, *,
 
 
 def _remember_attempt(started_path, router, bambu_id, wall_time, *,
-                      submission_id, uploaded) -> None:
+                      submission_id, uploaded, gcode_file=None) -> None:
+    """Store this send, including the file name on the printer before it starts.
+
+    A later republish writes the attempt without calling this, so the pre-send
+    name is what phase A compares.
+    """
     now = float(wall_time())
     record = load_attempt(started_path, router, str(bambu_id), now)
     record["phase"] = "A"
@@ -1271,6 +1307,7 @@ def _remember_attempt(started_path, router, bambu_id, wall_time, *,
     if submission_id is not None:
         record["submission_id"] = submission_id
     record.setdefault("last_failure", None)
+    record["gcode_file"] = gcode_file
     save_attempt(started_path, router, str(bambu_id), record)
 
 
@@ -1521,12 +1558,7 @@ def _validate_sparse_ams_mapping(value, required):
     required_positions = {filament_id - 1 for filament_id, _color, _family in required}
     mapping = []
     for index, item in enumerate(value):
-        if (
-            isinstance(item, bool)
-            or not isinstance(item, int)
-            or item < -1
-            or item > MAX_BAMBU_AMS_TRAY_INDEX
-        ):
+        if isinstance(item, bool) or not tray_index_allowed(item):
             return None
         if index in required_positions:
             if item < 0:
@@ -1551,15 +1583,9 @@ def _mapping_from_live_slots(required, live):
             continue
         family = _filament_family(slot.get("filament_type"))
         slot_number = slot.get("slot_number")
-        if (
-            family is None
-            or isinstance(slot_number, bool)
-            or not isinstance(slot_number, int)
-            or slot_number < 1
-            or slot_number > MAX_BAMBU_AMS_TRAY_INDEX + 1
-        ):
+        if family is None or not live_slot_number_allowed(slot_number):
             return None
-        candidates.setdefault((color, family), []).append(slot_number - 1)
+        candidates.setdefault((color, family), []).append(live_slot_to_tray(slot_number))
     mapping = [-1] * max(
         (filament_id for filament_id, _color, _family in required),
         default=0,

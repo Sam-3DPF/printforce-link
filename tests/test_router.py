@@ -615,3 +615,12 @@ def test_desired_idle_with_no_queued_match_does_not_dispatch(tmp_path):
         desired=[{"bambu_id": "P1", "desired_status": "IDLE"}],
     )
     assert fleet.calls == []  # cleared, but nothing queued -> no spurious dispatch
+
+
+def test_the_pre_send_file_name_is_stored_on_the_assignment(tmp_path):
+    r = Router(str(tmp_path / "queue.json"))
+    r.record_assignment("P1", "B1", 1, started_at=1.0)
+    r.update_send_attempt("P1", gcode_file="plate.gcode", attempts=1, phase="A")
+    assert r.assignments_snapshot()["P1"]["gcode_file"] == "plate.gcode"
+    restarted = Router(str(tmp_path / "queue.json"))
+    assert restarted.assignments_snapshot()["P1"]["gcode_file"] == "plate.gcode"

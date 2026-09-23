@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # Watchdog fields stored beside an assignment. Other keys stay untouched.
 _SEND_ATTEMPT_FIELDS = frozenset({
     "submission_id", "attempts", "phase", "phase_started_at",
-    "last_failure", "uploaded", "pending_republish",
+    "last_failure", "uploaded", "pending_republish", "gcode_file",
 })
 
 

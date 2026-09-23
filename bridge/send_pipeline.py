@@ -24,7 +24,7 @@ _READY_GCODE = frozenset({"IDLE", "FINISH", "FAILED"})
 _BUSY_STATUS = frozenset({"PRINTING", "PAUSED", "OFFLINE"})
 _ATTEMPT_FIELDS = (
     "submission_id", "attempts", "phase", "phase_started_at",
-    "last_failure", "uploaded", "pending_republish",
+    "last_failure", "uploaded", "pending_republish", "gcode_file",
 )
 
 
@@ -128,19 +128,26 @@ def decide(record, snapshot, now, *, phase_a=PHASE_A_SECONDS,
     if snapshot_echoed(snapshot, record.get("submission_id")):
         return "enter_b"
     if age >= phase_a:
+        if _gcode_file_changed(record, snapshot):
+            return "enter_b"
         return "fail" if attempts >= max_attempts else "reset_retry"
     return "wait"
 
 
 def failure_reason(record, snapshot) -> str:
-    """The named reason stored on a send that is about to be reported failed."""
+    """The named reason stored on a send that is about to be reported failed.
+
+    A drying unit (``dry_time`` greater than 0) is named. The cycle is not stopped.
+    """
     if snapshot_commands_rejected(snapshot):
-        return "commands_rejected"
-    if record.get("last_failure"):
-        return str(record["last_failure"])
-    if (record.get("phase") or "A") == "B":
-        return "no_active"
-    return "no_echo"
+        reason = "commands_rejected"
+    elif record.get("last_failure"):
+        reason = str(record["last_failure"])
+    elif (record.get("phase") or "A") == "B":
+        reason = "no_active"
+    else:
+        reason = "no_echo"
+    return _with_drying_unit(reason, snapshot)
 
 
 def attempt_path(started_path: str) -> str:
@@ -163,6 +170,7 @@ def load_attempt(started_path: str, router, bambu_id: str, now: float) -> dict:
     data.setdefault("last_failure", None)
     data.setdefault("submission_id", None)
     data.setdefault("pending_republish", False)
+    data.setdefault("gcode_file", None)
     return data
 
 
@@ -235,6 +243,42 @@ def release_settled_attempts(spool_dir: str, live) -> None:
             os.unlink(path)
         except OSError:
             pass
+
+
+def _gcode_file_changed(record, snapshot) -> bool:
+    """True when phase A saw a different file name than the one stored at send time.
+
+    A missing stored name is not a change. The pre-send name is what was
+    remembered, so a later republish must not overwrite it before this check.
+    """
+    if not isinstance(record, dict) or not isinstance(snapshot, dict):
+        return False
+    stored = record.get("gcode_file")
+    if stored is None or stored == "":
+        return False
+    current = snapshot.get("gcode_file")
+    if current is None:
+        return False
+    return str(current) != str(stored)
+
+
+def _with_drying_unit(reason: str, snapshot) -> str:
+    if not isinstance(snapshot, dict):
+        return reason
+    dry = snapshot.get("dry_time")
+    if isinstance(dry, bool):
+        return reason
+    try:
+        dry_time = int(dry)
+    except (TypeError, ValueError):
+        return reason
+    if dry_time <= 0:
+        return reason
+    unit = snapshot.get("drying_unit")
+    named = "drying unit" if unit is None else f"drying unit {unit}"
+    if named in reason:
+        return reason
+    return f"{reason}; {named}"
 
 
 def _gcode(snapshot) -> str:

@@ -152,6 +152,11 @@ class LinkSession:
         self._next_probe_at = None
         self._auth_retry_not_before = None
         self._user_stopped = False
+        # Merged HMS 0500050000010007. A new client does not clear it.
+        self._commands_rejected = False
+        self._reports_this_client = 0
+        self._empty_topic_logged_for = None
+        self._developer_mode_logged_for = None
         self._watchdog = None
         self._watchdog_stop = threading.Event()
         self._report_topic = f"device/{serial}/report"
@@ -336,6 +341,13 @@ class LinkSession:
                 self._down_reason = "unreachable"
             return
 
+        self._tick_quiet_client()
+        if self._commands_rejected:
+            # A new client does not clear this fault, and it drops the QoS 1
+            # queue. Stay on this client in every gcode_state.
+            self._log_developer_mode_once()
+            return
+
         self._tick_probe(now)
         if self._state == "commands_ignored":
             # Two misses inside the cooldown still owe a reset once it passes.
@@ -465,6 +477,9 @@ class LinkSession:
                 self._auth_retry_not_before = None
             self._state = "connecting"
             self._down_reason = None
+            self._reports_this_client = 0
+            self._empty_topic_logged_for = None
+            self._developer_mode_logged_for = None
             self._record_event("connack", result="ok", code=code)
             try:
                 client.subscribe(self._report_topic, qos=_QOS)
@@ -486,10 +501,17 @@ class LinkSession:
             # so the retry stays slow instead of giving up or hammering.
             self._auth_retry_not_before = self._monotonic() + _AUTH_RETRY_SECONDS
             self._hold_paho_retry(client)
-        logger.warning(
-            "printer %s: MQTT connection refused (%s, code %s)",
-            self.serial, self._last_connect_error, code,
-        )
+        if rejected:
+            logger.warning(
+                "printer %s: MQTT connection refused (%s, code %s). "
+                "The access code changes when LAN Only or Developer Mode is toggled.",
+                self.serial, self._last_connect_error, code,
+            )
+        else:
+            logger.warning(
+                "printer %s: MQTT connection refused (%s, code %s)",
+                self.serial, self._last_connect_error, code,
+            )
 
     def _on_message(self, client, userdata, msg):
         if client is not self._client:
@@ -503,6 +525,7 @@ class LinkSession:
         if doc is None:
             return
         self._record_message("in", topic or self._report_topic, doc)
+        self._reports_this_client += 1
         now = self._monotonic()
         self._last_message_at = now
         self._note_probe_reply(doc)
@@ -565,6 +588,36 @@ class LinkSession:
     def _reset_allowed(self, now: float) -> bool:
         last = self._last_reset_at
         return last is None or now - last >= _RESET_COOLDOWN_SECONDS
+
+    def note_commands_rejected(self, rejected: bool) -> None:
+        """Remember the merged command-rejection fault. The message callback does not reset.
+
+        The printer sets this from the merged payload, so a delta that omits
+        ``hms`` still counts. A new CONNACK does not clear it.
+        """
+        self._commands_rejected = bool(rejected)
+
+    def _tick_quiet_client(self) -> None:
+        """Log an empty report topic once for this client."""
+        if self._reports_this_client != 0:
+            return
+        if self._empty_topic_logged_for == self._client_id:
+            return
+        self._empty_topic_logged_for = self._client_id
+        logger.warning(
+            "printer %s: report topic is empty after connect",
+            self.serial,
+        )
+
+    def _log_developer_mode_once(self) -> None:
+        if self._developer_mode_logged_for == self._client_id:
+            return
+        self._developer_mode_logged_for = self._client_id
+        logger.warning(
+            "printer %s: Enable Developer Mode and restart the printer. "
+            "The access code then changes.",
+            self.serial,
+        )
 
     def _hold_paho_retry(self, client) -> None:
         """Stop paho's 1–30s backoff without joining the network thread.
@@ -640,7 +693,7 @@ class LinkSession:
 def _parse_report(payload):
     try:
         if isinstance(payload, (bytes, bytearray)):
-            doc = json.loads(payload.decode("utf-8"))
+            doc = json.loads(payload.decode("utf-8", "replace"))
         elif isinstance(payload, str):
             doc = json.loads(payload)
         elif isinstance(payload, dict):
