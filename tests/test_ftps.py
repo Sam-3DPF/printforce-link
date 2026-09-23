@@ -30,6 +30,20 @@ def ftps_cert(tmp_path_factory):
         pytest.skip("openssl is not available")
 
 
+@pytest.fixture(autouse=True)
+def _reset_handshake_cooloff():
+    """A handshake failure cools that host off for 300s. Tests share 127.0.0.1."""
+    from bridge.bambu import ftps
+
+    cooloff = getattr(ftps, "_cooloff_until", None)
+    if cooloff is not None:
+        cooloff.clear()
+    yield
+    cooloff = getattr(ftps, "_cooloff_until", None)
+    if cooloff is not None:
+        cooloff.clear()
+
+
 @pytest.fixture
 def implicit_server(ftps_cert):
     running = []
@@ -105,7 +119,10 @@ def test_implicit_client_stores_the_file(implicit_server, tmp_path, caplog):
             port=server.port, connect_timeout=_CONNECT, profile=P1_PROFILE,
         )
     assert name == "job.3mf"
-    assert server.snapshot()["files"]["job.3mf"] == payload
+    snap = server.snapshot()
+    assert snap["files"]["job.3mf"] == payload
+    verbs = [line.split(" ", 1)[0].upper() for line in snap["commands"]]
+    assert verbs.count("DELE") == 1
     _secret_hidden(caplog)
 
 
@@ -162,6 +179,7 @@ def test_size_mismatch_is_storage(implicit_server, tmp_path):
         )
     assert caught.value.kind == "storage"
     assert SECRET not in str(caught.value)
+    assert "job.3mf" not in server.snapshot()["files"]
 
 
 def test_trailing_426_with_matching_size_succeeds(implicit_server, tmp_path):
@@ -202,6 +220,7 @@ def test_trailing_426_with_mismatched_size_is_storage(implicit_server, tmp_path)
         )
     assert caught.value.kind == "storage"
     assert SECRET not in str(caught.value)
+    assert "job.3mf" not in server.snapshot()["files"]
 
 
 def test_plaintext_on_the_implicit_port_is_a_handshake_failure(implicit_server, tmp_path, caplog):
@@ -319,15 +338,10 @@ def test_cancel_between_blocks_raises_upload_cancelled(implicit_server, tmp_path
             )
     assert SECRET not in str(caught.value)
     _secret_hidden(caplog, str(caught.value))
-    deadline = time.monotonic() + 2
-    stored = b""
-    while time.monotonic() < deadline:
-        stored = server.snapshot()["files"].get("job.3mf", b"")
-        if stored:
-            break
-        time.sleep(0.01)
-    assert 0 < len(stored) < len(payload)
-    assert len(stored) == _BLOCK_BYTES
+    snap = server.snapshot()
+    assert "job.3mf" not in snap["files"]
+    verbs = [line.split(" ", 1)[0].upper() for line in snap["commands"]]
+    assert verbs.count("DELE") >= 2
 
 
 def test_second_upload_to_the_same_printer_waits(implicit_server, tmp_path, monkeypatch):
@@ -422,6 +436,271 @@ def test_printer_upload_records_events_and_hides_the_access_code(
     assert SECRET not in blob
     assert SECRET not in str(events)
     assert "[redacted]" not in str(events)
+
+
+def _client():
+    import bridge.bambu.ftps as ftps
+    return ftps
+
+
+def _closed_port():
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    port = probe.getsockname()[1]
+    probe.close()
+    return port
+
+
+def test_cleartext_data_stores_only_after_prot_c(implicit_server, tmp_path):
+    """PROT C leaves the data socket clear. The P1 default still refuses that."""
+    server = implicit_server(require_prot_c=True)
+    path, payload = _file(tmp_path)
+    name = _upload()(
+        "127.0.0.1", SECRET, str(path), "job.3mf",
+        port=server.port, connect_timeout=_CONNECT, cleartext=True,
+    )
+    snap = server.snapshot()
+    assert name == "job.3mf"
+    assert snap["files"]["job.3mf"] == payload
+    assert any(line.upper().startswith("PROT C") for line in snap["commands"])
+    assert snap["data_tls"] == [False]
+    assert not any(line.upper().startswith("PROT P") for line in snap["commands"])
+
+
+def test_cancel_cleanup_550_still_raises_upload_cancelled(implicit_server, tmp_path):
+    from bridge.bambu.ftps import UploadCancelled, _BLOCK_BYTES
+
+    server = implicit_server(dele_existing_reply="550 No such file.")
+    path, _payload = _file(tmp_path, b"a" * (_BLOCK_BYTES + 50))
+    cancel = _CancelOnSecondCheck()
+    with pytest.raises(UploadCancelled) as caught:
+        _upload()(
+            "127.0.0.1", SECRET, str(path), "job.3mf",
+            port=server.port, connect_timeout=_CONNECT, cancel=cancel,
+        )
+    assert SECRET not in str(caught.value)
+    assert "local file not found" not in str(caught.value)
+    snap = server.snapshot()
+    verbs = [line.split(" ", 1)[0].upper() for line in snap["commands"]]
+    assert verbs.count("DELE") >= 2
+    assert "550 No such file." in snap["replies"]
+
+
+def test_short_size_cleanup_550_is_still_storage(implicit_server, tmp_path):
+    from bridge.bambu.ftps import FtpsError
+
+    server = implicit_server(size_override=1, dele_existing_reply="550 No such file.")
+    path, _payload = _file(tmp_path)
+    with pytest.raises(FtpsError) as caught:
+        _upload()(
+            "127.0.0.1", SECRET, str(path), "job.3mf",
+            port=server.port, connect_timeout=_CONNECT,
+        )
+    assert caught.value.kind == "storage"
+    assert "local file not found" not in str(caught.value)
+    assert SECRET not in str(caught.value)
+    verbs = [line.split(" ", 1)[0].upper() for line in server.snapshot()["commands"]]
+    assert verbs.count("DELE") >= 2
+
+
+def test_root_path_commands_return_the_bare_name(implicit_server, tmp_path):
+    server = implicit_server()
+    path, payload = _file(tmp_path)
+    name = _upload()(
+        "127.0.0.1", SECRET, str(path), "job.3mf",
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    commands = server.snapshot()["commands"]
+    assert name == "job.3mf"
+    assert "DELE /job.3mf" in commands
+    assert "STOR /job.3mf" in commands
+    assert "SIZE /job.3mf" in commands
+    assert server.snapshot()["files"]["job.3mf"] == payload
+
+
+def test_empty_directory_lists_as_empty(implicit_server):
+    server = implicit_server()
+    names = _client().list_files(
+        "127.0.0.1", SECRET, port=server.port, connect_timeout=_CONNECT,
+    )
+    assert names == []
+
+
+def test_refused_list_is_not_an_empty_directory():
+    from bridge.bambu.ftps import FtpsError
+
+    with pytest.raises(FtpsError) as caught:
+        _client().list_files(
+            "127.0.0.1", SECRET, port=_closed_port(), connect_timeout=_CONNECT,
+        )
+    assert caught.value.kind == "network"
+    assert SECRET not in str(caught.value)
+
+
+def test_list_download_and_delete_share_the_client(implicit_server, tmp_path):
+    server = implicit_server()
+    path, payload = _file(tmp_path, b"plate-bytes")
+    _upload()(
+        "127.0.0.1", SECRET, str(path), "job.3mf",
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    ftps = _client()
+    assert ftps.list_files(
+        "127.0.0.1", SECRET, port=server.port, connect_timeout=_CONNECT,
+    ) == ["job.3mf"]
+    dest = tmp_path / "copied.3mf"
+    ftps.download(
+        "127.0.0.1", SECRET, "job.3mf", str(dest),
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    assert dest.read_bytes() == payload
+    ftps.delete(
+        "127.0.0.1", SECRET, "job.3mf",
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    assert ftps.list_files(
+        "127.0.0.1", SECRET, port=server.port, connect_timeout=_CONNECT,
+    ) == []
+    assert "job.3mf" not in server.snapshot()["files"]
+
+
+def test_short_retr_removes_the_local_partial(implicit_server, tmp_path):
+    from bridge.bambu.ftps import FtpsError
+
+    server = implicit_server(retr_short=2)
+    path, _payload = _file(tmp_path, b"plate-bytes")
+    _upload()(
+        "127.0.0.1", SECRET, str(path), "job.3mf",
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    dest = tmp_path / "partial.3mf"
+    with pytest.raises(FtpsError) as caught:
+        _client().download(
+            "127.0.0.1", SECRET, "job.3mf", str(dest),
+            port=server.port, connect_timeout=_CONNECT,
+        )
+    assert not dest.exists()
+    assert "local file not found" not in str(caught.value)
+    assert SECRET not in str(caught.value)
+
+
+def test_remote_550_on_retr_is_not_a_missing_local_file(implicit_server, tmp_path):
+    from bridge.bambu.ftps import FtpsError
+
+    server = implicit_server(retr_reply="550 No such file")
+    path, _payload = _file(tmp_path, b"plate-bytes")
+    _upload()(
+        "127.0.0.1", SECRET, str(path), "job.3mf",
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    dest = tmp_path / "missing-remote.3mf"
+    with pytest.raises(FtpsError) as caught:
+        _client().download(
+            "127.0.0.1", SECRET, "job.3mf", str(dest),
+            port=server.port, connect_timeout=_CONNECT,
+        )
+    assert any(line.upper().startswith("RETR ") for line in server.snapshot()["commands"])
+    assert caught.value.kind != "not_found"
+    assert "local file not found" not in str(caught.value)
+    assert not dest.exists()
+    assert SECRET not in str(caught.value)
+
+
+def test_remote_550_on_delete_is_not_a_missing_local_file(implicit_server):
+    from bridge.bambu.ftps import FtpsError
+
+    server = implicit_server()
+    with pytest.raises(FtpsError) as caught:
+        _client().delete(
+            "127.0.0.1", SECRET, "job.3mf",
+            port=server.port, connect_timeout=_CONNECT,
+        )
+    assert caught.value.kind != "not_found"
+    assert "local file not found" not in str(caught.value)
+    assert SECRET not in str(caught.value)
+
+
+def test_handshake_cooloff_skips_tls_and_hides_the_access_code(
+    implicit_server, tmp_path, caplog, monkeypatch,
+):
+    from bridge.bambu.ftps import FtpsError
+    import ssl
+
+    server = implicit_server(plaintext=True)
+    path, _payload = _file(tmp_path)
+    wraps = {"n": 0}
+    real_wrap = ssl.SSLContext.wrap_socket
+
+    def spy(self, *args, **kwargs):
+        wraps["n"] += 1
+        return real_wrap(self, *args, **kwargs)
+
+    monkeypatch.setattr(ssl.SSLContext, "wrap_socket", spy)
+    with caplog.at_level(logging.DEBUG, logger="bridge.bambu.ftps"):
+        with pytest.raises(FtpsError) as first:
+            _upload()(
+                "127.0.0.1", SECRET, str(path), "job.3mf",
+                port=server.port, connect_timeout=_CONNECT,
+            )
+    assert first.value.kind == "handshake"
+    assert any("220" in record.getMessage() for record in caplog.records)
+    _secret_hidden(caplog, str(first.value))
+    opened = wraps["n"]
+    assert opened >= 1
+    started = time.monotonic()
+    with pytest.raises(FtpsError) as second:
+        _upload()(
+            "127.0.0.1", SECRET, str(path), "job.3mf",
+            port=server.port, connect_timeout=_CONNECT,
+        )
+    assert second.value.kind == "handshake"
+    assert wraps["n"] == opened
+    assert time.monotonic() - started < 2
+    _secret_hidden(caplog, str(second.value))
+
+
+def test_cooloff_does_not_hold_the_transfer_lock(implicit_server, tmp_path):
+    from bridge.bambu.ftps import FtpsError
+    import bridge.bambu.ftps as ftps
+
+    server = implicit_server(plaintext=True)
+    path, _payload = _file(tmp_path)
+    with pytest.raises(FtpsError):
+        _upload()(
+            "127.0.0.1", SECRET, str(path), "job.3mf",
+            port=server.port, connect_timeout=_CONNECT,
+        )
+    acquired = threading.Event()
+
+    def grab():
+        with ftps._printer_lock("127.0.0.1"):
+            acquired.set()
+
+    waiter = threading.Thread(target=grab, daemon=True)
+    waiter.start()
+    assert acquired.wait(1)
+    waiter.join(1)
+    started = time.monotonic()
+    with pytest.raises(FtpsError):
+        _upload()(
+            "127.0.0.1", SECRET, str(path), "job.3mf",
+            port=server.port, connect_timeout=_CONNECT,
+        )
+    assert time.monotonic() - started < 2
+
+
+class _CancelOnSecondCheck(threading.Event):
+    """The client checks once per block. The second check is the second block."""
+
+    def __init__(self):
+        super().__init__()
+        self.checks = 0
+
+    def is_set(self):
+        self.checks += 1
+        if self.checks >= 2:
+            super().set()
+        return super().is_set()
 
 
 def test_upload_requires_a_connected_session(tmp_path):
