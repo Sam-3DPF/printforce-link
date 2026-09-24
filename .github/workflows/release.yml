@@ -1,6 +1,8 @@
 name: Release
 
 # Cut a release by pushing a version tag, e.g.: git tag v0.1.0 && git push origin v0.1.0
+# or run this workflow by hand (Actions -> Release -> Run workflow) on main with a version
+# such as v0.1.33. A manual run creates that tag at the commit it built.
 # Builds the --onedir agent on macOS (Apple Silicon) and Windows, then publishes the
 # archives + SHA256SUMS to a GitHub Release. Asset names match install.sh / install.ps1
 # / bridge/updater.py exactly. The tag is stamped into the frozen binary automatically;
@@ -13,6 +15,15 @@ name: Release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Release tag to create, vMAJOR.MINOR.PATCH (for example v0.1.33)'
+        required: true
+
+env:
+  # The pushed tag, or the version typed into a manual run.
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.version || github.ref_name }}
 
 jobs:
   build:
@@ -29,7 +40,7 @@ jobs:
         with:
           python-version: '3.11'
       - name: Stamp release version from tag
-        run: python packaging/stamp_version.py "${{ github.ref_name }}"
+        run: python packaging/stamp_version.py "$RELEASE_TAG"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -45,12 +56,12 @@ jobs:
           packaging/entry.py
       - name: Smoke version (macOS)
         if: matrix.kind == 'macos'
-        run: test "$(dist/printforce-link/printforce-link --version)" = "${GITHUB_REF_NAME#v}"
+        run: test "$(dist/printforce-link/printforce-link --version)" = "${RELEASE_TAG#v}"
       - name: Smoke version (Windows)
         if: matrix.kind == 'windows'
         shell: pwsh
         run: |
-          $expected = $env:GITHUB_REF_NAME.TrimStart("v")
+          $expected = $env:RELEASE_TAG.TrimStart("v")
           $actual = & "dist/printforce-link/printforce-link.exe" --version
           if ($actual -ne $expected) { throw "Expected $expected, got $actual" }
       - name: Package (macOS)
@@ -80,4 +91,7 @@ jobs:
           (cd release && sha256sum printforce-link-* > SHA256SUMS && cat SHA256SUMS)
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          # A manual run has no tag yet. The release creates it at the built commit.
+          target_commitish: ${{ github.sha }}
           files: release/*
