@@ -40,7 +40,9 @@ jobs:
         with:
           python-version: '3.11'
       - name: Stamp release version from tag
-        run: python packaging/stamp_version.py "$RELEASE_TAG"
+        # An expression, not $RELEASE_TAG: Windows runs this step in PowerShell,
+        # where $RELEASE_TAG is an empty shell variable, not the env value.
+        run: python packaging/stamp_version.py "${{ env.RELEASE_TAG }}"
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
