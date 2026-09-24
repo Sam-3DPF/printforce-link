@@ -19,6 +19,14 @@ def _handle_cloud_sends(*args, **kwargs):
     return _handle_cloud_sends_impl(*args, **kwargs)
 
 
+
+def _write_sliced_3mf(dest, plates=(1, 2, 3, 4)):
+    """A real .3mf: Link reads the plate list before it uploads."""
+    import zipfile
+    with zipfile.ZipFile(dest, "w") as archive:
+        for plate in plates:
+            archive.writestr(f"Metadata/plate_{plate}.gcode", "G28\n")
+
 class _FakeDpf:
     def __init__(self, download_ok=True, desired=None):
         self.download_ok = download_ok
@@ -30,8 +38,7 @@ class _FakeDpf:
     def download_url(self, url, dest):
         self.downloads.append((url, dest))
         if self.download_ok:
-            with open(dest, "wb") as handle:
-                handle.write(b"3mf")
+            _write_sliced_3mf(dest)
         return self.download_ok
 
     def report_dispatched(self, batch_id, bambu_id):
@@ -1237,3 +1244,95 @@ def test_cloud_map_accepts_external_and_unused_minus_one_and_rejects_a_required_
     assert _mapping_from_live_slots(one, {"slots": [{
         "slot_number": 25, "color_hex": "#D3B7A7", "filament_type": "PLA",
     }]}) == [24]
+
+
+class _PlateFileDpf(_FakeDpf):
+    """Serves a file with only the given plates, or unreadable bytes."""
+
+    def __init__(self, plates=(1,), raw=None, **kwargs):
+        super().__init__(**kwargs)
+        self.plates = plates
+        self.raw = raw
+
+    def download_url(self, url, dest):
+        self.downloads.append((url, dest))
+        if self.raw is not None:
+            with open(dest, "wb") as handle:
+                handle.write(self.raw)
+        else:
+            _write_sliced_3mf(dest, plates=self.plates)
+        return True
+
+
+def test_single_plate_file_starts_the_plate_it_contains(tmp_path):
+    """jo63pU4J plate 2 and FvLOOftf: the -2 file held only plate_1.gcode.
+
+    Asking for plate 2 left the printer at 0% with the bed warm. One plate
+    in the file is the plate to print.
+    """
+    fleet = _FakeFleet()
+    dpf = _PlateFileDpf(plates=(1,))
+    _handle_cloud_sends(_desired_plate(2), fleet, dpf, str(tmp_path), set())
+    assert len(fleet.starts) == 1
+    assert fleet.starts[0][3] == 1
+    assert dpf.failed == []
+
+
+def test_multi_plate_file_starts_the_requested_plate(tmp_path):
+    fleet = _FakeFleet()
+    dpf = _PlateFileDpf(plates=(1, 2))
+    _handle_cloud_sends(_desired_plate(2), fleet, dpf, str(tmp_path), set())
+    assert fleet.starts[0][3] == 2
+
+
+def test_missing_plate_fails_before_the_printer_is_touched(tmp_path):
+    fleet = _FakeFleet()
+    dpf = _PlateFileDpf(plates=(1, 3))
+    _handle_cloud_sends(_desired_plate(2), fleet, dpf, str(tmp_path), set())
+    assert fleet.uploads == []
+    assert fleet.starts == []
+    assert dpf.failed == [("B1", 2, "plate_missing")]
+    assert not list(tmp_path.glob("*.3mf"))
+
+
+def test_unreadable_file_fails_before_the_printer_is_touched(tmp_path):
+    fleet = _FakeFleet()
+    dpf = _PlateFileDpf(raw=b"not a zip")
+    _handle_cloud_sends(_desired_plate(1), fleet, dpf, str(tmp_path), set())
+    assert fleet.uploads == []
+    assert fleet.starts == []
+    assert dpf.failed == [("B1", 1, "file_unreadable")]
+
+
+def test_each_plate_downloads_its_own_file(tmp_path):
+    """One download per batch let plate 2 start from plate 1's file."""
+    fleet = _FakeFleet()
+    dpf = _PlateFileDpf(plates=(1, 2))
+    started = set()
+    dpf.desired = _desired_plate(1)
+    _handle_cloud_sends(_desired_plate(1), fleet, dpf, str(tmp_path), started)
+    dpf.desired = _desired_plate(2)
+    _handle_cloud_sends(_desired_plate(2), fleet, dpf, str(tmp_path), started)
+    assert len(dpf.downloads) == 2
+    first, second = dpf.downloads[0][1], dpf.downloads[1][1]
+    assert first != second
+    assert "plate-1" in first and "plate-2" in second
+    # Plate 1 left the desired state, so its download is gone.
+    import os
+    assert not os.path.exists(first)
+    assert [start[3] for start in fleet.starts] == [1, 2]
+
+
+def test_a_new_send_downloads_again(tmp_path):
+    """A file re-uploaded in 3DPF must not start from the old download."""
+    fleet = _FakeFleet()
+    dpf = _PlateFileDpf(plates=(1,))
+    started = set()
+    dpf.desired = _desired_plate(1)
+    no_send = [{"bambu_id": "P1", "desired_status": "IDLE"}]
+    _handle_cloud_sends(_desired_plate(1), fleet, dpf, str(tmp_path), started)
+    _handle_cloud_sends(no_send, fleet, dpf, str(tmp_path), started)
+    assert not list(tmp_path.glob("*.3mf"))
+    _handle_cloud_sends(_desired_plate(1), fleet, dpf, str(tmp_path), started)
+    assert len(dpf.downloads) == 2
+    assert len(fleet.starts) == 2
