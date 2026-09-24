@@ -13,6 +13,8 @@ The file is uploaded once.
 
 import json
 import os
+import re
+import zipfile
 
 from .bambu.commands import project_file_refused
 
@@ -26,6 +28,48 @@ _ATTEMPT_FIELDS = (
     "submission_id", "attempts", "phase", "phase_started_at",
     "last_failure", "uploaded", "pending_republish", "gcode_file",
 )
+
+
+_PLATE_GCODE = re.compile(r"\AMetadata/plate_(\d+)\.gcode\Z")
+# The file is not a readable .3mf. Nothing is sent to the printer.
+FILE_UNREADABLE = "file_unreadable"
+# The file has several plates and none is the one 3DPF asked for.
+PLATE_MISSING = "plate_missing"
+
+
+def plate_to_print(path, requested):
+    """The plate number to start from this file, or a failure reason.
+
+    Returns ``(plate, None)`` or ``(None, reason)``. The printer runs
+    ``Metadata/plate_N.gcode``. A name that is not in the file leaves a P1S
+    at 0% with the bed warm and no error, until someone stops it.
+
+    A file with one plate prints that plate. 3DPF numbers a split upload by
+    its ``-N`` file name, and a slicer that exports plate 2 alone can write
+    it as ``plate_1.gcode``. A file with several plates must contain the
+    requested one.
+    """
+    try:
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+    except (OSError, zipfile.BadZipFile):
+        return None, FILE_UNREADABLE
+    plates = sorted({
+        int(match.group(1))
+        for match in (_PLATE_GCODE.match(name) for name in names)
+        if match
+    })
+    if not plates:
+        return None, PLATE_MISSING
+    if len(plates) == 1:
+        return plates[0], None
+    try:
+        wanted = int(requested)
+    except (TypeError, ValueError):
+        wanted = 1
+    if wanted in plates:
+        return wanted, None
+    return None, PLATE_MISSING
 
 
 def snapshot_is_active(snapshot) -> bool:

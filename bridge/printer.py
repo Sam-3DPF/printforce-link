@@ -265,7 +265,15 @@ def _is_leftover_idle_failed(print_obj: Dict, fields: Dict) -> bool:
     return True
 
 
-def promote_live_idle(status: str, print_obj: Optional[dict]) -> str:
+def _start_faulted(print_obj: Dict, fields: Optional[Dict]) -> bool:
+    """A print error or a blocking HMS is up. Heat-up does not carry either."""
+    if not _is_zero_or_absent_error(print_obj.get("print_error")):
+        return True
+    return (fields or {}).get("hms_severity") in _LEFTOVER_BLOCKING_HMS
+
+
+def promote_live_idle(status: str, print_obj: Optional[dict],
+                      fields: Optional[Dict] = None) -> str:
     """gcode IDLE during heat-up or a moving print is still a live print.
 
     Bambu can leave gcode_state at IDLE while the nozzle and bed are commanded
@@ -276,6 +284,12 @@ def promote_live_idle(status: str, print_obj: Optional[dict]) -> str:
     so a finished plate can remain uncleared in the cloud. A FAILED state
     that map_status already folded to IDLE (user cancel, leftover fail) is
     not promoted.
+
+    A start that failed is not heat-up. P1S-8 on 2026-09-24 sat at gcode
+    IDLE, 0%, with a 38°C nozzle target and the file name left over, plus a
+    print_error and a SERIOUS HMS. Promoting that kept it Printing, so Stop
+    never stuck and no new file could start. ``fields`` is the parsed
+    telemetry, for ``hms_severity``.
     """
     if status != "IDLE" or not isinstance(print_obj, dict):
         return status
@@ -285,6 +299,8 @@ def promote_live_idle(status: str, print_obj: Optional[dict]) -> str:
     if progress is not None and 0 < progress < 100:
         return "PRINTING"
     if progress == 100:
+        return status
+    if _start_faulted(print_obj, fields):
         return status
     nozzle_target = as_float(print_obj.get("nozzle_target_temper"), None) or 0
     bed_target = as_float(print_obj.get("bed_target_temper"), None) or 0
@@ -1802,7 +1818,7 @@ class BambuPrinter:
         )
         if status == "ERROR" and _is_leftover_idle_failed(print_obj, telemetry):
             status = "IDLE"
-        status = promote_live_idle(status, print_obj)
+        status = promote_live_idle(status, print_obj, telemetry)
         report = {
             "bambu_id": self.bambu_id,
             "status": status,

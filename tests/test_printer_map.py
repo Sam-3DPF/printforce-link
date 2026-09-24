@@ -83,3 +83,26 @@ def test_map_status_latched_cancel_survives_cleared_print_error():
     assert map_status("FAILED", print_error=None, user_cancelled=True) == "IDLE"
     assert map_status("FAILED", print_error="0", user_cancelled=True) == "IDLE"
     assert map_status("FAILED", print_error=None, user_cancelled=False) == "ERROR"
+
+
+def test_promote_live_idle_does_not_promote_a_failed_start():
+    """P1S-8: gcode IDLE at 0% with a 38°C target and the file name, after a
+    leveling fault. A print error or a serious HMS is not heat-up."""
+    failed_start = {
+        "gcode_state": "IDLE",
+        "mc_percent": 0,
+        "nozzle_target_temper": 38,
+        "bed_target_temper": 0,
+        "subtask_name": "batch-2026-09-22-um7425xQ-1",
+        "print_error": 50348032,
+    }
+    assert promote_live_idle("IDLE", failed_start) == "IDLE"
+    no_error = dict(failed_start, print_error=0)
+    assert promote_live_idle("IDLE", no_error, {"hms_severity": "SERIOUS"}) == "IDLE"
+    assert promote_live_idle("IDLE", no_error, {"hms_severity": "FATAL"}) == "IDLE"
+    # A plain heat-up, or a minor HMS, still reads as a live print.
+    assert promote_live_idle("IDLE", no_error) == "PRINTING"
+    assert promote_live_idle("IDLE", no_error, {"hms_severity": "COMMON"}) == "PRINTING"
+    # A moving print is still printing whatever the error field says.
+    moving = dict(failed_start, mc_percent=40)
+    assert promote_live_idle("IDLE", moving) == "PRINTING"

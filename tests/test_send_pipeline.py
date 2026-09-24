@@ -397,3 +397,37 @@ def test_a_final_failure_names_the_drying_unit_and_does_not_stop_it(tmp_path):
     assert "drying unit 7" in dpf.failed[0][2]
     assert fleet.commands == []
     assert "ams_filament_drying" not in dpf.failed[0][2]
+
+
+def _plate_file(path, plates):
+    import zipfile
+    with zipfile.ZipFile(path, "w") as archive:
+        for plate in plates:
+            archive.writestr(f"Metadata/plate_{plate}.gcode", "G28\n")
+        archive.writestr("Metadata/plate_1.png", b"")
+    return str(path)
+
+
+def test_plate_to_print_picks_the_only_plate(tmp_path):
+    from bridge.send_pipeline import plate_to_print
+    path = _plate_file(tmp_path / "one.3mf", [1])
+    assert plate_to_print(path, 2) == (1, None)
+    path = _plate_file(tmp_path / "two.3mf", [2])
+    assert plate_to_print(path, 1) == (2, None)
+
+
+def test_plate_to_print_needs_the_requested_plate_when_there_are_several(tmp_path):
+    from bridge.send_pipeline import PLATE_MISSING, plate_to_print
+    path = _plate_file(tmp_path / "many.3mf", [1, 2])
+    assert plate_to_print(path, 2) == (2, None)
+    assert plate_to_print(path, 3) == (None, PLATE_MISSING)
+
+
+def test_plate_to_print_refuses_a_file_without_plates(tmp_path):
+    from bridge.send_pipeline import FILE_UNREADABLE, PLATE_MISSING, plate_to_print
+    path = _plate_file(tmp_path / "none.3mf", [])
+    assert plate_to_print(path, 1) == (None, PLATE_MISSING)
+    junk = tmp_path / "junk.3mf"
+    junk.write_bytes(b"not a zip")
+    assert plate_to_print(str(junk), 1) == (None, FILE_UNREADABLE)
+    assert plate_to_print(str(tmp_path / "missing.3mf"), 1) == (None, FILE_UNREADABLE)

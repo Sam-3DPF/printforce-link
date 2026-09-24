@@ -36,6 +36,7 @@ from .send_pipeline import (
     latch_failure,
     load_attempt,
     mark_uploaded,
+    plate_to_print,
     printer_is_held,
     ready_for_upload,
     release_settled_attempts,
@@ -959,9 +960,9 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         live.add(key)
         if failure_latched(_cloud_send_started_path(spool_dir, key)):
             continue
-        dest = os.path.join(spool_dir, f"{batch_id}.3mf")
+        dest = _cloud_send_file_path(spool_dir, key)
         started_path = _cloud_send_started_path(spool_dir, key)
-        legacy_started_path = dest + ".started"
+        legacy_started_path = os.path.join(spool_dir, f"{batch_id}.3mf") + ".started"
         assignment_matches = _router_assignment_matches(router, key)
         if os.path.exists(legacy_started_path):
             migration_key = _router_assignment_key_for_batch(router, str(batch_id))
@@ -1081,6 +1082,15 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     pass
                 logger.warning("could not download send file for batch %s", batch_id)
                 continue
+        print_plate, bad_file = plate_to_print(dest, plate_index)
+        if bad_file:
+            logger.warning(
+                "cloud send %s: file cannot print plate %s (%s); not starting",
+                batch_id, plate_index, bad_file,
+            )
+            _discard_cloud_send_file(spool_dir, key)
+            _fail_cloud_send(key, dpf, spool_dir, started_sends, router, bad_file)
+            continue
         remote_name = _cloud_remote_name(send)
         uploaded = None
         if hasattr(fleet, "upload") and hasattr(fleet, "start_print"):
@@ -1117,11 +1127,11 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 continue
             started = _mqtt_start_print(
                 fleet, bambu_id, uploaded or remote_name or os.path.basename(dest),
-                ams_mapping, plate_index,
+                ams_mapping, print_plate,
             )
         else:
             started = fleet.dispatch(
-                bambu_id, dest, ams_mapping, plate_index,
+                bambu_id, dest, ams_mapping, print_plate,
                 remote_name=remote_name,
             )
         if started:
@@ -1156,6 +1166,7 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             except OSError:
                 pass
             discard_attempt(leftover)
+            _discard_cloud_send_file(spool_dir, key)
     _cleanup_orphaned_cloud_send_markers(spool_dir, live, seen_serials)
     if release_failures:
         release_settled_attempts(spool_dir, live)
@@ -1170,6 +1181,26 @@ def _cloud_send_started_path(spool_dir: str, key) -> str:
         spool_dir,
         f"cloud-send-{safe_batch}-{safe_printer}-plate-{int(plate_index)}.started",
     )
+
+
+def _cloud_send_file_path(spool_dir: str, key) -> str:
+    """This send's downloaded file. One per batch, printer, and plate.
+
+    A per-batch name let plate 2 start from plate 1's file, and a file
+    re-uploaded in 3DPF never replaced the first download. The file is
+    deleted when the send ends, so the next send downloads again.
+    """
+    started = _cloud_send_started_path(spool_dir, key)
+    return started[: -len(".started")] + ".3mf"
+
+
+def _discard_cloud_send_file(spool_dir: str, key) -> None:
+    path = _cloud_send_file_path(spool_dir, key)
+    for leftover in (path, path + ".part"):
+        try:
+            os.unlink(leftover)
+        except OSError:
+            pass
 
 
 def _snapshot_shows_active(snapshot) -> bool:
@@ -1220,6 +1251,7 @@ def _report_confirmed_dispatch(key, dpf, spool_dir: str, router) -> None:
         )
     except OSError:
         pass
+    _discard_cloud_send_file(spool_dir, key)
     dpf.report_dispatched(batch_id, bambu_id)
 
 
@@ -1232,6 +1264,7 @@ def _clear_pending_cloud_send(spool_dir: str, key, started_sends, router) -> Non
     except OSError:
         pass
     discard_attempt(leftover)
+    _discard_cloud_send_file(spool_dir, key)
     if router is not None and _router_assignment_matches(router, key):
         clearer = getattr(router, "clear_assignment", None)
         if callable(clearer):
@@ -1355,9 +1388,14 @@ def _republish_start(send, fleet, bambu_id: str, dest: str, plate_index: int) ->
     if ams_mapping is None:
         return False
     remote_name = _cloud_remote_name(send)
+    print_plate = plate_index
+    if os.path.exists(dest):
+        found, _bad = plate_to_print(dest, plate_index)
+        if found is not None:
+            print_plate = found
     return bool(_mqtt_start_print(
         fleet, bambu_id, remote_name or os.path.basename(dest),
-        ams_mapping, plate_index,
+        ams_mapping, print_plate,
     ))
 
 
@@ -1403,7 +1441,7 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
     if action == "republish":
         if not _cloud_send_session_connected(fleet, bambu_id):
             return
-        dest = os.path.join(spool_dir, f"{batch_id}.3mf")
+        dest = _cloud_send_file_path(spool_dir, key)
         if not _republish_start(send, fleet, bambu_id, dest, plate_index):
             return
         record["pending_republish"] = False
@@ -1418,7 +1456,7 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
         return
     if action == "retry":
         record["last_failure"] = "no_active"
-        dest = os.path.join(spool_dir, f"{batch_id}.3mf")
+        dest = _cloud_send_file_path(spool_dir, key)
         if not _republish_start(send, fleet, bambu_id, dest, plate_index):
             _fail_cloud_send(
                 key, dpf, spool_dir, started_sends, router,
@@ -1480,12 +1518,15 @@ def _router_assignment_key_for_batch(router, batch_id: str):
     return matches[0] if len(matches) == 1 else None
 
 
+_CLOUD_SEND_SUFFIXES = (".started", ".3mf", ".3mf.part")
+
+
 def _cleanup_orphaned_cloud_send_markers(spool_dir: str, live, seen_serials) -> None:
-    """Remove durable markers only for printers covered by this desired-state."""
+    """Remove durable markers and downloads only for printers covered by this desired-state."""
     if not seen_serials:
         return
     live_paths = {
-        os.path.abspath(_cloud_send_started_path(spool_dir, key))
+        os.path.abspath(_cloud_send_started_path(spool_dir, key))[: -len(".started")]
         for key in live
     }
     printer_suffixes = {
@@ -1498,13 +1539,15 @@ def _cleanup_orphaned_cloud_send_markers(spool_dir: str, live, seen_serials) -> 
         return
     for entry in entries:
         name = entry.name
+        suffix = next((end for end in _CLOUD_SEND_SUFFIXES if name.endswith(end)), None)
+        if suffix is None or not name.startswith("cloud-send-"):
+            continue
+        stem = name[: -len(suffix)]
         if (
-            not name.startswith("cloud-send-")
-            or not name.endswith(".started")
-            or os.path.abspath(entry.path) in live_paths
+            os.path.abspath(os.path.join(spool_dir, stem)) in live_paths
             or not any(
-                re.search(re.escape(suffix) + r"\d+\.started\Z", name)
-                for suffix in printer_suffixes
+                re.search(re.escape(printer) + r"\d+\Z", stem)
+                for printer in printer_suffixes
             )
         ):
             continue
