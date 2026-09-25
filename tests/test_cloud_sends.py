@@ -1336,3 +1336,33 @@ def test_a_new_send_downloads_again(tmp_path):
     _handle_cloud_sends(_desired_plate(1), fleet, dpf, str(tmp_path), started)
     assert len(dpf.downloads) == 2
     assert len(fleet.starts) == 2
+
+
+class _LevelingFleet(_FakeFleet):
+    """A fleet whose start_print takes the operator's bed leveling choice."""
+
+    def __init__(self):
+        super().__init__()
+        self.leveling = []
+
+    def start_print(self, bambu_id, remote_name, mapping, plate_index=1, bed_leveling=None):
+        self.leveling.append(bed_leveling)
+        return super().start_print(bambu_id, remote_name, mapping, plate_index)
+
+
+@pytest.mark.parametrize("choice", [True, False])
+def test_cloud_send_passes_the_bed_leveling_choice_to_the_start(tmp_path, choice):
+    fleet = _LevelingFleet()
+    desired = _desired_plate(1)
+    desired[0]["send"]["bed_leveling"] = choice
+    dpf = _FakeDpf(desired=desired)
+    _handle_cloud_sends(desired, fleet, dpf, str(tmp_path), set())
+    assert fleet.leveling == [choice]
+
+
+def test_cloud_send_without_a_choice_uses_the_old_start_call(tmp_path):
+    """No bed_leveling key: the printer decides, and an older fleet still works."""
+    fleet = _FakeFleet()
+    dpf = _FakeDpf(desired=_desired_plate(1))
+    _handle_cloud_sends(_desired_plate(1), fleet, dpf, str(tmp_path), set())
+    assert len(fleet.starts) == 1

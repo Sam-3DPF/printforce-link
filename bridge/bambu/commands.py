@@ -172,9 +172,25 @@ def _subtask_name(remote_name: str) -> str:
     return name
 
 
-def build_project_file(remote_name, ams_mapping, plate_number, profile, submission_id) -> dict:
+def bed_leveling_fields(bed_leveling=None):
+    """``bed_leveling`` and ``auto_bed_leveling`` for one start.
+
+    ``auto_bed_leveling`` is 0 off, 1 on, 2 let the printer decide. The
+    operator's choice from 3DPF (True or False) sets both. None, when 3DPF
+    sent no choice, keeps the printer's own decision.
+    """
+    if bed_leveling is True:
+        return True, 1
+    if bed_leveling is False:
+        return False, 0
+    return False, 2
+
+
+def build_project_file(remote_name, ams_mapping, plate_number, profile, submission_id,
+                       bed_leveling=None) -> dict:
     """The MQTT document for one start. The caller has already refused a busy state."""
     trays, mapped, use_ams = ams_fields(ams_mapping)
+    leveling, auto_leveling = bed_leveling_fields(bed_leveling)
     url = project_file_url(remote_name, profile.start_url_scheme)
     token = str(int(submission_id))
     bare = _bare_file_name(remote_name)
@@ -188,8 +204,8 @@ def build_project_file(remote_name, ams_mapping, plate_number, profile, submissi
             "file": bare,
             "md5": "",
             "bed_type": "auto",
-            "bed_leveling": False,
-            "auto_bed_leveling": 2,
+            "bed_leveling": leveling,
+            "auto_bed_leveling": auto_leveling,
             "flow_cali": False,
             "extrude_cali_flag": 2,
             "extrude_cali_manual_mode": 0,

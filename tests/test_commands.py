@@ -397,3 +397,19 @@ def test_a_calibration_table_reply_does_not_replace_nozzle_diameter():
         "print": {"gcode_state": "IDLE"},
     })
     assert printer.state.view()["payload"]["info"]["module"][0]["sw_ver"] == "01.08.00.00"
+
+
+@pytest.mark.parametrize("choice, leveling, auto_leveling", [
+    (True, True, 1),
+    (False, False, 0),
+    (None, False, 2),
+])
+def test_start_document_carries_the_operator_bed_leveling_choice(
+    choice, leveling, auto_leveling,
+):
+    """3DPF's Start dialog sends on or off. No choice lets the printer decide."""
+    printer = _printer(model="C12")
+    assert printer.start_print("batch-a.3mf", [0], 1, bed_leveling=choice) is True
+    body = _body(printer)
+    assert body["bed_leveling"] is leveling
+    assert body["auto_bed_leveling"] == auto_leveling
