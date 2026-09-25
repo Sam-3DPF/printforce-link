@@ -10,6 +10,7 @@ from bridge.app import (
     _LegacyMarkerReadiness,
     _cloud_send_started_path,
     _handle_cloud_sends as _handle_cloud_sends_impl,
+    _republish_start,
 )
 from bridge.router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
 
@@ -1503,6 +1504,16 @@ def test_cloud_send_passes_both_choices_to_the_start(tmp_path):
     desired[0]["send"]["timelapse"] = True
     dpf = _FakeDpf(desired=desired)
     _handle_cloud_sends(desired, fleet, dpf, str(tmp_path), set())
+    assert fleet.choices == [(False, True)]
+
+
+def test_republished_start_keeps_both_choices(tmp_path):
+    """A start republished after a reconnect sends the same operator choices."""
+    fleet = _TimelapseFleet()
+    send = _desired_plate(1)[0]["send"]
+    send["bed_leveling"] = False
+    send["timelapse"] = True
+    assert _republish_start(send, fleet, "P1", str(tmp_path / "missing.3mf"), 1)
     assert fleet.choices == [(False, True)]
 
 
