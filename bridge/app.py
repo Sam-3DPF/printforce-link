@@ -19,6 +19,7 @@ from typing import List, Dict, Optional
 from . import __version__
 from .ams import normalize_hex
 from .bambu.commands import live_slot_number_allowed, live_slot_to_tray, tray_index_allowed
+from .bambu.ftps import UploadCancelled
 from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
@@ -64,6 +65,45 @@ LEGACY_READY_OBSERVATION_LIMIT = 256
 CLOUD_SEND_CONFIRM_WAIT_SECONDS = 8.0
 STARTED_MARKER_COMMANDED = "commanded"
 STARTED_MARKER_CONFIRMED = "confirmed"
+# A failed upload or start used to retry every pass without telling 3DPF, and
+# 3DPF refused every other Start on that printer while it waited. Report after
+# this many failures in a row that span at least this long, so a short Wi-Fi
+# drop still retries.
+SEND_SETUP_FAILURE_LIMIT = 3
+SEND_SETUP_FAILURE_MIN_SECONDS = 120.0
+
+
+class _SendSetupFailures:
+    """Upload and start failures in a row for each send, before the watchdog.
+
+    Shared by every printer worker. Each worker touches only its own serial's
+    keys, so ``forget_missing`` drops only keys for serials it was shown.
+    """
+
+    def __init__(self, limit=SEND_SETUP_FAILURE_LIMIT,
+                 min_seconds=SEND_SETUP_FAILURE_MIN_SECONDS):
+        self._limit = int(limit)
+        self._min_seconds = float(min_seconds)
+        self._lock = threading.Lock()
+        self._seen = {}
+
+    def record(self, key, now: float) -> bool:
+        """Count one failure. True when this send should be reported failed."""
+        with self._lock:
+            count, first = self._seen.get(key, (0, float(now)))
+            count += 1
+            self._seen[key] = (count, first)
+            return count >= self._limit and float(now) - first >= self._min_seconds
+
+    def clear(self, key) -> None:
+        with self._lock:
+            self._seen.pop(key, None)
+
+    def forget_missing(self, live, serials) -> None:
+        with self._lock:
+            for key in list(self._seen):
+                if str(key[1]) in serials and key not in live:
+                    del self._seen[key]
 
 
 class _LegacyMarkerReadiness:
@@ -402,6 +442,7 @@ def main(config_path: str = "config.toml") -> None:
     # so a shared object would forget another printer's legacy-marker observations.
     legacy_marker_readiness = {}
     cloud_send_jobs = {}
+    send_setup_failures = _SendSetupFailures()
     spool_dir = cfg.printhost.spool_dir if cfg.printhost else "/tmp/printforce-spool"
     os.makedirs(spool_dir, exist_ok=True)
     logger.info("Reporting every %ss; heartbeat every %ss; a printer that says nothing "
@@ -452,6 +493,7 @@ def main(config_path: str = "config.toml") -> None:
                 desired or [], fleet, dpf, spool_dir, started_sends, applied_controls,
                 router=router, legacy_marker_readiness=legacy_marker_readiness,
                 cloud_send_jobs=cloud_send_jobs,
+                send_setup_failures=send_setup_failures,
             )
             # After sends are queued, so a worker already uploading is skipped
             # this pass. One run per offline spell, not one per loop.
@@ -513,6 +555,7 @@ def main(config_path: str = "config.toml") -> None:
                     applied_controls, router=router,
                     legacy_marker_readiness=legacy_marker_readiness,
                     cloud_send_jobs=cloud_send_jobs,
+                    send_setup_failures=send_setup_failures,
                 )
                 printers_busy = _printers_busy(reports, fleet)
                 updater.tick_async(force=force_update, printers_busy=printers_busy)
@@ -598,7 +641,8 @@ def _send_keys(started_sends):
 
 def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
                    started_sends, applied_controls, router=None,
-                   legacy_marker_readiness=None, cloud_send_jobs=None) -> None:
+                   legacy_marker_readiness=None, cloud_send_jobs=None,
+                   send_setup_failures=None) -> None:
     """Apply control on this thread, then cloud sends on each printer's worker.
 
     Controls stay here: publish does not block, and refresh is queued inside
@@ -613,6 +657,7 @@ def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
         _handle_cloud_sends(
             desired, fleet, dpf, spool_dir, started_sends, router=router,
             legacy_marker_readiness=legacy_marker_readiness,
+            setup_failures=send_setup_failures,
         )
         return
     if cloud_send_jobs is None:
@@ -648,6 +693,7 @@ def _apply_desired(desired: List[Dict], fleet, dpf, spool_dir: str,
             router=router,
             legacy_marker_readiness=readiness,
             release_failures=False,
+            setup_failures=send_setup_failures,
         )
         if future is not None:
             cloud_send_jobs[serial] = future
@@ -925,7 +971,8 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                        wall_time=time.time,
                        confirm_wait_seconds=CLOUD_SEND_CONFIRM_WAIT_SECONDS,
                        sleep_fn=time.sleep,
-                       release_failures: bool = True) -> None:
+                       release_failures: bool = True,
+                       setup_failures=None) -> None:
     """Start a print only when the cloud Sliced Queue says so.
 
     MQTT publish True is not a physical start. DISPATCHED is reported only after
@@ -937,6 +984,8 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         started_sends = set()
     if legacy_marker_readiness is None:
         legacy_marker_readiness = _LegacyMarkerReadiness()
+    if setup_failures is None:
+        setup_failures = _SendSetupFailures()
     live = set()
     pending_legacy_markers = set()
     seen_serials = {
@@ -1097,7 +1146,20 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             if uploaded_already(started_path):
                 uploaded = remote_name or os.path.basename(dest)
             else:
-                uploaded = fleet.upload(bambu_id, dest, remote_name=remote_name)
+                try:
+                    uploaded = fleet.upload(bambu_id, dest, remote_name=remote_name)
+                except UploadCancelled:
+                    raise
+                except Exception as exc:
+                    logger.warning(
+                        "cloud send %s: upload to %s failed (%s)",
+                        batch_id, bambu_id, getattr(exc, "kind", None) or type(exc).__name__,
+                    )
+                    _count_setup_failure(
+                        key, setup_failures, wall_time, dpf, spool_dir,
+                        started_sends, router, "upload_failed",
+                    )
+                    continue
                 mark_uploaded(started_path)
             latest = dpf.heartbeat() if hasattr(dpf, "heartbeat") else {}
             latest_rows = latest.get("printers") if isinstance(latest, dict) else None
@@ -1125,16 +1187,23 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     batch_id,
                 )
                 continue
-            started = _mqtt_start_print(
-                fleet, bambu_id, uploaded or remote_name or os.path.basename(dest),
-                ams_mapping, print_plate, bed_leveling=_send_bed_leveling(fresh_send),
-            )
+            try:
+                started = _mqtt_start_print(
+                    fleet, bambu_id, uploaded or remote_name or os.path.basename(dest),
+                    ams_mapping, print_plate, bed_leveling=_send_bed_leveling(fresh_send),
+                )
+            except Exception:
+                logger.warning(
+                    "cloud send %s: start on %s raised", batch_id, bambu_id, exc_info=True,
+                )
+                started = False
         else:
             started = fleet.dispatch(
                 bambu_id, dest, ams_mapping, print_plate,
                 remote_name=remote_name,
             )
         if started:
+            setup_failures.clear(key)
             _send_mark(started_sends, key)
             try:
                 _write_cloud_send_marker(started_path, STARTED_MARKER_COMMANDED)
@@ -1156,6 +1225,10 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 _report_confirmed_dispatch(key, dpf, spool_dir, router)
         else:
             logger.warning("printer %s did not start batch %s", bambu_id, batch_id)
+            _count_setup_failure(
+                key, setup_failures, wall_time, dpf, spool_dir,
+                started_sends, router, "start_not_sent",
+            )
     for key in _send_keys(started_sends):
         _batch_id, bambu_id, _plate_index = key
         if bambu_id in seen_serials and key not in live:
@@ -1167,6 +1240,7 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 pass
             discard_attempt(leftover)
             _discard_cloud_send_file(spool_dir, key)
+    setup_failures.forget_missing(live, seen_serials)
     _cleanup_orphaned_cloud_send_markers(spool_dir, live, seen_serials)
     if release_failures:
         release_settled_attempts(spool_dir, live)
@@ -1285,6 +1359,23 @@ def _fail_cloud_send(key, dpf, spool_dir, started_sends, router, reason: str) ->
             return
     _clear_pending_cloud_send(spool_dir, key, started_sends, router)
     latch_failure(_cloud_send_started_path(spool_dir, key), key, reason)
+
+
+def _count_setup_failure(key, setup_failures, wall_time, dpf, spool_dir,
+                         started_sends, router, reason: str) -> None:
+    """Count a failed upload or start. Report it once the limit is reached.
+
+    3DPF puts a named never-started failure back on Ready to print and frees
+    the printer. Until then the next pass retries.
+    """
+    if not setup_failures.record(key, float(wall_time())):
+        return
+    logger.warning(
+        "cloud send %s: %s on printer %s; reporting it failed", key[0], reason, key[1],
+    )
+    _fail_cloud_send(key, dpf, spool_dir, started_sends, router, reason)
+    if failure_latched(_cloud_send_started_path(spool_dir, key)):
+        setup_failures.clear(key)
 
 
 def _submission_on_printer(fleet, bambu_id: str):
