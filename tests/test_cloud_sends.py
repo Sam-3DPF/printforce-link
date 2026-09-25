@@ -1366,3 +1366,108 @@ def test_cloud_send_without_a_choice_uses_the_old_start_call(tmp_path):
     dpf = _FakeDpf(desired=_desired_plate(1))
     _handle_cloud_sends(_desired_plate(1), fleet, dpf, str(tmp_path), set())
     assert len(fleet.starts) == 1
+
+
+class _UploadFailsFleet(_ConfirmFleet):
+    def upload(self, bambu_id, dest, remote_name=None):
+        from bridge.bambu.ftps import FtpsError
+        self.uploads.append((bambu_id, dest, remote_name))
+        raise FtpsError("storage", "553 could not create file")
+
+
+class _StartRefusedFleet(_ConfirmFleet):
+    def start_print(self, bambu_id, remote_name, mapping, plate_index=1):
+        self.starts.append((bambu_id, remote_name, list(mapping), plate_index))
+        return False
+
+
+def _passes(fleet, dpf, tmp_path, times, failures):
+    from bridge.app import _SendSetupFailures
+    clock = _FakeClock(0.0)
+    started = set()
+    for at in times:
+        clock.now = at
+        _handle_cloud_sends(
+            _desired(), fleet, dpf, str(tmp_path), started,
+            wall_time=lambda: clock.now, setup_failures=failures,
+        )
+
+
+def test_upload_that_keeps_failing_is_reported_to_3dpf(tmp_path):
+    from bridge.app import _SendSetupFailures
+    fleet = _UploadFailsFleet()
+    dpf = _FakeDpf()
+    failures = _SendSetupFailures()
+
+    _passes(fleet, dpf, tmp_path, [0.0, 60.0], failures)
+    assert dpf.failed == []
+
+    _passes(fleet, dpf, tmp_path, [130.0], failures)
+    assert dpf.failed == [("B1", 2, "upload_failed")]
+    assert fleet.starts == []
+
+    # Latched: the next pass does not upload again.
+    uploads = len(fleet.uploads)
+    _passes(fleet, dpf, tmp_path, [150.0], failures)
+    assert len(fleet.uploads) == uploads
+    assert len(dpf.failed) == 1
+
+
+def test_start_that_never_goes_out_is_reported_to_3dpf(tmp_path):
+    from bridge.app import _SendSetupFailures
+    fleet = _StartRefusedFleet()
+    dpf = _FakeDpf()
+    failures = _SendSetupFailures()
+
+    _passes(fleet, dpf, tmp_path, [0.0, 60.0, 130.0], failures)
+
+    assert dpf.failed == [("B1", 2, "start_not_sent")]
+    assert len(fleet.uploads) == 1  # uploaded once, start retried
+    assert len(fleet.starts) == 3
+
+
+def test_short_upload_blip_still_retries(tmp_path):
+    from bridge.app import _SendSetupFailures
+    fleet = _UploadFailsFleet()
+    dpf = _FakeDpf()
+    failures = _SendSetupFailures()
+
+    _passes(fleet, dpf, tmp_path, [0.0, 15.0, 30.0, 45.0], failures)
+
+    assert dpf.failed == []
+    assert len(fleet.uploads) == 4
+
+
+def test_a_start_that_goes_out_clears_the_failure_count(tmp_path):
+    from bridge.app import _SendSetupFailures
+
+    class _SecondTryStarts(_ConfirmFleet):
+        def start_print(self, bambu_id, remote_name, mapping, plate_index=1):
+            self.starts.append((bambu_id, remote_name, list(mapping), plate_index))
+            return len(self.starts) >= 2
+
+    fleet = _SecondTryStarts()
+    dpf = _FakeDpf()
+    failures = _SendSetupFailures()
+    _passes(fleet, dpf, tmp_path, [0.0, 60.0], failures)
+
+    assert dpf.failed == []
+    assert len(fleet.starts) == 2
+    # Count starts again from one.
+    assert failures.record(("B1", "P1", 2), 1_000.0) is False
+
+
+def test_failure_count_is_dropped_when_3dpf_stops_asking(tmp_path):
+    from bridge.app import _SendSetupFailures
+    failures = _SendSetupFailures()
+    key = ("B1", "P1", 2)
+    other = ("B9", "P2", 1)
+    failures.record(key, 0.0)
+    failures.record(other, 0.0)
+
+    failures.forget_missing(live=set(), serials={"P1"})
+
+    # P1's count is gone; P2 was not in this pass and keeps its count.
+    assert failures.record(key, 500.0) is False
+    failures.record(other, 100.0)
+    assert failures.record(other, 200.0) is True
