@@ -693,6 +693,13 @@ def test_delta_does_not_blank_the_last_known_scalars():
     assert snapshot["progress_percent"] == 41      # ...but the delta's own value wins
 
 
+def test_partial_ipcam_delta_keeps_the_record_setting():
+    full = {"print": {"ipcam": {"ipcam_record": "enable", "timelapse": "disable"}}}
+    delta = {"print": {"ipcam": {"timelapse": "enable"}}}
+    merged = merge_status_payload(merge_status_payload(None, full), delta)
+    assert merged["print"]["ipcam"] == {"ipcam_record": "enable", "timelapse": "enable"}
+
+
 def test_delta_without_an_ams_key_keeps_the_last_known_trays():
     printer = _printer([
         {"print": {"gcode_state": "IDLE", "ams": {"ams": [
