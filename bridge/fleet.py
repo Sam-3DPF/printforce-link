@@ -383,13 +383,15 @@ class Fleet:
                     cancel.clear()
 
     def start_print(self, bambu_id: str, remote_name: str, ams_mapping,
-                    plate_number: int = 1) -> bool:
-        """MQTT-start a file already on the printer."""
+                    plate_number: int = 1, bed_leveling=None) -> bool:
+        """MQTT-start a file already on the printer. None bed_leveling lets the printer decide."""
         printer = self.by_id(bambu_id)
         if printer is None:
             logger.error("start_print requested for unknown printer %s", bambu_id)
             return False
-        return printer.start_print(remote_name, ams_mapping, plate_number)
+        return printer.start_print(
+            remote_name, ams_mapping, plate_number, bed_leveling=bed_leveling,
+        )
 
     def snapshot(self) -> List[Dict]:
         """One state report per printer — the bridge's wire contract with 3DPF:

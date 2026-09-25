@@ -856,7 +856,8 @@ class BambuPrinter:
         except Exception:
             logger.debug("printer %s: upload event was not recorded", self.bambu_id)
 
-    def start_print(self, remote_name: str, ams_mapping, plate_number: int = 1) -> bool:
+    def start_print(self, remote_name: str, ams_mapping, plate_number: int = 1,
+                    bed_leveling=None) -> bool:
         """MQTT-start a file already on the printer. A True return is not an ack.
 
         Refused while the last ``gcode_state`` is PREPARE, SLICING, RUNNING,
@@ -876,6 +877,7 @@ class BambuPrinter:
         self._last_submission_id = submission_id
         payload = build_project_file(
             remote_name, ams_mapping, plate_number, self.profile, submission_id,
+            bed_leveling=bed_leveling,
         )
         started = self._publish_command(payload)
         if started:

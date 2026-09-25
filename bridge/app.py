@@ -1127,7 +1127,7 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 continue
             started = _mqtt_start_print(
                 fleet, bambu_id, uploaded or remote_name or os.path.basename(dest),
-                ams_mapping, print_plate,
+                ams_mapping, print_plate, bed_leveling=_send_bed_leveling(fresh_send),
             )
         else:
             started = fleet.dispatch(
@@ -1395,7 +1395,7 @@ def _republish_start(send, fleet, bambu_id: str, dest: str, plate_index: int) ->
             print_plate = found
     return bool(_mqtt_start_print(
         fleet, bambu_id, remote_name or os.path.basename(dest),
-        ams_mapping, print_plate,
+        ams_mapping, print_plate, bed_leveling=_send_bed_leveling(send),
     ))
 
 
@@ -1688,9 +1688,24 @@ def _legacy_marker_snapshot_allows_start(snapshot) -> bool:
     )
 
 
-def _mqtt_start_print(fleet, bambu_id, remote_name, ams_mapping, plate_index):
-    """Publish the start. IDLE, FINISH, and FAILED need no stop first."""
-    return fleet.start_print(bambu_id, remote_name, ams_mapping, plate_index)
+def _mqtt_start_print(fleet, bambu_id, remote_name, ams_mapping, plate_index,
+                      bed_leveling=None):
+    """Publish the start. IDLE, FINISH, and FAILED need no stop first.
+
+    ``bed_leveling`` is the operator's choice from 3DPF. None keeps the
+    printer's own decision and the call an older fleet understands.
+    """
+    if bed_leveling is None:
+        return fleet.start_print(bambu_id, remote_name, ams_mapping, plate_index)
+    return fleet.start_print(
+        bambu_id, remote_name, ams_mapping, plate_index, bed_leveling=bed_leveling,
+    )
+
+
+def _send_bed_leveling(send):
+    """True or False when 3DPF sent the operator's choice. Anything else is None."""
+    value = send.get("bed_leveling") if isinstance(send, dict) else None
+    return value if isinstance(value, bool) else None
 
 
 def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[list]:
