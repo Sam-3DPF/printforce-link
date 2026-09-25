@@ -1037,6 +1037,10 @@ class BambuPrinter:
         flag = 1 if enabled else 0
         if not self._publish_line(f"M981 S{flag} P20000"):
             return False
+        return self._publish_pushall()
+
+    def _publish_pushall(self) -> bool:
+        """A bare ``pushall`` so the next report shows a setting just changed."""
         return self._publish_command({
             "pushing": {"sequence_id": "0", "command": "pushall"},
         })
@@ -1069,9 +1073,7 @@ class BambuPrinter:
         self._require_session()
         if not self._publish_command(build_camera_record(on)):
             return False
-        return self._publish_command({
-            "pushing": {"sequence_id": "0", "command": "pushall"},
-        })
+        return self._publish_pushall()
 
     def send_drying(self, params) -> bool:
         """Publish drying, except on a P1 profile, which consumes the control id.
