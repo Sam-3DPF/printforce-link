@@ -383,14 +383,18 @@ class Fleet:
                     cancel.clear()
 
     def start_print(self, bambu_id: str, remote_name: str, ams_mapping,
-                    plate_number: int = 1, bed_leveling=None) -> bool:
-        """MQTT-start a file already on the printer. None bed_leveling lets the printer decide."""
+                    plate_number: int = 1, bed_leveling=None, timelapse=None) -> bool:
+        """MQTT-start a file already on the printer.
+
+        None bed_leveling lets the printer decide. None timelapse is off.
+        """
         printer = self.by_id(bambu_id)
         if printer is None:
             logger.error("start_print requested for unknown printer %s", bambu_id)
             return False
         return printer.start_print(
-            remote_name, ams_mapping, plate_number, bed_leveling=bed_leveling,
+            remote_name, ams_mapping, plate_number,
+            bed_leveling=bed_leveling, timelapse=timelapse,
         )
 
     def snapshot(self) -> List[Dict]:
@@ -420,7 +424,7 @@ class Fleet:
                 "spd_lvl", "cooling_fan_percent", "big_fan1_percent",
                 "big_fan2_percent", "heatbreak_fan_percent", "door_open",
                 "sdcard", "chamber_light", "wifi_signal", "wifi_wired",
-                "store_to_sdcard", "lights_report", "airduct",
+                "store_to_sdcard", "ipcam_record", "lights_report", "airduct",
                 "tray_now", "tray_tar", "tray_pre", "ams_status",
                 "dry_time", "dry_status", "dry_sf_reason", "drying_unit",
                 "stage_name", "firmware_version", "unit_versions",

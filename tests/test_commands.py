@@ -413,3 +413,65 @@ def test_start_document_carries_the_operator_bed_leveling_choice(
     body = _body(printer)
     assert body["bed_leveling"] is leveling
     assert body["auto_bed_leveling"] == auto_leveling
+
+
+@pytest.mark.parametrize("choice, timelapse", [
+    (True, True),
+    (False, False),
+    (None, False),
+])
+def test_start_document_carries_the_operator_timelapse_choice(choice, timelapse):
+    """3DPF's Start dialog sends on or off. No choice is off, as before."""
+    printer = _printer(model="C12")
+    assert printer.start_print("batch-a.3mf", [0], 1, timelapse=choice) is True
+    body = _body(printer)
+    assert body["timelapse"] is timelapse
+    assert body["bed_leveling"] is False
+    assert body["auto_bed_leveling"] == 2
+
+
+def test_timelapse_and_bed_leveling_choices_travel_together():
+    printer = _printer(model="C12")
+    assert printer.start_print(
+        "batch-a.3mf", [0], 1, bed_leveling=False, timelapse=True,
+    ) is True
+    body = _body(printer)
+    assert body["timelapse"] is True
+    assert body["bed_leveling"] is False
+    assert body["auto_bed_leveling"] == 0
+
+
+def test_project_file_builder_sends_timelapse_only_for_true():
+    from bridge.bambu.commands import build_project_file
+    profile = _printer(model="C12").profile
+    for value, expected in ((True, True), (False, False), (None, False), (1, False), ("true", False)):
+        body = build_project_file("a.3mf", [0], 1, profile, 7, timelapse=value)["print"]
+        assert body["timelapse"] is expected, value
+    assert build_project_file("a.3mf", [0], 1, profile, 7)["print"]["timelapse"] is False
+
+
+def test_camera_record_builder_is_the_ipcam_record_set_document():
+    from bridge.bambu.commands import build_camera_record
+    assert build_camera_record(True) == {"camera": {
+        "sequence_id": "0", "command": "ipcam_record_set", "control": "enable",
+    }}
+    assert build_camera_record(False) == {"camera": {
+        "sequence_id": "0", "command": "ipcam_record_set", "control": "disable",
+    }}
+
+
+@pytest.mark.parametrize("on, control", [(False, "disable"), (True, "enable")])
+def test_camera_record_publishes_the_camera_document_then_pushall(on, control):
+    printer = _printer()
+    assert printer.handle_control("camera_record", {"on": on}) is True
+    assert printer._session.payloads == [
+        {"camera": {"sequence_id": "0", "command": "ipcam_record_set", "control": control}},
+        {"pushing": {"sequence_id": "0", "command": "pushall"}},
+    ]
+
+
+@pytest.mark.parametrize("params", [{}, {"on": None}, {"on": "false"}, {"on": 0}, {"on": 1}])
+def test_camera_record_without_a_boolean_publishes_nothing_and_is_handled(params):
+    printer = _printer()
+    assert printer.handle_control("camera_record", params) is True
+    assert printer._session.payloads == []

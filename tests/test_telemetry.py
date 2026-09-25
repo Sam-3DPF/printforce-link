@@ -262,6 +262,7 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "wifi_signal": None,
         "wifi_wired": None,
         "store_to_sdcard": None,
+        "ipcam_record": None,
         "lights_report": None,
         "airduct": None,
         "tray_now": None,
@@ -690,6 +691,13 @@ def test_delta_does_not_blank_the_last_known_scalars():
     assert snapshot["nozzle_temper"] == 219.5      # would be None without the merge
     assert snapshot["remaining_seconds"] == 1380
     assert snapshot["progress_percent"] == 41      # ...but the delta's own value wins
+
+
+def test_partial_ipcam_delta_keeps_the_record_setting():
+    full = {"print": {"ipcam": {"ipcam_record": "enable", "timelapse": "disable"}}}
+    delta = {"print": {"ipcam": {"timelapse": "enable"}}}
+    merged = merge_status_payload(merge_status_payload(None, full), delta)
+    assert merged["print"]["ipcam"] == {"ipcam_record": "enable", "timelapse": "enable"}
 
 
 def test_delta_without_an_ams_key_keeps_the_last_known_trays():
@@ -1634,6 +1642,7 @@ def test_live_report_fields_and_offline_nulls():
         "sdcard": True,
         "wifi_signal": -90,
         "home_flag": 1 << 11,
+        "ipcam": {"ipcam_record": "enable", "timelapse": "disable"},
         "lights_report": [{"node": "chamber_light", "mode": "on"}],
         "device": {"airduct": {"modeId": 1}},
         "ams": {
@@ -1665,6 +1674,7 @@ def test_live_report_fields_and_offline_nulls():
     assert snapshot["wifi_signal"] == -90
     assert snapshot["wifi_wired"] is True
     assert snapshot["store_to_sdcard"] is True
+    assert snapshot["ipcam_record"] == "enable"
     assert snapshot["lights_report"][0]["node"] == "chamber_light"
     assert snapshot["airduct"] == {"modeId": 1}
     assert snapshot["tray_now"] == 1
@@ -1693,12 +1703,32 @@ def test_live_report_fields_and_offline_nulls():
     assert offline["connection"] == "offline"
     for key in (
         "spd_lvl", "cooling_fan_percent", "door_open", "sdcard", "chamber_light",
-        "wifi_signal", "store_to_sdcard", "lights_report", "airduct", "tray_now",
+        "wifi_signal", "store_to_sdcard", "ipcam_record", "lights_report", "airduct",
+        "tray_now",
         "dry_time", "dry_status", "dry_sf_reason", "drying_unit", "firmware_version",
         "unit_versions", "external_spool", "stage", "stage_name",
     ):
         assert offline[key] is None, key
     assert offline["slots"] is None
+
+
+@pytest.mark.parametrize("ipcam, expected", [
+    ({"ipcam_record": "enable"}, "enable"),
+    ({"ipcam_record": "disable"}, "disable"),
+    ({"ipcam_record": "on"}, None),
+    ({"ipcam_record": True}, None),
+    ({"timelapse": "enable"}, None),
+    ("not-a-dict", None),
+])
+def test_ipcam_record_is_the_printer_word_or_null(ipcam, expected):
+    """Camera Record, as the printer reports it. Anything else is unknown."""
+    snapshot = parse_telemetry({"print": {"gcode_state": "IDLE", "ipcam": ipcam}})
+    assert snapshot["ipcam_record"] == expected
+
+
+def test_a_dump_without_ipcam_reports_ipcam_record_null():
+    assert parse_telemetry({"print": {"gcode_state": "IDLE"}})["ipcam_record"] is None
+    assert parse_telemetry(None)["ipcam_record"] is None
 
 
 def test_stage_sentinels_stay_null_and_zero_stays_zero():

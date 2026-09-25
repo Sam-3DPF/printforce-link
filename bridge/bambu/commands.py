@@ -187,8 +187,12 @@ def bed_leveling_fields(bed_leveling=None):
 
 
 def build_project_file(remote_name, ams_mapping, plate_number, profile, submission_id,
-                       bed_leveling=None) -> dict:
-    """The MQTT document for one start. The caller has already refused a busy state."""
+                       bed_leveling=None, timelapse=None) -> dict:
+    """The MQTT document for one start. The caller has already refused a busy state.
+
+    ``timelapse`` is on only when 3DPF sent True. No choice is off, unlike
+    bed leveling, so every start without the Start dialog stays as before.
+    """
     trays, mapped, use_ams = ams_fields(ams_mapping)
     leveling, auto_leveling = bed_leveling_fields(bed_leveling)
     url = project_file_url(remote_name, profile.start_url_scheme)
@@ -210,7 +214,7 @@ def build_project_file(remote_name, ams_mapping, plate_number, profile, submissi
             "extrude_cali_flag": 2,
             "extrude_cali_manual_mode": 0,
             "layer_inspect": False,
-            "timelapse": False,
+            "timelapse": timelapse is True,
             "cfg": "0",
             "profile_id": "0",
             "nozzle_offset_cali": 0,
@@ -273,6 +277,17 @@ def build_select_extruder(index) -> dict:
             "sequence_id": "0",
             "command": "select_extruder",
             "extruder_index": int(index),
+        },
+    }
+
+
+def build_camera_record(on) -> dict:
+    """``ipcam_record_set``: the camera's Record setting, enable or disable."""
+    return {
+        "camera": {
+            "sequence_id": "0",
+            "command": "ipcam_record_set",
+            "control": "enable" if on else "disable",
         },
     }
 

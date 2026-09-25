@@ -47,6 +47,7 @@ def merge_status_payload(cached: Optional[dict], incoming: Optional[dict]) -> Di
         active tray must not blank RFID colours on trays `tray_exist_bits` still
         marks loaded. A real unload (bit cleared, or no bits and an id-only tray)
         still replaces.
+      * `ipcam` merges key-by-key, so a camera delta keeps `ipcam_record`.
 
     Nothing from `incoming` is ever stored by reference. The report callback runs
     on the MQTT thread, which can keep the dict it just handed us, so caching it
@@ -67,6 +68,10 @@ def merge_status_payload(cached: Optional[dict], incoming: Optional[dict]) -> Di
             if "ams" in incoming_print:
                 previous_ams = previous.get("ams") if isinstance(previous, dict) else None
                 incoming_print["ams"] = merge_ams(previous_ams, incoming_print.get("ams"))
+            previous_ipcam = previous.get("ipcam") if isinstance(previous, dict) else None
+            if isinstance(previous_ipcam, dict) and isinstance(incoming_print.get("ipcam"), dict):
+                # A camera delta that names one field keeps the others, like ipcam_record.
+                incoming_print["ipcam"] = {**previous_ipcam, **incoming_print["ipcam"]}
             print_obj.update(incoming_print)
             merged["print"] = print_obj             # rebuilt, so cached["print"] is untouched
         else:
