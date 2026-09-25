@@ -605,3 +605,38 @@ def test_c11_and_c12_consume_drying_without_publishing(tmp_path):
         assert printer._session.payloads == []
         assert fleet.calls == 1
         assert f"dry-{model}" in applied
+
+
+def test_camera_record_control_reaches_the_printer_once(tmp_path):
+    class _PublishSession:
+        def __init__(self):
+            self.payloads = []
+
+        def publish(self, payload):
+            self.payloads.append(payload)
+            return True
+
+    class _Fleet:
+        def __init__(self, printer):
+            self.printer = printer
+
+        def by_id(self, _bambu_id):
+            return self.printer
+
+        def apply_control(self, bambu_id, action, params=None):
+            return self.printer.handle_control(action, params or {})
+
+    cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P", model="C12")
+    printer = BambuPrinter(cfg)
+    printer._session = _PublishSession()
+    desired = [{"bambu_id": "P1", "control": {
+        "id": "rec-1", "action": "camera_record", "on": False,
+    }}]
+    applied = set()
+    _handle_desired(desired, _Fleet(printer), applied, str(tmp_path))
+    _handle_desired(desired, _Fleet(printer), applied, str(tmp_path))
+    assert printer._session.payloads == [
+        {"camera": {"sequence_id": "0", "command": "ipcam_record_set", "control": "disable"}},
+        {"pushing": {"sequence_id": "0", "command": "pushall"}},
+    ]
+    assert "rec-1" in applied

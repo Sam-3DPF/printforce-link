@@ -1471,3 +1471,71 @@ def test_failure_count_is_dropped_when_3dpf_stops_asking(tmp_path):
     assert failures.record(key, 500.0) is False
     failures.record(other, 100.0)
     assert failures.record(other, 200.0) is True
+
+
+class _TimelapseFleet(_FakeFleet):
+    """A fleet whose start_print takes both operator choices."""
+
+    def __init__(self):
+        super().__init__()
+        self.choices = []
+
+    def start_print(self, bambu_id, remote_name, mapping, plate_index=1,
+                    bed_leveling=None, timelapse=None):
+        self.choices.append((bed_leveling, timelapse))
+        return super().start_print(bambu_id, remote_name, mapping, plate_index)
+
+
+@pytest.mark.parametrize("choice", [True, False])
+def test_cloud_send_passes_the_timelapse_choice_to_the_start(tmp_path, choice):
+    fleet = _TimelapseFleet()
+    desired = _desired_plate(1)
+    desired[0]["send"]["timelapse"] = choice
+    dpf = _FakeDpf(desired=desired)
+    _handle_cloud_sends(desired, fleet, dpf, str(tmp_path), set())
+    assert fleet.choices == [(None, choice)]
+
+
+def test_cloud_send_passes_both_choices_to_the_start(tmp_path):
+    fleet = _TimelapseFleet()
+    desired = _desired_plate(1)
+    desired[0]["send"]["bed_leveling"] = False
+    desired[0]["send"]["timelapse"] = True
+    dpf = _FakeDpf(desired=desired)
+    _handle_cloud_sends(desired, fleet, dpf, str(tmp_path), set())
+    assert fleet.choices == [(False, True)]
+
+
+@pytest.mark.parametrize("value", ["true", 1, None, {"on": True}])
+def test_cloud_send_with_a_non_boolean_timelapse_uses_the_old_start_call(tmp_path, value):
+    """A non-boolean timelapse is no choice. An older fleet still starts."""
+    fleet = _FakeFleet()
+    desired = _desired_plate(1)
+    desired[0]["send"]["timelapse"] = value
+    dpf = _FakeDpf(desired=desired)
+    _handle_cloud_sends(desired, fleet, dpf, str(tmp_path), set())
+    assert len(fleet.starts) == 1
+
+
+def test_mqtt_start_passes_only_the_choices_that_were_made():
+    from bridge.app import _mqtt_start_print
+
+    class _Recorder:
+        def __init__(self):
+            self.kwargs = []
+
+        def start_print(self, bambu_id, remote_name, mapping, plate_index, **kwargs):
+            self.kwargs.append(kwargs)
+            return True
+
+    fleet = _Recorder()
+    _mqtt_start_print(fleet, "P1", "a.3mf", [0], 1)
+    _mqtt_start_print(fleet, "P1", "a.3mf", [0], 1, bed_leveling=True)
+    _mqtt_start_print(fleet, "P1", "a.3mf", [0], 1, timelapse=True)
+    _mqtt_start_print(fleet, "P1", "a.3mf", [0], 1, bed_leveling=False, timelapse=False)
+    assert fleet.kwargs == [
+        {},
+        {"bed_leveling": True},
+        {"timelapse": True},
+        {"bed_leveling": False, "timelapse": False},
+    ]

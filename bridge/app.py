@@ -575,7 +575,8 @@ _CONTROL_ACTIONS = frozenset({
     "gcode_line", "bed_temperature", "nozzle_temperature", "chamber_temperature",
     "print_speed", "fan_speed", "airduct", "home", "move",
     "motors_off", "motors_on", "skip_objects", "select_extruder", "timelapse",
-    "calibration", "chamber_light", "drying", "filament_load", "filament_unload",
+    "calibration", "chamber_light", "camera_record", "drying", "filament_load",
+    "filament_unload",
     "ams_control", "filament_setting", "filament_setting_reset", "extrusion_cali_sel",
     "ignore", "idle_ignore", "clean_print_error",
     "check_assistant", "jump_to_liveview", "cancle",
@@ -1191,6 +1192,7 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 started = _mqtt_start_print(
                     fleet, bambu_id, uploaded or remote_name or os.path.basename(dest),
                     ams_mapping, print_plate, bed_leveling=_send_bed_leveling(fresh_send),
+                    timelapse=_send_timelapse(fresh_send),
                 )
             except Exception:
                 logger.warning(
@@ -1487,6 +1489,7 @@ def _republish_start(send, fleet, bambu_id: str, dest: str, plate_index: int) ->
     return bool(_mqtt_start_print(
         fleet, bambu_id, remote_name or os.path.basename(dest),
         ams_mapping, print_plate, bed_leveling=_send_bed_leveling(send),
+        timelapse=_send_timelapse(send),
     ))
 
 
@@ -1780,22 +1783,34 @@ def _legacy_marker_snapshot_allows_start(snapshot) -> bool:
 
 
 def _mqtt_start_print(fleet, bambu_id, remote_name, ams_mapping, plate_index,
-                      bed_leveling=None):
+                      bed_leveling=None, timelapse=None):
     """Publish the start. IDLE, FINISH, and FAILED need no stop first.
 
-    ``bed_leveling`` is the operator's choice from 3DPF. None keeps the
-    printer's own decision and the call an older fleet understands.
+    ``bed_leveling`` and ``timelapse`` are the operator's choices from 3DPF.
+    Each is passed only when set, so a start with no choice is the call an
+    older fleet understands. None bed leveling keeps the printer's own
+    decision. None timelapse is off.
     """
-    if bed_leveling is None:
-        return fleet.start_print(bambu_id, remote_name, ams_mapping, plate_index)
-    return fleet.start_print(
-        bambu_id, remote_name, ams_mapping, plate_index, bed_leveling=bed_leveling,
-    )
+    choices = {}
+    if bed_leveling is not None:
+        choices["bed_leveling"] = bed_leveling
+    if timelapse is not None:
+        choices["timelapse"] = timelapse
+    return fleet.start_print(bambu_id, remote_name, ams_mapping, plate_index, **choices)
 
 
 def _send_bed_leveling(send):
     """True or False when 3DPF sent the operator's choice. Anything else is None."""
-    value = send.get("bed_leveling") if isinstance(send, dict) else None
+    return _send_choice(send, "bed_leveling")
+
+
+def _send_timelapse(send):
+    """True or False when 3DPF sent the operator's choice. Anything else is None."""
+    return _send_choice(send, "timelapse")
+
+
+def _send_choice(send, key):
+    value = send.get(key) if isinstance(send, dict) else None
     return value if isinstance(value, bool) else None
 
 

@@ -26,6 +26,7 @@ from .bambu.commands import (
     build_airduct,
     build_ams_control,
     build_calibration,
+    build_camera_record,
     build_change_filament,
     build_drying,
     build_extrusion_cali_sel,
@@ -144,7 +145,7 @@ def _default_session_factory(ip, access_code, serial, on_report):
 
 def _mqtt_command_name(payload) -> str:
     if isinstance(payload, dict):
-        for key in ("print", "pushing", "info"):
+        for key in ("print", "pushing", "info", "camera"):
             body = payload.get(key)
             if isinstance(body, dict):
                 command = body.get("command")
@@ -857,7 +858,7 @@ class BambuPrinter:
             logger.debug("printer %s: upload event was not recorded", self.bambu_id)
 
     def start_print(self, remote_name: str, ams_mapping, plate_number: int = 1,
-                    bed_leveling=None) -> bool:
+                    bed_leveling=None, timelapse=None) -> bool:
         """MQTT-start a file already on the printer. A True return is not an ack.
 
         Refused while the last ``gcode_state`` is PREPARE, SLICING, RUNNING,
@@ -877,7 +878,7 @@ class BambuPrinter:
         self._last_submission_id = submission_id
         payload = build_project_file(
             remote_name, ams_mapping, plate_number, self.profile, submission_id,
-            bed_leveling=bed_leveling,
+            bed_leveling=bed_leveling, timelapse=timelapse,
         )
         started = self._publish_command(payload)
         if started:
@@ -928,6 +929,7 @@ class BambuPrinter:
             "timelapse": self.set_timelapse,
             "calibration": self.start_calibration,
             "chamber_light": self.set_chamber_light,
+            "camera_record": self.set_camera_record,
             "drying": self.send_drying,
             "filament_load": self.load_filament,
             "filament_unload": self.unload_filament,
@@ -1055,6 +1057,21 @@ class BambuPrinter:
             if not self._publish_command(payload):
                 published = False
         return published
+
+    def set_camera_record(self, params) -> bool:
+        """Camera Record on or off, then ``pushall`` so ``ipcam_record`` updates.
+
+        ``on`` must be a boolean. Anything else publishes nothing.
+        """
+        on = params.get("on")
+        if not isinstance(on, bool):
+            return True
+        self._require_session()
+        if not self._publish_command(build_camera_record(on)):
+            return False
+        return self._publish_command({
+            "pushing": {"sequence_id": "0", "command": "pushall"},
+        })
 
     def send_drying(self, params) -> bool:
         """Publish drying, except on a P1 profile, which consumes the control id.
@@ -1528,7 +1545,8 @@ class BambuPrinter:
         ``big_fan2_percent``, ``heatbreak_fan_percent``), ``door_open``
         (``stat`` bit 23), ``sdcard``, ``chamber_light``, ``wifi_signal``
         (``-90`` is the wired mark, ``wifi_wired``), ``store_to_sdcard``
-        (``home_flag`` bit 11), ``lights_report``, ``airduct``, ``tray_now``,
+        (``home_flag`` bit 11), ``ipcam_record`` (camera Record, "enable" or
+        "disable"), ``lights_report``, ``airduct``, ``tray_now``,
         ``tray_tar``, ``tray_pre``, ``ams_status``, ``dry_time``,
         ``dry_status``, ``dry_sf_reason``, ``drying_unit``, ``stage_name``,
         ``firmware_version``, ``unit_versions``, and ``external_spool``.
@@ -1996,6 +2014,7 @@ def _report_fields(status, print_obj) -> Dict:
         "wifi_signal": wifi_signal,
         "wifi_wired": None if wifi_signal is None else wifi_signal == -90,
         "store_to_sdcard": _home_flag_bit(print_obj.get("home_flag"), 11),
+        "ipcam_record": _ipcam_record(print_obj.get("ipcam")),
         "lights_report": lights_copy,
         "airduct": airduct,
         "tray_now": _optional_int(ams.get("tray_now")),
@@ -2010,6 +2029,14 @@ def _report_fields(status, print_obj) -> Dict:
         "unit_versions": unit_versions,
         "external_spool": _external_spool(ams),
     }
+
+
+def _ipcam_record(ipcam):
+    """Camera Record from ``ipcam.ipcam_record``: "enable", "disable", or None."""
+    if not isinstance(ipcam, dict):
+        return None
+    value = ipcam.get("ipcam_record")
+    return value if value in ("enable", "disable") else None
 
 
 def _first_present(primary, secondary, key):
