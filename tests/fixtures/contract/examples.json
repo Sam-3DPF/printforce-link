@@ -1,0 +1,551 @@
+{
+  "failed_external_print": {
+    "events": [
+      {
+        "at": "2025-09-16T05:20:00Z",
+        "bambu_id": "01P00C000000001",
+        "batch_id": null,
+        "gcode_file": "/data/Metadata/plate_1.gcode",
+        "id": "event-1",
+        "observed": true,
+        "origin": "external",
+        "plate": null,
+        "progress": 42,
+        "seq": 1,
+        "stage": 0,
+        "submission_id": null,
+        "subtask_name": "Widget",
+        "type": "print_started"
+      },
+      {
+        "at": "2025-09-16T05:20:00Z",
+        "bambu_id": "01P00C000000001",
+        "batch_id": null,
+        "gcode_file": "/data/Metadata/plate_1.gcode",
+        "id": "event-2",
+        "observed": true,
+        "origin": "external",
+        "plate": null,
+        "print_error": "50364420",
+        "progress": 42,
+        "seq": 2,
+        "stage": 0,
+        "submission_id": null,
+        "subtask_name": "Widget",
+        "type": "print_failed"
+      }
+    ],
+    "v2": {
+      "activity": "ended",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": false,
+      "connection": "live",
+      "connection_reason": "ok",
+      "contract": "state_v2",
+      "errors": [
+        {
+          "code": "0300_8004",
+          "detail": "The printer ran out of filament. Load a new reel and resume.",
+          "severity": "SERIOUS",
+          "source": "print_error",
+          "title": "Filament runout"
+        }
+      ],
+      "job": {
+        "file": "/data/Metadata/plate_1.gcode",
+        "layer": 30,
+        "name": "Widget",
+        "outcome": "failed",
+        "plate": 1,
+        "progress": 42,
+        "remaining_s": 3300,
+        "total_layers": 120
+      },
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": null,
+      "raw": {
+        "gcode_state": "FAILED",
+        "print_error": "50364420",
+        "stg_cur": 0
+      },
+      "stage": {
+        "code": null,
+        "label": null
+      },
+      "state_seq": 1,
+      "stuck_job": false
+    }
+  },
+  "finished_link_print": {
+    "events": [
+      {
+        "at": "2025-09-16T05:20:00Z",
+        "bambu_id": "01P00C000000001",
+        "batch_id": "11111111-2222-3333-4444-555555555555",
+        "gcode_file": "/data/Metadata/plate_1.gcode",
+        "id": "event-1",
+        "observed": true,
+        "origin": "link",
+        "plate": 1,
+        "progress": 42,
+        "seq": 1,
+        "stage": 0,
+        "submission_id": "1758000000123",
+        "subtask_name": "Widget",
+        "type": "print_started"
+      },
+      {
+        "at": "2025-09-16T05:20:00Z",
+        "bambu_id": "01P00C000000001",
+        "batch_id": "11111111-2222-3333-4444-555555555555",
+        "gcode_file": "/data/Metadata/plate_1.gcode",
+        "id": "event-2",
+        "observed": true,
+        "origin": "link",
+        "plate": 1,
+        "progress": 100,
+        "seq": 2,
+        "stage": 0,
+        "submission_id": "1758000000123",
+        "subtask_name": "Widget",
+        "type": "print_finished"
+      }
+    ],
+    "v2": {
+      "activity": "ended",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": false,
+      "connection": "live",
+      "connection_reason": "ok",
+      "contract": "state_v2",
+      "errors": [],
+      "job": {
+        "file": "/data/Metadata/plate_1.gcode",
+        "layer": 30,
+        "name": "Widget",
+        "outcome": "finished",
+        "plate": 1,
+        "progress": 100,
+        "remaining_s": 3300,
+        "total_layers": 120
+      },
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": null,
+      "raw": {
+        "gcode_state": "FINISH",
+        "print_error": null,
+        "stg_cur": 255
+      },
+      "stage": {
+        "code": null,
+        "label": null
+      },
+      "state_seq": 1,
+      "stuck_job": false
+    }
+  },
+  "idle": {
+    "events": [],
+    "v2": {
+      "activity": "idle",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": false,
+      "connection": "live",
+      "connection_reason": "ok",
+      "contract": "state_v2",
+      "errors": [],
+      "job": null,
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": null,
+      "raw": {
+        "gcode_state": "IDLE",
+        "print_error": null,
+        "stg_cur": 255
+      },
+      "stage": {
+        "code": null,
+        "label": null
+      },
+      "state_seq": 1,
+      "stuck_job": false
+    }
+  },
+  "offline_wrong_access_code": {
+    "events": [],
+    "v2": {
+      "activity": "unknown",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": null,
+      "connection": "offline",
+      "connection_reason": "auth_rejected",
+      "contract": "state_v2",
+      "errors": [],
+      "job": null,
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": null,
+      "raw": {
+        "gcode_state": null,
+        "print_error": null,
+        "stg_cur": null
+      },
+      "stage": {
+        "code": null,
+        "label": null
+      },
+      "state_seq": 1,
+      "stuck_job": false
+    }
+  },
+  "paused_filament_runout": {
+    "events": [],
+    "v2": {
+      "activity": "paused",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": false,
+      "connection": "live",
+      "connection_reason": "ok",
+      "contract": "state_v2",
+      "errors": [],
+      "job": {
+        "file": "/data/Metadata/plate_1.gcode",
+        "layer": 30,
+        "name": "Widget",
+        "outcome": null,
+        "plate": 1,
+        "progress": 42,
+        "remaining_s": 3300,
+        "total_layers": 120
+      },
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": "filament_runout",
+      "raw": {
+        "gcode_state": "PAUSE",
+        "print_error": null,
+        "stg_cur": 6
+      },
+      "stage": {
+        "code": 6,
+        "label": "Paused: filament ran out"
+      },
+      "state_seq": 1,
+      "stuck_job": false
+    }
+  },
+  "printing": {
+    "events": [
+      {
+        "at": "2025-09-16T05:20:00Z",
+        "bambu_id": "01P00C000000001",
+        "batch_id": "11111111-2222-3333-4444-555555555555",
+        "gcode_file": "/data/Metadata/plate_1.gcode",
+        "id": "event-1",
+        "observed": true,
+        "origin": "link",
+        "plate": 1,
+        "progress": 42,
+        "seq": 1,
+        "stage": 0,
+        "submission_id": "1758000000123",
+        "subtask_name": "Widget",
+        "type": "print_started"
+      }
+    ],
+    "v2": {
+      "activity": "printing",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": false,
+      "connection": "live",
+      "connection_reason": "ok",
+      "contract": "state_v2",
+      "errors": [],
+      "job": {
+        "file": "/data/Metadata/plate_1.gcode",
+        "layer": 30,
+        "name": "Widget",
+        "outcome": null,
+        "plate": 1,
+        "progress": 42,
+        "remaining_s": 3300,
+        "total_layers": 120
+      },
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": null,
+      "raw": {
+        "gcode_state": "RUNNING",
+        "print_error": null,
+        "stg_cur": 0
+      },
+      "stage": {
+        "code": 0,
+        "label": "Printing"
+      },
+      "state_seq": 1,
+      "stuck_job": false
+    }
+  },
+  "stale_while_printing": {
+    "events": [],
+    "v2": {
+      "activity": "printing",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": false,
+      "connection": "stale",
+      "connection_reason": "silent",
+      "contract": "state_v2",
+      "errors": [],
+      "job": {
+        "file": "/data/Metadata/plate_1.gcode",
+        "layer": 30,
+        "name": "Widget",
+        "outcome": null,
+        "plate": 1,
+        "progress": 42,
+        "remaining_s": 3300,
+        "total_layers": 120
+      },
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": null,
+      "raw": {
+        "gcode_state": "RUNNING",
+        "print_error": null,
+        "stg_cur": 0
+      },
+      "stage": {
+        "code": 0,
+        "label": "Printing"
+      },
+      "state_seq": 1,
+      "stuck_job": false
+    }
+  },
+  "stopped_from_3dpf": {
+    "events": [
+      {
+        "at": "2025-09-16T05:20:00Z",
+        "bambu_id": "01P00C000000001",
+        "batch_id": "11111111-2222-3333-4444-555555555555",
+        "gcode_file": "/data/Metadata/plate_1.gcode",
+        "id": "event-1",
+        "observed": true,
+        "origin": "link",
+        "plate": 1,
+        "progress": 42,
+        "seq": 1,
+        "stage": 0,
+        "submission_id": "1758000000123",
+        "subtask_name": "Widget",
+        "type": "print_started"
+      },
+      {
+        "at": "2025-09-16T05:20:00Z",
+        "bambu_id": "01P00C000000001",
+        "batch_id": "11111111-2222-3333-4444-555555555555",
+        "by": "link",
+        "gcode_file": "/data/Metadata/plate_1.gcode",
+        "id": "event-2",
+        "observed": true,
+        "origin": "link",
+        "plate": 1,
+        "progress": 42,
+        "seq": 2,
+        "stage": 0,
+        "submission_id": "1758000000123",
+        "subtask_name": "Widget",
+        "type": "print_cancelled"
+      }
+    ],
+    "v2": {
+      "activity": "ended",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": false,
+      "connection": "live",
+      "connection_reason": "ok",
+      "contract": "state_v2",
+      "errors": [],
+      "job": {
+        "file": "/data/Metadata/plate_1.gcode",
+        "layer": 30,
+        "name": "Widget",
+        "outcome": "cancelled",
+        "plate": 1,
+        "progress": 42,
+        "remaining_s": 3300,
+        "total_layers": 120
+      },
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": null,
+      "raw": {
+        "gcode_state": "FAILED",
+        "print_error": "50348044",
+        "stg_cur": 0
+      },
+      "stage": {
+        "code": null,
+        "label": null
+      },
+      "state_seq": 1,
+      "stuck_job": false
+    }
+  },
+  "stuck_job": {
+    "events": [],
+    "v2": {
+      "activity": "idle",
+      "capabilities": [
+        "pause",
+        "resume",
+        "stop",
+        "light",
+        "fans",
+        "temperatures",
+        "filament_units"
+      ],
+      "commands_rejected": false,
+      "connection": "live",
+      "connection_reason": "ok",
+      "contract": "state_v2",
+      "errors": [],
+      "job": {
+        "file": null,
+        "layer": null,
+        "name": "old",
+        "outcome": null,
+        "plate": null,
+        "progress": 0,
+        "remaining_s": null,
+        "total_layers": null
+      },
+      "model": {
+        "code": "C12",
+        "family": "p1",
+        "known": true,
+        "name": "P1S",
+        "verified": true
+      },
+      "pause_reason": null,
+      "raw": {
+        "gcode_state": "RUNNING",
+        "print_error": null,
+        "stg_cur": null
+      },
+      "stage": {
+        "code": null,
+        "label": null
+      },
+      "state_seq": 1,
+      "stuck_job": true
+    }
+  }
+}
