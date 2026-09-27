@@ -535,7 +535,7 @@ class BambuPrinter:
     def __init__(self, cfg: PrinterConfig, stopwatch: Optional[PrintStopwatch] = None,
                  stale_after_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
                  monotonic=time.monotonic, ams_cache_path: Optional[str] = None,
-                 sleep=time.sleep, session_factory=None, log_path=None):
+                 sleep=time.sleep, session_factory=None, log_path=None, outbox=None):
         self._cfg = cfg
         # IP is a cache, the serial (bambu_id) is the identity. Seeded from config, then
         # updated by reconnect() when SSDP finds the serial at a new address (U1) — so a
@@ -547,6 +547,7 @@ class BambuPrinter:
         # report loop reads a copy; it does not share the MQTT thread's dict.
         self.state = PrinterState(
             cfg.bambu_id, ams_cache_path=ams_cache_path, monotonic=monotonic,
+            outbox=outbox,
         )
         self._stopwatch = stopwatch or PrintStopwatch(cfg.bambu_id)
         self._monotonic = monotonic               # injectable — staleness is otherwise untestable
@@ -906,8 +907,25 @@ class BambuPrinter:
         return self._mqtt_command("resume_print")
 
     def stop_print(self) -> bool:
-        """Publish stop. True is not an ack — confirm via the next gcode_state."""
-        return self._mqtt_command("stop_print")
+        """Publish stop. True is not an ack — confirm via the next gcode_state.
+
+        The print's cancel event says ``by: link`` once the printer stops.
+        """
+        published = self._mqtt_command("stop_print")
+        if published:
+            self.state.note_link_stop("operator")
+        return published
+
+    def clear_stuck_job(self) -> bool:
+        """Stop a cold RUNNING job the firmware still holds, before a start.
+
+        Its cancel event says ``by: link_cleared_stuck_job``: nothing printed,
+        so 3DPF does not treat the plate as used.
+        """
+        published = self._mqtt_command("stop_print")
+        if published:
+            self.state.note_link_stop("stuck_job")
+        return published
 
     def handle_control(self, action: str, params=None) -> bool:
         """Publish one direct command. A purposeful refusal returns True.
@@ -1291,9 +1309,9 @@ class BambuPrinter:
         payload = self.state.view()["payload"] or {}
         return not ams_needs_pushall(payload)
 
-    def register_submission(self, submission_id) -> None:
-        """Remember a Link submission id for origin matching on this printer."""
-        self.state.register_submission(submission_id)
+    def register_submission(self, submission_id, batch_id=None, plate=None) -> None:
+        """Remember a Link submission id (and its batch) for this printer's events."""
+        self.state.register_submission(submission_id, batch_id=batch_id, plate=plate)
 
     def ack_events(self, ids) -> None:
         """Drop lifecycle events included in a report POST the cloud accepted."""

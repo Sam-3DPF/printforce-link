@@ -156,11 +156,20 @@ class LifecycleTracker:
     submission id ``register_submission`` was given.
     """
 
-    def __init__(self, bambu_id: str, wall_clock=None):
+    def __init__(self, bambu_id: str, wall_clock=None, outbox=None):
         self._bambu_id = bambu_id
         self._wall_clock = wall_clock or time.time
+        # With an outbox (bridge/outbox.py) events are on disk and survive a
+        # restart. Without one (unit tests) they live in this list.
+        self._outbox = outbox
         self._events: List[dict] = []
-        self._submissions: Dict[str, None] = {}
+        # submission id -> {"batch_id", "plate"} for prints Link started, so
+        # an event can name its batch without the cloud matching file names.
+        self._submissions: Dict[str, Optional[dict]] = {}
+        # Set when Link publishes stop; a cancel after it is by Link.
+        # "operator" for a Stop someone asked for, "stuck_job" when Link
+        # clears a cold RUNNING job before a start (nothing was printed).
+        self._link_stop: Optional[str] = None
         self._prev_state: Optional[str] = None
         self._active_identity: Optional[str] = None
         self._seen_running = False
@@ -176,14 +185,23 @@ class LifecycleTracker:
         self._seen_running = False
         self._print_origin = None
 
-    def register_submission(self, submission_id) -> None:
+    def register_submission(self, submission_id, batch_id=None, plate=None) -> None:
         token = _id_token(submission_id)
         if token is None:
             return
-        self._submissions.pop(token, None)
-        self._submissions[token] = None
+        previous = self._submissions.pop(token, None)
+        tag = None
+        if batch_id:
+            tag = {"batch_id": str(batch_id), "plate": _plate_int(plate)}
+        elif isinstance(previous, dict):
+            tag = previous
+        self._submissions[token] = tag
         while len(self._submissions) > _MAX_REMEMBERED_SUBMISSIONS:
             self._submissions.pop(next(iter(self._submissions)))
+
+    def note_link_stop(self, reason: str = "operator") -> None:
+        """Link just published stop. The next cancel of this print is Link's."""
+        self._link_stop = reason if reason in ("operator", "stuck_job") else "operator"
 
     def ack(self, ids) -> None:
         """Drop exactly these event ids. Unknown ids are ignored."""
@@ -192,9 +210,14 @@ class LifecycleTracker:
         wanted = {item for item in ids if isinstance(item, str) and item}
         if not wanted:
             return
+        if self._outbox is not None:
+            self._outbox.ack(wanted)
+            return
         self._events = [event for event in self._events if event.get("id") not in wanted]
 
     def copy_events(self) -> List[dict]:
+        if self._outbox is not None:
+            return self._outbox.pending(self._bambu_id)
         return copy.deepcopy(self._events)
 
     @property
@@ -238,7 +261,12 @@ class LifecycleTracker:
         prev = self._prev_state
 
         if new_print:
+            self._link_stop = None
             self._enqueue("print_started", origin, submission_id, print_obj)
+        elif state == "PAUSE" and prev == "RUNNING" and self._active_identity is not None:
+            self._enqueue("print_paused", origin, submission_id, print_obj)
+        elif state == "RUNNING" and prev == "PAUSE" and self._active_identity is not None:
+            self._enqueue("print_resumed", origin, submission_id, print_obj)
         if state == "RUNNING" and _has_file(print_obj) and identity:
             self._active_identity = identity
         if new_print and not frame_includes_hms:
@@ -250,11 +278,23 @@ class LifecycleTracker:
         elif state == "FAILED" and (
             prev in _PREPARE_FAIL_STATES or prev == "RUNNING" or self._seen_running
         ):
-            terminal = "print_cancelled" if user_cancelled else "print_failed"
-        elif state == "IDLE" and prev == "RUNNING":
+            cancelled = user_cancelled or self._link_stop is not None
+            terminal = "print_cancelled" if cancelled else "print_failed"
+        elif state == "IDLE" and prev in ("RUNNING", "PAUSE"):
             terminal = "print_cancelled"
+        elif state == "FINISH" and prev == "PAUSE":
+            terminal = "print_finished"
         if terminal is not None:
-            self._enqueue(terminal, origin, submission_id, print_obj)
+            by = None
+            if terminal == "print_cancelled":
+                if self._link_stop == "stuck_job":
+                    by = "link_cleared_stuck_job"
+                elif self._link_stop:
+                    by = "link"
+                else:
+                    by = "printer" if user_cancelled else "unknown"
+            self._enqueue(terminal, origin, submission_id, print_obj, by=by)
+            self._link_stop = None
             self._active_identity = None
             self._seen_running = False
         elif state == "RUNNING":
@@ -297,14 +337,9 @@ class LifecycleTracker:
                 return "link", token
         return "external", None
 
-    def _enqueue(self, kind, origin, submission_id, print_obj, *, observed=True) -> None:
-        if len(self._events) >= _MAX_LIFECYCLE_EVENTS:
-            dropped = self._events.pop(0)
-            logger.warning(
-                "printer %s: lifecycle queue full; dropping oldest event %s",
-                self._bambu_id, dropped.get("id"),
-            )
-        self._events.append({
+    def _enqueue(self, kind, origin, submission_id, print_obj, *, observed=True, by=None) -> None:
+        tag = self._submissions.get(submission_id) if submission_id else None
+        event = {
             "id": uuid.uuid4().hex,
             "type": kind,
             "submission_id": submission_id,
@@ -313,7 +348,57 @@ class LifecycleTracker:
             "subtask_name": clean_str(print_obj.get("subtask_name")),
             "at": _iso_utc(self._wall_clock()),
             "observed": bool(observed),
-        })
+            # Named only for prints Link started. The cloud never matches files.
+            "batch_id": tag.get("batch_id") if isinstance(tag, dict) else None,
+            "plate": tag.get("plate") if isinstance(tag, dict) else None,
+            "progress": _progress(print_obj),
+            "stage": _stage_code(print_obj),
+        }
+        if by is not None:
+            event["by"] = by
+        if kind in ("print_failed", "print_paused"):
+            event["print_error"] = _norm_error_code(print_obj.get("print_error")) or None
+        if self._outbox is not None:
+            self._outbox.append(self._bambu_id, event)
+            return
+        if len(self._events) >= _MAX_LIFECYCLE_EVENTS:
+            dropped = self._events.pop(0)
+            logger.warning(
+                "printer %s: lifecycle queue full; dropping oldest event %s",
+                self._bambu_id, dropped.get("id"),
+            )
+        self._events.append(event)
+
+
+def _plate_int(value) -> Optional[int]:
+    if isinstance(value, bool):
+        return None
+    try:
+        plate = int(value)
+    except (TypeError, ValueError):
+        return None
+    return plate if plate > 0 else None
+
+
+def _progress(print_obj: dict) -> Optional[int]:
+    value = print_obj.get("mc_percent")
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _stage_code(print_obj: dict) -> Optional[int]:
+    value = print_obj.get("stg_cur")
+    if isinstance(value, bool):
+        return None
+    try:
+        stage = int(value)
+    except (TypeError, ValueError):
+        return None
+    return None if stage in (-1, 255) else stage
 
 
 class PrinterState:
@@ -327,11 +412,11 @@ class PrinterState:
     """
 
     def __init__(self, bambu_id: str, ams_cache_path: Optional[str] = None,
-                 monotonic=None, wall_clock=None):
+                 monotonic=None, wall_clock=None, outbox=None):
         self._bambu_id = bambu_id
         self._ams_cache_path = ams_cache_path
         self._monotonic = monotonic or time.monotonic
-        self._lifecycle = LifecycleTracker(bambu_id, wall_clock=wall_clock)
+        self._lifecycle = LifecycleTracker(bambu_id, wall_clock=wall_clock, outbox=outbox)
         self._lock = threading.Lock()
         self._payload: Optional[Dict] = None
         self._pending_fresh = False
@@ -470,7 +555,12 @@ class PrinterState:
         with self._lock:
             self._lifecycle.emit_recovered(kind, submission_id, _print_obj(self._payload))
 
-    def register_submission(self, submission_id) -> None:
+    def note_link_stop(self, reason: str = "operator") -> None:
+        """Link published stop on this printer."""
+        with self._lock:
+            self._lifecycle.note_link_stop(reason)
+
+    def register_submission(self, submission_id, batch_id=None, plate=None) -> None:
         """Remember a submission id Link sent to this printer.
 
         A later report whose ``subtask_id`` or ``task_id`` equals it is
@@ -478,7 +568,7 @@ class PrinterState:
         path exists; startup registers ids already stored on assignments.
         """
         with self._lock:
-            self._lifecycle.register_submission(submission_id)
+            self._lifecycle.register_submission(submission_id, batch_id=batch_id, plate=plate)
 
     def ack_events(self, ids) -> None:
         """Drop lifecycle events whose report POST was accepted."""
