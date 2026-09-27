@@ -55,7 +55,8 @@ from .bambu.hms_actions import (
 )
 from .bambu.log import PrinterLog
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
-from .bambu.models import ModelProfile, profile_for
+from .bambu.models import ModelProfile, is_known_model, profile_for
+from .state_v2 import build_state_v2
 from .bambu.session import LinkSession
 from .bambu.hms import (
     commands_rejected as hms_commands_rejected,
@@ -77,6 +78,11 @@ from .config import PrinterConfig
 from .bambu import ftps
 
 logger = logging.getLogger(__name__)
+
+# ``state_seq`` on every v2 report. Seeded from wall-clock milliseconds so a
+# restarted Link keeps counting up; the cloud drops a report older than the
+# one it already stored for that printer.
+_STATE_SEQ = [int(time.time() * 1000)]
 
 # Bambu gcode_state -> the Printer.status vocabulary 3DPF accepts
 # (IDLE / PRINTING / PAUSED / NEEDS_CLEARING / ERROR / OFFLINE).
@@ -1078,13 +1084,10 @@ class BambuPrinter:
     def send_drying(self, params) -> bool:
         """Publish drying, except on a P1 profile, which consumes the control id.
 
-        C11, C12, and every code that still uses the P1 profile publish nothing.
+        Only a profile with ``publishes_drying`` publishes. None does yet, so
+        every model consumes the control id without publishing, as before.
         """
-        code = ""
-        model = getattr(self._cfg, "model", None)
-        if isinstance(model, str):
-            code = model.strip().upper()
-        if self.profile.family == "p1" or code in {"C11", "C12"}:
+        if not self.profile.publishes_drying:
             logger.info(
                 "printer %s: drying is not published on this model", self.bambu_id,
             )
@@ -1861,6 +1864,7 @@ class BambuPrinter:
         }
         report.update(self._lifecycle_fields(view, connection="live"))
         report.update(self._contract_fields(view, "live"))
+        report["v2"] = self._state_v2(payload, "live", view)
         return report
 
     def _stale_snapshot(self, view: Dict) -> Dict:
@@ -1887,6 +1891,7 @@ class BambuPrinter:
         }
         report.update(self._lifecycle_fields(view, connection="stale"))
         report.update(self._contract_fields(view, "stale"))
+        report["v2"] = self._state_v2(payload, "stale", view)
         return report
 
     def _offline_snapshot(self, view: Optional[Dict] = None) -> Dict:
@@ -1920,7 +1925,33 @@ class BambuPrinter:
         }
         report.update(self._lifecycle_fields(view, connection="offline"))
         report.update(self._contract_fields(view, "offline"))
+        report["v2"] = self._state_v2(None, "offline", view)
         return report
+
+    def _state_v2(self, payload, connection: str, view: Optional[Dict] = None) -> Dict:
+        """This printer's v2 state (``bridge/state_v2.py``). Never raises.
+
+        An offline report carries no reading, so it is built from no payload.
+        """
+        model = getattr(self._cfg, "model", None)
+        _STATE_SEQ[0] += 1
+        try:
+            return build_state_v2(
+                payload if connection != "offline" else None,
+                connection=connection,
+                down_reason=None if connection == "live" else self.down_reason,
+                profile=self.profile,
+                model_code=model if isinstance(model, str) else None,
+                known_model=is_known_model(model),
+                user_cancelled=bool((view or {}).get("user_cancelled")),
+                state_seq=_STATE_SEQ[0],
+            )
+        except Exception:
+            logger.exception("printer %s: building state v2 raised — this is a BRIDGE BUG",
+                             self.bambu_id)
+            return {"contract": "state_v2", "state_seq": _STATE_SEQ[0],
+                    "connection": "offline", "connection_reason": "no_data",
+                    "activity": "unknown"}
 
     def _is_connected(self) -> bool:
         """Is the MQTT session to this printer actually up?
