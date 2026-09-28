@@ -96,8 +96,10 @@ again. Applying is idempotent on `id`.
 | `idle` / `ended` | IDLE | — |
 
 - **Free for the next file:** `connection=live`, `activity` in {`idle`, `ended`},
-  `commands_rejected` not true, plate flag clear, no auto-queue hold, queue enabled.
-  (`stuck_job` is fine: Link clears it.)
+  `commands_rejected` not true, no `FATAL` entry in `errors`, plate flag clear,
+  no auto-queue hold, queue enabled. (`stuck_job` is fine: Link clears it.)
+  Clear failure always releases the hold; a printer that still reports a
+  `FATAL` alarm stays out of the queue until the alarm goes away.
 - **Never:** send a Stop Link did not get from an operator; gate Link on a guessed
   status; keep its own copy of Bambu codes.
 
