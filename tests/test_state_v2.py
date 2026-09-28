@@ -205,7 +205,7 @@ def test_errors_are_real_faults_with_titles():
 def test_an_unknown_error_code_keeps_its_code_and_a_generic_title():
     v2 = _v2({"gcode_state": "PAUSE", "print_error": 0x0C00_C001})
     assert v2["errors"][0]["code"] == "0C00_C001"
-    assert v2["errors"][0]["title"] == "Printer error"
+    assert v2["errors"][0]["title"] == "Printer alarm"
 
 
 def test_commands_rejected_is_reported():
@@ -263,3 +263,31 @@ def test_malformed_values_do_not_raise():
     v2 = _v2({"gcode_state": 5, "mc_percent": "x", "stg_cur": [1], "hms": "junk",
               "nozzle_target_temper": {}, "subtask_name": 9})
     assert v2["activity"] == "unknown"
+
+
+# --- shop readings, 2026-09-28 (first day on v0.1.36) ------------------------
+
+def test_p1s8_paused_on_an_ams_alarm_says_ams():
+    v2 = _v2({"gcode_state": "PAUSE", "stg_cur": 2, "mc_percent": 2, "subtask_name": "W",
+              "hms": [{"attr": 0x07007000, "code": 0x00020008}]})
+    assert v2["activity"] == "paused"
+    assert v2["pause_reason"] == "ams"
+    assert v2["errors"][0]["code"] == "0700_7000_0002_0008"
+    assert v2["errors"][0]["title"] == "AMS alarm"
+
+
+def test_p1s10_idle_keeps_no_leftover_stage():
+    v2 = _v2({"gcode_state": "IDLE", "stg_cur": 1, "mc_percent": 0})
+    assert v2["activity"] == "idle"
+    assert v2["stage"] == {"code": None, "label": None}
+
+
+def test_p1s3_ended_keeps_no_leftover_stage():
+    v2 = _v2({"gcode_state": "FAILED", "stg_cur": 2, "mc_percent": 0})
+    assert v2["activity"] == "ended"
+    assert v2["stage"] == {"code": None, "label": None}
+
+
+def test_a_stage_during_a_job_is_kept():
+    v2 = _v2({"gcode_state": "PAUSE", "stg_cur": 16, "mc_percent": 40, "subtask_name": "W"})
+    assert v2["stage"] == {"code": 16, "label": "Paused by user"}

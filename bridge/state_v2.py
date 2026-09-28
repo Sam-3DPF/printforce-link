@@ -245,8 +245,12 @@ def _stage(value, profile: ModelProfile) -> Optional[int]:
 def _stage_obj(stage: Optional[int], activity: str) -> Dict:
     if stage is None:
         return {"code": None, "label": None}
-    # A1/P1 report 0 ("printing") while idle; only trust stage 0 mid-job.
-    if stage == 0 and activity not in ("printing", "paused"):
+    # A stage is only meaningful during a job. Idle and ended printers keep the
+    # last stage number (shop P1S-10 idle at stg 1, P1S-3 ended at stg 2), and
+    # A1/P1 report 0 ("printing") while idle.
+    if activity not in ("preparing", "printing", "paused"):
+        return {"code": None, "label": None}
+    if stage == 0 and activity == "preparing":
         return {"code": None, "label": None}
     label = STAGE_LABELS.get(stage)
     if label is None and activity in ("preparing", "printing", "paused"):
@@ -257,9 +261,22 @@ def _stage_obj(stage: Optional[int], activity: str) -> Dict:
 def _pause_reason(stage: Optional[int], errors: List[Dict]) -> str:
     if stage in _PAUSE_REASONS:
         return _PAUSE_REASONS[stage]
+    if any(_is_ams_code(e.get("code")) for e in errors):
+        return "ams"
     if errors:
         return "error"
     return "unknown"
+
+
+# HMS codes start with the module that raised them. 07xx is the AMS
+# (shop P1S-8 paused on 0700_7000_0002_0008).
+def _is_ams_code(code) -> bool:
+    return isinstance(code, str) and code.replace("_", "").upper().startswith("07")
+
+
+def _fallback_title(code) -> str:
+    """Title for a code our wording table does not know yet. The code stays beside it."""
+    return "AMS alarm" if _is_ams_code(code) else "Printer alarm"
 
 
 def _job(print_obj: Dict, activity: str, user_cancelled: bool) -> Optional[Dict]:
@@ -316,7 +333,7 @@ def _errors(print_obj: Dict) -> List[Dict]:
         out.append({
             "code": code,
             "severity": fault.get("severity"),
-            "title": copy.get("title") or "Printer error",
+            "title": copy.get("title") or _fallback_title(code),
             "detail": copy.get("detail"),
             "source": "hms",
         })
@@ -326,7 +343,7 @@ def _errors(print_obj: Dict) -> List[Dict]:
         out.append({
             "code": pe[:4] + "_" + pe[4:] if len(pe) == 8 else pe,
             "severity": "SERIOUS",
-            "title": copy.get("title") or "Printer error",
+            "title": copy.get("title") or _fallback_title(pe),
             "detail": copy.get("detail"),
             "source": "print_error",
         })
