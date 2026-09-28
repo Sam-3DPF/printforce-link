@@ -172,6 +172,10 @@ class LifecycleTracker:
         self._link_stop: Optional[str] = None
         self._prev_state: Optional[str] = None
         self._active_identity: Optional[str] = None
+        # The Link submission the open print was matched to. A P1 often drops
+        # or changes subtask_id by FINISH, which made the finish "external"
+        # with no batch (shop P1S-8 / P1S-9, 2026-09-28). The open print keeps it.
+        self._active_submission: Optional[str] = None
         self._seen_running = False
         self._print_origin: Optional[str] = None
 
@@ -257,6 +261,13 @@ class LifecycleTracker:
         identity = _print_identity(print_obj)
         new_print = self._is_new_print(print_obj)
         origin, submission_id = self._classify(print_obj)
+        if new_print:
+            self._active_submission = submission_id
+        elif submission_id is not None and state in ("RUNNING", "PAUSE"):
+            self._active_submission = submission_id
+        elif submission_id is None and self._active_submission is not None:
+            # Same print, frame no longer names it: keep Link's match.
+            origin, submission_id = "link", self._active_submission
         self._print_origin = None if state == "IDLE" else origin
         prev = self._prev_state
 
@@ -296,12 +307,14 @@ class LifecycleTracker:
             self._enqueue(terminal, origin, submission_id, print_obj, by=by)
             self._link_stop = None
             self._active_identity = None
+            self._active_submission = None
             self._seen_running = False
         elif state == "RUNNING":
             self._seen_running = True
         elif state in ("IDLE", "FINISH", "FAILED"):
             # A standing terminal or idle machine has no print open.
             self._active_identity = None
+            self._active_submission = None
 
         self._prev_state = state
 
