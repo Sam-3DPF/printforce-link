@@ -47,6 +47,7 @@ from .send_pipeline import (
     uploaded_already,
 )
 from .store import PrinterStore
+from .pacer import ReportPacer
 from .updater import SelfUpdater, default_state_path
 
 logger = logging.getLogger(__name__)
@@ -416,6 +417,9 @@ def main(config_path: str = "config.toml") -> None:
     # Print lifecycle events live on disk until 3DPF says it applied them.
     outbox = EventOutbox(os.path.join(config_dir, "events.json"))
 
+    # A printer whose card-visible state moves wakes the report loop early (U10).
+    pacer = ReportPacer(cfg.state_interval_seconds)
+
     def make_printer(printer_cfg, stale_after_seconds=None):
         kwargs = {
             "ams_cache_path": ams_cache_path,
@@ -424,7 +428,9 @@ def main(config_path: str = "config.toml") -> None:
         }
         if stale_after_seconds is not None:
             kwargs["stale_after_seconds"] = stale_after_seconds
-        return BambuPrinter(printer_cfg, **kwargs)
+        printer = BambuPrinter(printer_cfg, **kwargs)
+        printer.set_change_listener(pacer.poke)
+        return printer
 
     fleet = Fleet(
         printer_configs,
@@ -476,11 +482,35 @@ def main(config_path: str = "config.toml") -> None:
     send_setup_failures = _SendSetupFailures()
     spool_dir = cfg.printhost.spool_dir if cfg.printhost else "/tmp/printforce-spool"
     os.makedirs(spool_dir, exist_ok=True)
-    logger.info("Reporting every %ss; heartbeat every %ss; a printer that says nothing "
-                "new for %ss is reported OFFLINE",
+    # LAN upkeep runs on its own thread so an SSDP scan or a slow config GET
+    # never holds back a state report (U9).
+    upkeep = _Upkeep(cfg.state_interval_seconds, [
+        # Pull any newly-couriered printer config (a printer added in the web
+        # wizard), store it, and add it to the running fleet without a restart
+        # (U4). Throttled.
+        ("config reconcile", reconciler.tick),
+        # Report the printers seen on the LAN so the onboarding wizard can list
+        # them (U11). Scans once at startup then goes quiet; scan_requested
+        # reopens one bounded on-demand burst (U7). Throttled; code-free.
+        ("discovery report", lambda: discovery_reporter.tick(
+            scan_requested=upkeep.scan_requested, probe_ips=fleet.known_ips(),
+        )),
+        # Self-heal any printer that dropped off the network — re-discover it by
+        # serial and reconnect at its new IP if DHCP moved it (U1). Throttled and
+        # only when something is actually offline. A client that already had a
+        # session and has been silent for minutes is rebuilt in place when its
+        # port still accepts TCP.
+        ("reconnect offline printers", fleet.reconcile_connections),
+        ("recover dead sessions", fleet.recover_dead_sessions),
+    ])
+    upkeep.start()
+    logger.info("Reporting every %ss, and within about 1s of a printer changing; "
+                "heartbeat every %ss; a printer that says nothing new for %ss is "
+                "reported OFFLINE",
                 cfg.state_interval_seconds, cfg.heartbeat_interval_seconds,
                 cfg.stale_after_seconds)
     while True:
+        pass_started = time.monotonic()
         arm_report_loop_dump()
         # The updater downloads concurrently, but its final swap/restart must wait until
         # this iteration has finished every irreversible printer action and durable marker.
@@ -518,8 +548,11 @@ def main(config_path: str = "config.toml") -> None:
             # scan_requested (U7): true for a short TTL after the operator's "Add Printer"
             # click (U8) POSTs /api/bridge/scan. Drives discovery_reporter.tick() below —
             # the bridge scans once at startup, then goes quiet, then reopens exactly one
-            # bounded burst per request instead of scanning forever.
-            scan_requested = bool(response.get("scan_requested")) if isinstance(response, dict) else False
+            # bounded burst per request instead of scanning forever. The upkeep
+            # thread reads it on its next tick.
+            upkeep.set_scan_requested(
+                bool(response.get("scan_requested")) if isinstance(response, dict) else False
+            )
             _apply_desired(
                 desired or [], fleet, dpf, spool_dir, started_sends, applied_controls,
                 router=router, legacy_marker_readiness=legacy_marker_readiness,
@@ -550,26 +583,6 @@ def main(config_path: str = "config.toml") -> None:
             if dispatcher is not None:
                 dispatcher.drain(reports, desired or [])
 
-            # Pull any newly-couriered printer config (a printer added in the web wizard),
-            # store it, and add it to the running fleet without a restart (U4). Throttled.
-            reconciler.tick()
-
-            # Report the printers seen on the LAN so the onboarding wizard can list them
-            # (U11). Scans once at startup then goes quiet; scan_requested reopens one
-            # bounded on-demand burst (U7). Throttled; code-free.
-            discovery_reporter.tick(
-                scan_requested=scan_requested, probe_ips=fleet.known_ips(),
-            )
-
-            # Self-heal any printer that dropped off the network — re-discover it by
-            # serial and reconnect at its new IP if DHCP moved it (U1). Throttled and only
-            # when something is actually offline, so a healthy farm pays nothing.
-            # A client that already had a session and has been silent for minutes is
-            # rebuilt in place when its port still accepts TCP. That does not wait
-            # for SSDP and does not replace the printer object.
-            fleet.reconcile_connections()
-            fleet.recover_dead_sessions()
-
             now = time.monotonic()
             if now - last_heartbeat >= cfg.heartbeat_interval_seconds:
                 heartbeat = dpf.heartbeat(link=updater.metadata())
@@ -598,7 +611,52 @@ def main(config_path: str = "config.toml") -> None:
         finally:
             update_restart_lock.release()
 
-        time.sleep(cfg.state_interval_seconds)
+        # Up to state_interval_seconds, or about 1s after a printer changes.
+        pacer.wait(pass_started)
+
+
+class _Upkeep:
+    """LAN upkeep on its own daemon thread (plan U9).
+
+    Rediscovery, reconnects, config pulls and the discovery report each can
+    wait seconds on the network. On the report loop that wait delayed every
+    printer's state; here it delays only the next upkeep tick. Each step is
+    throttled on its own and never raises out of ``run_once``.
+    """
+
+    def __init__(self, interval_seconds, steps):
+        self._interval = float(interval_seconds)
+        self._steps = list(steps)
+        self._wake = threading.Event()
+        # Written by the report loop from the latest desired-state response.
+        self.scan_requested = False
+        self._thread = None
+
+    def set_scan_requested(self, requested: bool) -> None:
+        """An "Add Printer" click starts its scan now, not on the next tick."""
+        was = self.scan_requested
+        self.scan_requested = bool(requested)
+        if self.scan_requested and not was:
+            self._wake.set()
+
+    def run_once(self) -> None:
+        for name, step in self._steps:
+            try:
+                step()
+            except Exception:
+                logger.exception("upkeep step %r failed; continuing", name)
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(target=self._run, name="link-upkeep", daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            self.run_once()
+            self._wake.wait(self._interval)
+            self._wake.clear()
 
 
 _CONTROL_ACTIONS = frozenset({
