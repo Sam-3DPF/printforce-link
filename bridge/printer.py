@@ -10,6 +10,7 @@ without a printer.
 import copy
 import logging
 import os
+import re
 import threading
 import time
 from typing import Dict, Optional, Tuple
@@ -2086,7 +2087,7 @@ def _report_fields(status, print_obj) -> Dict:
     if isinstance(device, dict) and "airduct" in device:
         airduct = copy.deepcopy(device.get("airduct"))
     wifi = _first_present(print_obj, status, "wifi_signal")
-    wifi_signal = _numeric(wifi)
+    wifi_signal = _dbm(wifi)
     dry_time, dry_status, dry_sf_reason, drying_unit = _drying_fields(print_obj, ams)
     info = status.get("info") if isinstance(status.get("info"), dict) else {}
     firmware_version, unit_versions = _module_versions(info.get("module"))
@@ -2139,6 +2140,14 @@ def _optional_int(value):
     if isinstance(value, bool) or value is None:
         return None
     return as_int(value, None)
+
+
+def _dbm(value):
+    """Bambu reports Wi-Fi strength as text ("-52dBm"); plain numbers still work."""
+    if isinstance(value, str):
+        match = re.match(r"\s*(-?\d+)", value)
+        return int(match.group(1)) if match else None
+    return _numeric(value)
 
 
 def _numeric(value):

@@ -1315,13 +1315,17 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                 except UploadCancelled:
                     raise
                 except Exception as exc:
+                    kind = getattr(exc, "kind", None)
                     logger.warning(
                         "cloud send %s: upload to %s failed (%s)",
-                        batch_id, bambu_id, getattr(exc, "kind", None) or type(exc).__name__,
+                        batch_id, bambu_id, kind or type(exc).__name__,
                     )
+                    # The kind (timeout, network, storage, …) tells the operator
+                    # whether to look at Wi-Fi or at the SD card.
                     _count_setup_failure(
                         key, setup_failures, wall_time, dpf, spool_dir,
-                        started_sends, router, "upload_failed",
+                        started_sends, router,
+                        f"upload_failed; {kind}" if isinstance(kind, str) else "upload_failed",
                     )
                     continue
                 mark_uploaded(started_path)

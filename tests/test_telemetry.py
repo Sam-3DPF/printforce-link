@@ -1758,3 +1758,14 @@ def test_vir_slot_is_the_external_spool_and_not_a_slot_row():
     snapshot = _printer([payload]).snapshot()
     assert snapshot["external_spool"]["id"] == "255"
     assert snapshot["slots"] == []
+
+
+def test_wifi_signal_text_from_the_printer_is_read_as_dbm():
+    """Bambu sends "-52dBm". It used to be dropped, so no card showed Wi-Fi."""
+    from bridge.printer import _dbm
+    assert _dbm("-52dBm") == -52
+    assert _dbm(" -71dBm ") == -71
+    assert _dbm(-90) == -90
+    assert _dbm("dBm") is None
+    assert _dbm(None) is None
+    assert parse_telemetry({"print": {"wifi_signal": "-64dBm"}})["wifi_signal"] == -64
