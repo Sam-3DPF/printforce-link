@@ -232,8 +232,16 @@ _FULL_PAYLOAD = {"print": {
 def test_snapshot_is_the_full_flat_wire_contract():
     """The whole report, pinned. The telemetry is FLAT on the report, not nested: that
     is what the cloud's ingest_printer_state reads (`{bambu_id, status, slots, plus the
-    telemetry fields}`) — nesting it would silently persist a row of NULLs."""
-    assert _printer([_FULL_PAYLOAD]).snapshot() == {
+    telemetry fields}`) — nesting it would silently persist a row of NULLs.
+
+    ``v2`` is the one nested object: the state v2 contract, pinned in
+    tests/test_state_v2.py. Every flat field stays exactly as before."""
+    report = _printer([_FULL_PAYLOAD]).snapshot()
+    v2 = report.pop("v2")
+    assert v2["contract"] == "state_v2"
+    assert v2["activity"] == "printing"
+    assert v2["connection"] == "live"
+    assert report == {
         "bambu_id": _BAMBU_ID,
         "status": "PRINTING",
         "slots": [{"slot_number": 1, "color_hex": "FF6A13FF", "filament_type": "PLA"}],

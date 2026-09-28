@@ -467,7 +467,8 @@ class Fleet:
             printers = list(self._printers)
         return [printer.snapshot() for printer in printers]
 
-    def register_submission(self, bambu_id: str, submission_id) -> None:
+    def register_submission(self, bambu_id: str, submission_id, batch_id=None,
+                            plate=None) -> None:
         """Teach one printer a submission id Link already sent it.
 
         Unknown serials are ignored. The printer may not be in the fleet yet
@@ -478,6 +479,12 @@ class Fleet:
             return
         register = getattr(printer, "register_submission", None)
         if callable(register):
+            if batch_id:
+                try:
+                    register(submission_id, batch_id=batch_id, plate=plate)
+                    return
+                except TypeError:
+                    pass  # a stand-in printer without batch tagging
             register(submission_id)
 
     def emit_recovered_event(self, bambu_id: str, kind, submission_id) -> None:

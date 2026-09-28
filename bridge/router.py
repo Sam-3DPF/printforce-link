@@ -227,7 +227,10 @@ class Router:
             self._persist_assignments()
             registrar = self._submission_registrar
         if sid and registrar is not None:
-            registrar(bambu_id, sid)
+            try:
+                registrar(bambu_id, sid, batch_id=batch_id, plate=plate_number)
+            except TypeError:
+                registrar(bambu_id, sid)  # a registrar without batch tagging
 
     def update_send_attempt(self, bambu_id: str, **fields) -> None:
         """Record the send watchdog beside this printer's assignment.

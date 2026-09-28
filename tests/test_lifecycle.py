@@ -469,7 +469,11 @@ def test_pause_and_resume_is_one_print():
     state.ingest(_doc("PAUSE", gcode_file="plate.gcode"))
     state.ingest(_doc("RUNNING", gcode_file="plate.gcode"))
     state.ingest(_doc("FINISH", gcode_file="plate.gcode"))
-    assert _types(state.pending_events()) == ["print_started", "print_finished"]
+    # One print: one start and one finish. The pause and the resume are
+    # reported as moments inside it, not as a new print.
+    assert _types(state.pending_events()) == [
+        "print_started", "print_paused", "print_resumed", "print_finished",
+    ]
 
 
 def test_a_finish_repeated_in_the_same_session_emits_once():

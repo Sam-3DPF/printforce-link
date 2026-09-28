@@ -24,6 +24,7 @@ from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
 from .fleet import Fleet
+from .outbox import EventOutbox
 from .printer import BambuPrinter
 from .pairing import ensure_paired, maybe_repair
 from .reconciler import ConfigReconciler
@@ -295,15 +296,37 @@ class _OfflineDiagnosticTrigger:
 
 
 def _ack_reported_events(fleet, response, reports) -> None:
-    """Drop lifecycle events only after ``report_state`` accepts the POST.
+    """Drop lifecycle events only after 3DPF has them.
 
-    A failed POST returns an empty dict. The same event ids go out on the
-    next pass. Acking before the accept would lose the edge.
+    A 3DPF that applies events answers ``events_acked``: the ids it stored.
+    Only those are dropped; anything else is sent again next pass. An older
+    3DPF that does not answer the key gets the previous rule: an accepted
+    POST acks every event it carried. A failed POST returns an empty dict and
+    acks nothing.
     """
     if not isinstance(response, dict) or not response:
         return
     ack = getattr(fleet, "ack_events", None)
     if not callable(ack):
+        return
+    applied = response.get("events_acked")
+    if isinstance(applied, list):
+        wanted = {item for item in applied if isinstance(item, str) and item}
+        by_printer = {}
+        for report in reports or []:
+            if not isinstance(report, dict) or not report.get("bambu_id"):
+                continue
+            events = report.get("events")
+            if not isinstance(events, list):
+                continue
+            ids = [
+                e.get("id") for e in events
+                if isinstance(e, dict) and e.get("id") in wanted
+            ]
+            if ids:
+                by_printer[report["bambu_id"]] = ids
+        if by_printer:
+            ack(by_printer)
         return
     by_printer = {}
     for report in reports or []:
@@ -349,7 +372,11 @@ def _register_persisted_submissions(fleet, router) -> None:
             continue
         submission_id = assignment.get("submission_id")
         if submission_id:
-            register(bambu_id, submission_id)
+            try:
+                register(bambu_id, submission_id, batch_id=assignment.get("batch_id"),
+                         plate=assignment.get("plate_number"))
+            except TypeError:
+                register(bambu_id, submission_id)
 
 
 def main(config_path: str = "config.toml") -> None:
@@ -386,10 +413,14 @@ def main(config_path: str = "config.toml") -> None:
     log_dir = os.path.join(config_dir, "logs")
     os.makedirs(log_dir, exist_ok=True)
 
+    # Print lifecycle events live on disk until 3DPF says it applied them.
+    outbox = EventOutbox(os.path.join(config_dir, "events.json"))
+
     def make_printer(printer_cfg, stale_after_seconds=None):
         kwargs = {
             "ams_cache_path": ams_cache_path,
             "log_path": _printer_log_path(log_dir, printer_cfg.bambu_id),
+            "outbox": outbox,
         }
         if stale_after_seconds is not None:
             kwargs["stale_after_seconds"] = stale_after_seconds
@@ -1091,6 +1122,12 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
         if str(row.get("desired_status") or "IDLE") != "IDLE":
             continue
         snapshot = _live_snapshot(fleet, str(bambu_id))
+        if _snapshot_stuck_job(snapshot):
+            # The firmware holds a cold RUNNING job and refuses project_file.
+            # Link clears it itself (3DPF no longer sends that stop) and the
+            # start goes ahead on a later pass once the printer is IDLE.
+            _clear_stuck_job(fleet, str(bambu_id), batch_id)
+            continue
         if not ready_for_upload(snapshot):
             logger.warning(
                 "cloud send %s: printer %s is not idle and live; not uploading",
@@ -1733,6 +1770,41 @@ def _mapping_from_live_slots(required, live):
             return None
         mapping[filament_id - 1] = trays[0]
     return _validate_sparse_ams_mapping(mapping, required)
+
+
+# bambu_id -> monotonic time of the last stuck-job stop. One stop per 30 s.
+_STUCK_JOB_STOPS = {}
+_STUCK_JOB_STOP_COOLDOWN_SECONDS = 30.0
+
+
+def _snapshot_stuck_job(snapshot) -> bool:
+    v2 = snapshot.get("v2") if isinstance(snapshot, dict) else None
+    return (
+        isinstance(v2, dict)
+        and v2.get("stuck_job") is True
+        and v2.get("connection") == "live"
+    )
+
+
+def _clear_stuck_job(fleet, bambu_id: str, batch_id, monotonic=time.monotonic) -> bool:
+    now = monotonic()
+    last = _STUCK_JOB_STOPS.get(bambu_id)
+    if last is not None and now - last < _STUCK_JOB_STOP_COOLDOWN_SECONDS:
+        return False
+    by_id = getattr(fleet, "by_id", None)
+    printer = by_id(bambu_id) if callable(by_id) else None
+    clear = getattr(printer, "clear_stuck_job", None)
+    if not callable(clear):
+        return False
+    _STUCK_JOB_STOPS[bambu_id] = now
+    try:
+        published = bool(clear())
+    except Exception:
+        logger.exception("cloud send %s: could not clear the stuck job on %s", batch_id, bambu_id)
+        return False
+    logger.info("cloud send %s: printer %s holds a stuck job; stop %s",
+                batch_id, bambu_id, "published" if published else "not published")
+    return published
 
 
 def _live_snapshot(fleet, bambu_id: str):
