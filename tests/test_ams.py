@@ -718,3 +718,46 @@ def test_a_new_tray_color_replaces_a_stale_cols_spelling():
 
     assert "cols" not in merged["ams"][0]["tray"][0]
     assert parse_ams({"print": {"ams": merged}})[0]["color_hex"] is None
+
+
+# --- spool facts on the slot contract (plan 2026-09-28-001 U4) -------------------
+
+def test_a_tagless_spool_reports_a_null_spool_uid():
+    status = {"print": {"ams": {"tray_exist_bits": "1", "ams": [{"id": "0", "tray": [
+        {"id": "0", "tray_color": "FF0000FF", "tray_type": "PLA",
+         "tag_uid": "0" * 16, "tray_uuid": "0" * 32, "tray_info_idx": "GFL99", "tray_sub_brands": ""},
+    ]}]}}}
+
+    slot = parse_ams(status)[0]
+    assert slot["spool_uid"] is None
+    assert slot["filament_id"] == "GFL99"
+    assert slot["filament_name"] is None
+
+
+def test_tag_uid_stands_in_when_tray_uuid_is_zero():
+    status = {"print": {"ams": {"tray_exist_bits": "1", "ams": [{"id": "0", "tray": [
+        {"id": "0", "tray_color": "FF0000FF", "tray_type": "PLA",
+         "tag_uid": "B9C9DAFB00000100", "tray_uuid": "0" * 32},
+    ]}]}}}
+
+    assert parse_ams(status)[0]["spool_uid"] == "B9C9DAFB00000100"
+
+
+def test_an_empty_tray_sends_no_spool_facts():
+    status = {"print": {"ams": {"tray_exist_bits": "0", "ams": [{"id": "0", "tray": [
+        {"id": "0", "tray_color": "FF0000FF", "tray_type": "PLA", "tray_uuid": "A" * 32},
+    ]}]}}}
+
+    assert parse_ams(status) == [{"slot_number": 1, "color_hex": None, "filament_type": None}]
+
+
+def test_spool_fact_text_is_bounded():
+    status = {"print": {"ams": {"tray_exist_bits": "1", "ams": [{"id": "0", "tray": [
+        {"id": "0", "tray_color": "FF0000FF", "tray_type": "PLA",
+         "tray_sub_brands": "x" * 200, "tray_info_idx": "y" * 200, "tray_uuid": "Z" * 200},
+    ]}]}}}
+
+    slot = parse_ams(status)[0]
+    assert len(slot["filament_name"]) == 64
+    assert len(slot["filament_id"]) == 32
+    assert len(slot["spool_uid"]) == 64

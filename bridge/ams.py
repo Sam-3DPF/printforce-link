@@ -216,20 +216,48 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
                 remaining = remain_percent(tray.get("remain"))
                 if remaining is not None:
                     slot["remain_percent"] = remaining
-                slots.append(slot)
+                slots.append(_with_spool_facts(slot, tray))
             elif present:
                 # Bit-present trays with no reading stay on the list. Returning
                 # None here swallowed a sibling RFID hex (0.1.16).
-                slots.append({
+                slots.append(_with_spool_facts({
                     "slot_number": slot_number,
                     "color_hex": None,
                     "filament_type": None,
-                })
+                }, tray))
             else:
                 incomplete = True
     if incomplete:
         return None
     return slots
+
+
+def _with_spool_facts(slot: dict, tray: dict) -> dict:
+    """Add what the printer read off the spool, for a tray that is present.
+
+    Each key is sent only when the printer reported the matching field, so a
+    Link that reads no RFID data sends none of them. `spool_uid` is null for a
+    tagless spool: the cloud reads a null against a stored uid as a new spool.
+    """
+    if "tray_sub_brands" in tray:
+        slot["filament_name"] = _bounded(tray.get("tray_sub_brands"), 64)
+    if "tray_info_idx" in tray:
+        slot["filament_id"] = _bounded(tray.get("tray_info_idx"), 32)
+    if "tray_uuid" in tray or "tag_uid" in tray:
+        slot["spool_uid"] = next(
+            (
+                _bounded(tray.get(key), 64)
+                for key in ("tray_uuid", "tag_uid")
+                if _real_identity(tray.get(key))
+            ),
+            None,
+        )
+    return slot
+
+
+def _bounded(value, limit: int) -> Optional[str]:
+    text = clean_str(value)
+    return text[:limit] if text else None
 
 
 def _tray_color(tray: dict):

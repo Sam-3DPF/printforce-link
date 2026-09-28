@@ -1548,7 +1548,9 @@ class BambuPrinter:
             {
               "bambu_id": str,
               "status": IDLE | PRINTING | PAUSED | NEEDS_CLEARING | ERROR | OFFLINE,
-              "slots": [{slot_number, color_hex, filament_type}] | None,  # see below
+              "slots": [{slot_number, color_hex, filament_type,     # see below
+                         remain_percent?, filament_name?, filament_id?,
+                         spool_uid?}] | None,                     # see ams.parse_ams
               <the telemetry fields, flat>,                        # see parse_telemetry
               "gcode_state": str | None,                            # bounded firmware state
               "hms_present": bool, "hms_empty": bool,

@@ -74,3 +74,22 @@ def test_an_ams_blip_that_zeroes_two_trays_is_not_black_and_then_recovers():
     after = _by_slot(parse_ams(merged))
     assert after[3]["color_hex"] == "D3B7A7FF"
     assert after[4]["color_hex"] == "68724DFF"
+
+
+def test_a_shop_tray_reports_its_spool_facts():
+    slot = _by_slot(parse_ams(SHOP["p1s_1ams_rfid_read"]["full"]))[3]
+
+    assert slot["filament_name"] == "PLA Matte"
+    assert slot["filament_id"] == "GFA01"
+    assert slot["spool_uid"] == "7D4456FE7D5E42C4AF7096F84E8D7D29"
+
+
+def test_the_ams_blip_keeps_the_spool_identity():
+    """The spool never left, so the cloud must not read the blip as a new spool."""
+    frames = SHOP["p1s_1ams_rfid_read"]
+    merged = merge_status_payload(merge_status_payload(None, frames["full"]), frames["reading"])
+    slot = _by_slot(parse_ams(merged))[3]
+
+    assert slot["color_hex"] is None
+    assert slot["filament_name"] is None
+    assert slot["spool_uid"] == "7D4456FE7D5E42C4AF7096F84E8D7D29"
