@@ -370,10 +370,33 @@ def merge_ams(previous, incoming):
         merged["ams"] = []  # the printer says it has no AMS units
     elif isinstance(incoming_units, list):
         merged["ams"] = _merge_units(merged.get("ams"), incoming_units, bits)
+    _drop_units_the_printer_no_longer_has(
+        merged, _normalize_tray_exist_bits(incoming.get("ams_exist_bits")),
+    )
     if bits:
         merged["tray_exist_bits"] = bits
     _blank_trays_the_bits_call_empty(merged, bits)
     return merged
+
+
+def _drop_units_the_printer_no_longer_has(ams_obj: dict, unit_bits: Optional[str]) -> None:
+    """Forget a regular AMS unit (id 0-3) whose `ams_exist_bits` bit is clear.
+
+    Omitted units are kept between deltas, so without this an unplugged AMS
+    would stay as empty slots. Full dumps carry `ams_exist_bits` (bit N = unit
+    N). AMS-HT and A2L units are left alone: their bit layout here is unknown.
+    """
+    units = ams_obj.get("ams")
+    if not unit_bits or not isinstance(units, list):
+        return
+    present = int(unit_bits, 16)
+    kept = []
+    for unit in units:
+        unit_id = as_int(unit.get("id"), default=None) if isinstance(unit, dict) else None
+        if unit_id is not None and 0 <= unit_id < 4 and not (present >> unit_id) & 1:
+            continue
+        kept.append(unit)
+    ams_obj["ams"] = kept
 
 
 def _merge_units(previous_units, incoming_units, bits):
@@ -412,11 +435,20 @@ def _merge_tray(stored, incoming):
         # One colour, two spellings: a new reading replaces both.
         merged.pop("tray_color", None)
         merged.pop("cols", None)
+    # A real filament type with every tag zeroed is a tagless spool. The shop
+    # logs only zero the tags alongside a blank type (an AMS blip), so a zeroed
+    # tag next to a type means the old spool's identity no longer applies.
+    tagless_reading = bool(clean_str(incoming.get("tray_type"))) and all(
+        key in incoming and not _real_identity(incoming[key]) for key in _IDENTITY_FIELDS
+    )
     for key, value in incoming.items():
         if key in _READING_FIELDS:
             merged[key] = value
         elif key in _IDENTITY_FIELDS:
-            if _real_identity(value):
+            # A zeroed tag never hides a real stored one, except for a tagless
+            # reading. It still lands where nothing real is stored, so the
+            # report carries `spool_uid: null` for a tagless spool.
+            if _real_identity(value) or tagless_reading or not _real_identity(merged.get(key)):
                 merged[key] = value
         elif value not in (None, ""):
             merged[key] = value

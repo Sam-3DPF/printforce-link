@@ -773,3 +773,61 @@ def test_merge_never_changes_the_callers_objects():
     merged["ams"][0]["tray"][1]["tray_color"] = "changed"
 
     assert (previous, incoming) == before
+
+
+# --- review fixes: tagless identity through merge, removed AMS units ------------
+
+def _parse_merged(*frames):
+    merged = None
+    for frame in frames:
+        merged = merge_ams(merged, frame)
+    return parse_ams({"print": {"ams": merged}})
+
+
+def test_a_tagless_spool_reports_null_spool_uid_after_a_merge():
+    tagless = {"tray_exist_bits": "1", "ams": [{"id": "0", "tray": [
+        {"id": "0", "state": 3, "tray_color": "FF0000FF", "tray_type": "PLA",
+         "tag_uid": "0" * 16, "tray_uuid": "0" * 32},
+    ]}]}
+
+    slot = _parse_merged(tagless)[0]
+    assert "spool_uid" in slot and slot["spool_uid"] is None
+
+
+def test_a_tagless_spool_swapped_in_unseen_drops_the_old_identity():
+    """Link missed the empty moment. A typed reading with zeroed tags is a new, tagless spool."""
+    tagged = {"tray_exist_bits": "1", "ams": [{"id": "0", "tray": [_tray(0, "E8AFCFFF", uuid="A" * 32)]}]}
+    tagless = {"ams": [{"id": "0", "tray": [
+        {"id": "0", "state": 3, "tray_color": "FF0000FF", "tray_type": "PLA",
+         "tag_uid": "0" * 16, "tray_uuid": "0" * 32},
+    ]}]}
+
+    slot = _parse_merged(tagged, tagless)[0]
+    assert slot["color_hex"] == "FF0000FF"
+    assert slot["spool_uid"] is None
+
+
+def test_a_tagged_spool_blip_without_a_type_keeps_its_identity():
+    blip = {"ams": [{"id": "0", "tray": [
+        {"id": "0", "state": 3, "tray_color": "00000000", "tray_type": "",
+         "tag_uid": "0" * 16, "tray_uuid": "0" * 32},
+    ]}]}
+    tagged = {"tray_exist_bits": "1", "ams": [{"id": "0", "tray": [_tray(0, "E8AFCFFF", uuid="A" * 32)]}]}
+
+    assert _parse_merged(tagged, blip)[0]["spool_uid"] == "A" * 32
+
+
+def test_a_full_dump_without_a_unit_forgets_that_unit():
+    full = {"ams_exist_bits": "1", "tray_exist_bits": "f", "ams": [
+        {"id": "0", "tray": [_tray(i, "E8AFCFFF") for i in range(4)]},
+    ]}
+    merged = merge_ams(_two_units(), full)
+
+    assert [u["id"] for u in merged["ams"]] == ["0"]
+    assert [s["slot_number"] for s in parse_ams({"print": {"ams": merged}})] == [1, 2, 3, 4]
+
+
+def test_a_delta_without_ams_exist_bits_still_keeps_omitted_units():
+    merged = merge_ams(_two_units(), {"ams": [{"id": "0", "tray": [{"id": "0"}]}]})
+
+    assert [u["id"] for u in merged["ams"]] == ["0", "1"]
