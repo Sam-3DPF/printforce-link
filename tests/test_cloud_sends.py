@@ -1028,6 +1028,116 @@ def test_cloud_send_uses_cloud_mapping_when_live_slots_are_none(tmp_path):
     assert fleet.starts[0][2] == [-1, -1, -1, 0, -1, -1, -1, -1, 2]
 
 
+# Shared with 3D-PrintForce backend/tests/test_last_mile_queue_service.py:
+# slot 1's stale RFID reads X but 3DPF has it corrected; the real X spool is
+# in slot 2, whose RFID reads grey. 3DPF maps X to tray 1.
+_STALE_X = "#BB3D43"
+_GREY = "#9B9EA0"
+_NO_FLAG = object()
+
+
+class _CorrectedFleet(_FakeFleet):
+    def __init__(self, slots=None):
+        super().__init__()
+        self.slots = slots if slots is not None else [
+            {"slot_number": 1, "color_hex": _STALE_X, "filament_type": "PLA"},
+            {"slot_number": 2, "color_hex": _GREY, "filament_type": "PLA"},
+        ]
+
+    def by_id(self, bambu_id):
+        return _SnapPrinter(self.slots)
+
+
+def _corrected_desired(flag=True, mapping=(1,)):
+    desired = _desired()
+    send = desired[0]["send"]
+    send["required_filaments"] = [{"filament_id": 1, "hex": _STALE_X, "family": "PLA"}]
+    send["ams_mapping"] = list(mapping)
+    if flag is not _NO_FLAG:
+        send["ams_mapping_authoritative"] = flag
+    return desired
+
+
+def _send_corrected(tmp_path, fleet, desired):
+    _handle_cloud_sends(desired, fleet, _FakeDpf(desired=desired), str(tmp_path), set())
+
+
+def test_authoritative_cloud_mapping_beats_a_stale_rfid_match(tmp_path, caplog):
+    fleet = _CorrectedFleet()
+    with caplog.at_level("INFO", logger="bridge.app"):
+        _send_corrected(tmp_path, fleet, _corrected_desired())
+    assert fleet.starts[0][2] == [1]
+    assert "kept the cloud AMS mapping" in caplog.text
+
+
+def test_live_remap_still_wins_without_the_authoritative_flag(tmp_path):
+    fleet = _CorrectedFleet()
+    _send_corrected(tmp_path, fleet, _corrected_desired(flag=_NO_FLAG))
+    assert fleet.starts[0][2] == [0]
+
+
+@pytest.mark.parametrize("flag", ["true", 1, False, None])
+def test_only_a_boolean_true_makes_the_cloud_mapping_authoritative(tmp_path, flag):
+    fleet = _CorrectedFleet()
+    _send_corrected(tmp_path, fleet, _corrected_desired(flag=flag))
+    assert fleet.starts[0][2] == [0]
+
+
+def test_authoritative_send_still_refuses_malformed_live_slots(tmp_path):
+    fleet = _CorrectedFleet(slots={"not": "a-list"})
+    _send_corrected(tmp_path, fleet, _corrected_desired())
+    assert fleet.calls == []
+
+
+def test_authoritative_send_still_refuses_a_broken_live_snapshot(tmp_path):
+    class BrokenPrinter:
+        def snapshot(self):
+            raise RuntimeError("live snapshot unavailable")
+
+    class BrokenFleet(_FakeFleet):
+        def by_id(self, bambu_id):
+            return BrokenPrinter()
+
+    fleet = BrokenFleet()
+    _send_corrected(tmp_path, fleet, _corrected_desired())
+    assert fleet.calls == []
+
+
+def test_authoritative_send_uses_cloud_mapping_when_live_slots_are_none(tmp_path):
+    class NoSlotsFleet(_FakeFleet):
+        def by_id(self, bambu_id):
+            return _SnapPrinter(None)
+
+    fleet = NoSlotsFleet()
+    _send_corrected(tmp_path, fleet, _corrected_desired())
+    assert fleet.starts[0][2] == [1]
+
+
+def test_authoritative_send_still_refuses_an_invalid_cloud_mapping(tmp_path):
+    fleet = _CorrectedFleet()
+    _send_corrected(tmp_path, fleet, _corrected_desired(mapping=(-1,)))
+    assert fleet.calls == []
+
+
+def test_authoritative_send_rechecks_the_fresh_cloud_mapping_after_upload(tmp_path):
+    """Slots move during upload. Start follows the fresh cloud mapping, not a live remap."""
+    class MoveDuringUploadFleet(_CorrectedFleet):
+        def upload(self, bambu_id, dest, remote_name=None):
+            uploaded = super().upload(bambu_id, dest, remote_name=remote_name)
+            self.slots = [
+                {"slot_number": 1, "color_hex": _GREY, "filament_type": "PLA"},
+                {"slot_number": 3, "color_hex": _STALE_X, "filament_type": "PLA"},
+            ]
+            return uploaded
+
+    fleet = MoveDuringUploadFleet()
+    fresh = _corrected_desired(mapping=(3,))
+    _handle_cloud_sends(
+        _corrected_desired(), fleet, _FakeDpf(desired=fresh), str(tmp_path), set(),
+    )
+    assert fleet.starts[0][2] == [3]
+
+
 class _SlotsThenNoneFleet(_FakeFleet):
     def __init__(self):
         super().__init__()
