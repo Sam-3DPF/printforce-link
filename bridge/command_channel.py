@@ -23,6 +23,7 @@ again later; controls keep arriving through desired state meanwhile.
 from __future__ import annotations
 
 import logging
+import queue
 import threading
 import time
 from typing import Callable, Dict, Optional
@@ -30,6 +31,8 @@ from typing import Callable, Dict, Optional
 logger = logging.getLogger(__name__)
 
 ACK_PUBLISHED = "published"
+ACK_APPLIED = "applied"
+ACK_REJECTED = "rejected"
 ACK_FAILED = "failed"
 
 # run_command outcomes (see app._apply_control).
@@ -37,6 +40,9 @@ PUBLISHED = "published"
 ALREADY = "already"
 UNKNOWN_PRINTER = "unknown_printer"
 UNKNOWN_ACTION = "unknown_action"
+# Published, but the printer is refusing every command (HMS 0500_0500_0001_0007:
+# LAN-only without Developer Mode). Settles as rejected: developer_mode_off.
+REJECTED_DEVELOPER_MODE = "rejected_developer_mode_off"
 
 
 class CommandChannel:
@@ -56,6 +62,9 @@ class CommandChannel:
         self._sleep = sleep
         self._last_try: Dict[str, float] = {}
         self._thread: Optional[threading.Thread] = None
+        # Printer replies arrive on paho threads; their acks are posted here.
+        self._reply_acks: "queue.Queue" = queue.Queue()
+        self._reply_thread: Optional[threading.Thread] = None
 
     # --- one round --------------------------------------------------------
 
@@ -114,6 +123,10 @@ class CommandChannel:
             self._ack(command_id, ACK_PUBLISHED)
             self._last_try.pop(command_id, None)
             return True
+        if outcome == REJECTED_DEVELOPER_MODE:
+            self._ack(command_id, ACK_REJECTED, "developer_mode_off")
+            self._last_try.pop(command_id, None)
+            return True
         if outcome in (UNKNOWN_PRINTER, UNKNOWN_ACTION):
             self._ack(command_id, ACK_FAILED, outcome)
             self._last_try.pop(command_id, None)
@@ -129,6 +142,32 @@ class CommandChannel:
             logger.exception("command %s: ack %s failed; the next wait retries it",
                              command_id, state)
 
+    def report_reply(self, command_id: str, state: str, reason: Optional[str] = None,
+                     body: Optional[Dict] = None) -> None:
+        """The printer answered a command (plan U13). Safe from the paho thread."""
+        if state not in (ACK_APPLIED, ACK_REJECTED):
+            return
+        self._reply_acks.put((str(command_id), state, reason, body))
+
+    def drain_replies(self, block: bool = False, timeout: Optional[float] = None) -> int:
+        """Post queued reply acks. Returns how many were posted."""
+        posted = 0
+        while True:
+            try:
+                item = self._reply_acks.get(block=block and posted == 0, timeout=timeout)
+            except queue.Empty:
+                return posted
+            command_id, state, reason, body = item
+            reply = None
+            if isinstance(body, dict):
+                reply = {k: body.get(k) for k in ("command", "result", "reason", "sequence_id")
+                         if k in body}
+            try:
+                self._dpf.ack_command(command_id, state, reason=reason, reply=reply)
+            except Exception:
+                logger.exception("command %s: reply ack failed", command_id)
+            posted += 1
+
     def _forget_old(self, now: float) -> None:
         stale = [cid for cid, at in self._last_try.items() if now - at > 600]
         for cid in stale:
@@ -141,6 +180,18 @@ class CommandChannel:
             return
         self._thread = threading.Thread(target=self._loop, name="link-commands", daemon=True)
         self._thread.start()
+        self._reply_thread = threading.Thread(
+            target=self._reply_loop, name="link-command-replies", daemon=True,
+        )
+        self._reply_thread.start()
+
+    def _reply_loop(self) -> None:
+        while True:
+            try:
+                self.drain_replies(block=True, timeout=30.0)
+            except Exception:
+                logger.exception("command reply acks failed")
+                self._sleep(self._error_backoff)
 
     def _loop(self) -> None:
         told_unsupported = False

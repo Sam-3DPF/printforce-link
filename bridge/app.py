@@ -47,7 +47,8 @@ from .send_pipeline import (
     uploaded_already,
 )
 from .store import PrinterStore
-from .command_channel import UNKNOWN_ACTION, CommandChannel
+from .bambu.replies import watch as reply_watch
+from .command_channel import REJECTED_DEVELOPER_MODE, UNKNOWN_ACTION, CommandChannel
 from .pacer import ReportPacer
 from .updater import SelfUpdater, default_state_path
 
@@ -511,6 +512,7 @@ def main(config_path: str = "config.toml") -> None:
         dpf,
         lambda command: _run_mailbox_command(
             fleet, dpf, command, applied_controls, spool_dir, router,
+            on_reply=commands.report_reply,
         ),
         on_hint=lambda hints: pacer.poke() if "send" in hints else None,
     )
@@ -1070,8 +1072,14 @@ def _apply_control_locked(fleet, bambu_id: str, control: dict, applied_controls,
     return CONTROL_PUBLISHED
 
 
-def _run_mailbox_command(fleet, dpf, command: dict, applied_controls, spool_dir, router):
-    """One mailbox command (U12) through the same once-only path as desired state."""
+def _run_mailbox_command(fleet, dpf, command: dict, applied_controls, spool_dir, router,
+                         on_reply=None):
+    """One mailbox command (U12) through the same once-only path as desired state.
+
+    ``on_reply(command_id, state, reason, body)`` is called when the printer
+    answers it (U13). A printer refusing every command settles it as
+    rejected: developer_mode_off.
+    """
     action = command.get("action")
     bambu_id = command.get("bambu_id")
     if action not in _CONTROL_ACTIONS or not bambu_id:
@@ -1082,9 +1090,20 @@ def _run_mailbox_command(fleet, dpf, command: dict, applied_controls, spool_dir,
         for key, value in params.items():
             if key not in ("id", "action"):
                 control[key] = value
-    return _apply_control(
-        fleet, str(bambu_id), control, applied_controls, spool_dir, router, dpf=dpf,
-    )
+    if on_reply is None:
+        outcome = _apply_control(
+            fleet, str(bambu_id), control, applied_controls, spool_dir, router, dpf=dpf,
+        )
+    else:
+        with reply_watch(control["id"], on_reply):
+            outcome = _apply_control(
+                fleet, str(bambu_id), control, applied_controls, spool_dir, router, dpf=dpf,
+            )
+    if outcome == CONTROL_PUBLISHED:
+        printer = fleet.by_id(str(bambu_id)) if hasattr(fleet, "by_id") else None
+        if getattr(printer, "commands_rejected", None) is True:
+            return REJECTED_DEVELOPER_MODE
+    return outcome
 
 
 def _desired_cloud_send_keys(desired) -> set:

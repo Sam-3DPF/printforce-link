@@ -54,6 +54,7 @@ from .bambu.hms_actions import (
     ui_only_action,
 )
 from .bambu.log import PrinterLog
+from .bambu.replies import ReplyBook
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.models import ModelProfile, is_known_model, profile_for
 from .state_v2 import build_state_v2
@@ -584,6 +585,8 @@ class BambuPrinter:
         self._last_submission_id = None
         # gcode_line sequence. Separate from the project_file sequence "20000".
         self._line_sequence = 0
+        # Mailbox commands waiting for the printer's reply (plan U13).
+        self._replies = ReplyBook(monotonic=monotonic)
         # Called (from the paho thread) when change_signature moves (plan U10).
         self._change_listener = None
         self._last_change_signature = None
@@ -1332,6 +1335,7 @@ class BambuPrinter:
         session. ``hard_reset`` joins the network thread.
         """
         self._note_session_boundary()
+        self._replies.resolve(doc)
         if is_calibration_table_reply(doc):
             self._note_commands_rejected_on_session()
             return
@@ -1437,6 +1441,9 @@ class BambuPrinter:
             return self._stopwatch.duration_seconds, self._stopwatch.source
 
     def _publish_command(self, payload: dict) -> bool:
+        # Inside replies.watch(...) the command gets its own sequence_id so
+        # the printer's reply can be tied back to the click.
+        payload = self._replies.stamp(payload)
         session = self._session
         accepted = False
         if session is not None:
