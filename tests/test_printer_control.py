@@ -640,3 +640,52 @@ def test_camera_record_control_reaches_the_printer_once(tmp_path):
         {"pushing": {"sequence_id": "0", "command": "pushall"}},
     ]
     assert "rec-1" in applied
+
+
+class _AlarmPrinter(_FakePrinter):
+    def handle_control(self, action, params):
+        self.calls.append(action)
+        return True
+
+
+def _alarm_fleet(printer):
+    cfg = PrinterConfig(bambu_id="P1", ip="10.0.0.5", access_code="x", name="P1S")
+    return Fleet(
+        [cfg],
+        printer_factory=lambda _cfg, stale_after_seconds=None: printer,
+        discover_fn=lambda _timeout: [],
+    )
+
+
+def test_dismissing_an_alarm_asks_the_printer_for_a_full_status():
+    """After ignore/idle_ignore/clean_print_error, the next report must show the
+    alarms the printer really has, not a stale merged list (shop P1S-10)."""
+    for action in ("ignore", "idle_ignore", "clean_print_error"):
+        printer = _AlarmPrinter()
+        fleet = _alarm_fleet(printer)
+        assert fleet.apply_control("P1", action, {"err": 50348044}) is True
+        deadline = time.monotonic() + 1.0
+        while "request_full_status" not in printer.calls and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert printer.calls == [action, "request_full_status"]
+
+
+def test_other_controls_do_not_ask_for_a_full_status():
+    printer = _AlarmPrinter()
+    fleet = _alarm_fleet(printer)
+    assert fleet.apply_control("P1", "set_light", {"on": True}) is True
+    time.sleep(0.05)
+    assert printer.calls == ["set_light"]
+
+
+def test_a_dismiss_the_printer_did_not_take_asks_for_nothing():
+    class _Refused(_AlarmPrinter):
+        def handle_control(self, action, params):
+            self.calls.append(action)
+            return False
+
+    printer = _Refused()
+    fleet = _alarm_fleet(printer)
+    assert fleet.apply_control("P1", "idle_ignore", {"err": 1}) is False
+    time.sleep(0.05)
+    assert printer.calls == ["idle_ignore"]

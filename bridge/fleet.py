@@ -149,6 +149,10 @@ def _call_discover(discover_fn, timeout: float, probe_ips) -> List[DiscoveredPri
         return discover_fn(timeout)
 
 
+# Controls that dismiss an alarm on the printer. Each is followed by a pushall.
+_ALARM_DISMISS_ACTIONS = frozenset({"ignore", "idle_ignore", "clean_print_error"})
+
+
 class Fleet:
     def __init__(self, printer_configs: List[PrinterConfig],
                  stale_after_seconds: float = _DEFAULT_STALE_AFTER_SECONDS,
@@ -309,7 +313,14 @@ class Fleet:
             return self._enqueue_refresh(bambu_id)
         handle = getattr(printer, "handle_control", None)
         if callable(handle):
-            return bool(handle(action, params or {}))
+            published = bool(handle(action, params or {}))
+            if published and action in _ALARM_DISMISS_ACTIONS:
+                # The printer mostly sends deltas, so a cleared alarm can linger
+                # in the merged report. Ask for a full dump so the next report
+                # shows the alarm list the printer really has (shop P1S-10,
+                # 2026-09-28). Queued on the printer's worker; never blocks.
+                self._enqueue_refresh(bambu_id)
+            return published
         logger.warning("unknown control %s requested for printer %s", action, bambu_id)
         return False
 
