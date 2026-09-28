@@ -184,6 +184,46 @@ class DpfClient:
         a failure returns {} and is retried next interval."""
         return self._post("/api/bridge/printers/discovered", {"printers": printers})
 
+    def wait_commands(self, timeout: float = 25.0) -> Optional[Dict]:
+        """Hold the doorbell open (plan U12). One try, no retries.
+
+        Returns ``{"commands": [...], "hints": [...]}``; ``{}`` on a network or
+        server error (the caller backs off); ``None`` when this 3DPF has no
+        mailbox yet (404), so the caller falls back to desired-state controls.
+        """
+        url = self._base + "/api/bridge/commands/wait"
+        try:
+            resp = self._client.get(
+                url, params={"timeout": timeout}, headers=self._headers,
+                timeout=float(timeout) + 15.0,
+            )
+        except httpx.RequestError as e:
+            logger.info("3DPF command wait: %s", type(e).__name__)
+            return {}
+        if resp.status_code == 404:
+            return None
+        if resp.status_code in (401, 403):
+            self.unauthorized = True
+            return {}
+        if resp.status_code >= 400:
+            logger.warning("3DPF command wait -> %s", resp.status_code)
+            return {}
+        try:
+            return self._unwrap(resp.json())
+        except ValueError:
+            logger.warning("3DPF command wait returned a non-JSON body")
+            return {}
+
+    def ack_command(self, command_id: str, state: str, reason: Optional[str] = None,
+                    reply: Optional[Dict] = None) -> Dict:
+        """Report one command: published, applied, rejected, or failed."""
+        body: Dict = {"state": state}
+        if reason:
+            body["reason"] = reason
+        if isinstance(reply, dict):
+            body["reply"] = reply
+        return self._post(f"/api/bridge/commands/{command_id}/ack", body)
+
     @staticmethod
     def _unwrap(payload) -> Dict:
         """Unwrap 3DPF's standard `{"data": ...}` success envelope.
