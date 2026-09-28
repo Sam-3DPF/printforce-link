@@ -579,6 +579,31 @@ class PrinterState:
         with self._lock:
             return self._lifecycle.copy_events()
 
+    def change_signature(self) -> tuple:
+        """The merged fields whose change should reach 3DPF now (plan U10).
+
+        Job state, stage, print error, the HMS list, the cancel latch, and the
+        session. Temperatures, progress and fans are left out: they change on
+        almost every message and ride the regular report.
+        """
+        with self._lock:
+            print_obj = _print_obj(self._payload)
+            hms = print_obj.get("hms")
+            codes = ()
+            if isinstance(hms, list):
+                codes = tuple(sorted(
+                    f"{item.get('attr')}:{item.get('code')}"
+                    for item in hms if isinstance(item, dict)
+                ))
+            return (
+                self._session_seq,
+                print_obj.get("gcode_state"),
+                print_obj.get("stg_cur"),
+                print_obj.get("print_error"),
+                codes,
+                self._user_cancelled,
+            )
+
     def stopwatch_sample(self):
         """Merged ``(gcode_state, gcode_start_time)`` for the print stopwatch.
 

@@ -584,6 +584,9 @@ class BambuPrinter:
         self._last_submission_id = None
         # gcode_line sequence. Separate from the project_file sequence "20000".
         self._line_sequence = 0
+        # Called (from the paho thread) when change_signature moves (plan U10).
+        self._change_listener = None
+        self._last_change_signature = None
 
     @property
     def last_submission_id(self):
@@ -1336,6 +1339,33 @@ class BambuPrinter:
         self._observe_stopwatch()
         self._note_command_acceptance()
         self._note_commands_rejected_on_session()
+        self._note_change()
+
+    def set_change_listener(self, listener) -> None:
+        """``listener()`` runs on the paho thread when the card-visible state moves.
+
+        It must be quick and must not raise into paho; the report pacer's
+        ``poke`` is the intended listener.
+        """
+        self._change_listener = listener
+
+    def _note_change(self) -> None:
+        listener = self._change_listener
+        if listener is None:
+            return
+        try:
+            signature = self.state.change_signature()
+        except Exception:
+            logger.exception("printer %s: change signature raised — this is a BRIDGE BUG",
+                             self.bambu_id)
+            return
+        if signature == self._last_change_signature:
+            return
+        self._last_change_signature = signature
+        try:
+            listener()
+        except Exception:
+            logger.exception("printer %s: change listener raised", self.bambu_id)
 
     def _note_commands_rejected_on_session(self) -> None:
         """Tell the session about the merged fault, not only this datagram."""
