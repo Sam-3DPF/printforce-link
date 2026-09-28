@@ -43,10 +43,9 @@ def merge_status_payload(cached: Optional[dict], incoming: Optional[dict]) -> Di
 
       * scalars merge key-by-key, so a delta that omits `nozzle_temper` keeps the last
         known value rather than blanking it;
-      * `ams` is merged by `merge_ams`: a P1 print delta that only details the
-        active tray must not blank RFID colours on trays `tray_exist_bits` still
-        marks loaded. A real unload (bit cleared, or no bits and an id-only tray)
-        still replaces.
+      * `ams` is merged by `merge_ams` (Bambuddy's rules): omitted units and
+        trays are kept, a reading the printer names replaces the stored one,
+        and a tray `tray_exist_bits` clears loses its reading and identity.
       * `ipcam` merges key-by-key, so a camera delta keeps `ipcam_record`.
 
     Nothing from `incoming` is ever stored by reference. The report callback runs

@@ -486,9 +486,11 @@ def test_clear_exist_bit_blanks_a_tray_that_still_has_a_color():
     assert tray.get("remain") is None
 
 
-def test_regular_state_other_than_loaded_clears_remembered_color():
-    """A regular `{id, state}` update with state other than 11 is an unload.
-    State 11 is loaded and keeps the remembered color."""
+def test_state_never_blanks_a_tray_the_bits_call_present():
+    """P1S reports a loaded tray as state 3 and never 11. The bit decides.
+
+    Link 0.1.41 read state != 11 as an unload and blanked every shop tray.
+    """
     previous = {"tray_exist_bits": "f", "ams": [
         {"id": "0", "tray": [
             {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
@@ -498,28 +500,51 @@ def test_regular_state_other_than_loaded_clears_remembered_color():
     incoming = {"tray_exist_bits": "f", "ams": [
         {"id": "0", "tray": [
             {"id": "0", "state": 0},
+            {"id": "1", "state": 3, "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+        ]},
+    ]}
+    merged = merge_ams(previous, incoming)
+    assert merged["ams"][0]["tray"][0]["tray_color"] == "E8AFCFFF"
+    assert merged["ams"][0]["tray"][1]["tray_color"] == "A3D8E1FF"
+    assert parse_ams({"print": {"ams": merged}}) == [
+        {"slot_number": 1, "color_hex": "E8AFCFFF", "filament_type": "PLA"},
+        {"slot_number": 2, "color_hex": "A3D8E1FF", "filament_type": "PLA"},
+    ]
+
+
+def test_without_bits_an_id_state_update_that_is_not_loaded_clears_the_tray():
+    """No bits: Bambuddy's rule. `{id, state}` with a state that is not a
+    loaded one (3 or 11) is an unload; a loaded state keeps the colour."""
+    previous = {"ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1", "tray_color": "A3D8E1FF", "tray_type": "PLA"},
+            {"id": "2", "tray_color": "AE96D4FF", "tray_type": "PLA"},
+        ]},
+    ]}
+    incoming = {"ams": [
+        {"id": "0", "tray": [
+            {"id": "0", "state": 0},
             {"id": "1", "state": 11},
+            {"id": "2", "state": 3},
         ]},
     ]}
     merged = merge_ams(previous, incoming)
     assert "tray_color" not in merged["ams"][0]["tray"][0]
     assert merged["ams"][0]["tray"][1]["tray_color"] == "A3D8E1FF"
-    # The unloaded tray is empty, so it is not a dark spool waiting on RFID.
-    # The loaded tray (state 11) with no color still is.
-    assert idle_trays_needing_rfid({"print": {"ams": incoming}}) == [(0, 1)]
+    assert merged["ams"][0]["tray"][2]["tray_color"] == "AE96D4FF"
 
 
-def test_regular_state_unload_blanks_an_echoed_color():
-    """State other than 11 is empty even when the tray object still has a color.
-    The first payload has no remembered tray to compare against."""
-    echoed = {"id": "0", "state": 0, "tray_color": "E8AFCFFF", "tray_type": "PLA", "remain": 40}
-    status = {"print": {"ams": {"tray_exist_bits": "f", "ams": [
+def test_a_clear_bit_blanks_an_echoed_color():
+    """The tray object still carries a colour, but the bit says it is out."""
+    echoed = {"id": "0", "state": 3, "tray_color": "E8AFCFFF", "tray_type": "PLA", "remain": 40}
+    status = {"print": {"ams": {"tray_exist_bits": "e", "ams": [
         {"id": "0", "tray": [echoed]},
     ]}}}
     assert parse_ams(status) == [
         {"slot_number": 1, "color_hex": None, "filament_type": None},
     ]
-    incoming = {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [echoed]}]}
+    incoming = {"tray_exist_bits": "e", "ams": [{"id": "0", "tray": [echoed]}]}
     previous = {"tray_exist_bits": "f", "ams": [
         {"id": "0", "tray": [
             {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA", "remain": 40},
@@ -602,3 +627,94 @@ def test_missing_unit_list_is_none_and_vt_tray_is_not_a_slot():
     assert parse_ams(status) == [
         {"slot_number": 1, "color_hex": "000000FF", "filament_type": "PLA"},
     ]
+
+
+# --- Bambuddy-style merge (plan 2026-09-28-001 U3) -----------------------------
+
+def _tray(tray_id, color, uuid="0" * 32, **extra):
+    return {"id": str(tray_id), "state": 3, "tray_color": color, "tray_type": "PLA",
+            "tray_uuid": uuid, "tag_uid": "0" * 16, **extra}
+
+
+def _two_units():
+    return {"tray_exist_bits": "ff", "ams": [
+        {"id": "0", "humidity": "4", "tray": [_tray(i, "E8AFCFFF", uuid=f"A{i}".ljust(32, "0")) for i in range(4)]},
+        {"id": "1", "humidity": "3", "tray": [_tray(i, "0078BFFF", uuid=f"B{i}".ljust(32, "0")) for i in range(4)]},
+    ]}
+
+
+def _colors(ams):
+    return [t.get("tray_color") for u in ams["ams"] for t in u["tray"]]
+
+
+def test_a_delta_naming_one_unit_keeps_the_other_units_trays():
+    """AE3."""
+    merged = merge_ams(_two_units(), {"ams": [{"id": "0", "tray": [_tray(0, "E8AFCFFF")]}]})
+
+    assert [u["id"] for u in merged["ams"]] == ["0", "1"]
+    assert _colors(merged)[4:] == ["0078BFFF"] * 4
+    assert merged["ams"][1]["humidity"] == "3"
+
+
+def test_a_delta_naming_one_tray_keeps_its_siblings():
+    merged = merge_ams(_two_units(), {"ams": [{"id": "0", "tray": [_tray(2, "000000FF")]}]})
+
+    assert _colors(merged)[:4] == ["E8AFCFFF", "E8AFCFFF", "000000FF", "E8AFCFFF"]
+
+
+def test_a_swapped_spool_takes_the_new_colour_and_identity():
+    """AE2: never the previous spool's colour."""
+    new = _tray(1, "000000FF", uuid="C" * 32)
+    merged = merge_ams(_two_units(), {"ams": [{"id": "0", "tray": [new]}]})
+    tray = merged["ams"][0]["tray"][1]
+
+    assert tray["tray_color"] == "000000FF"
+    assert tray["tray_uuid"] == "C" * 32
+
+
+def test_an_explicit_blank_colour_clears_it_instead_of_inheriting():
+    blank = {"id": "1", "state": 3, "tray_color": "", "tray_type": ""}
+    merged = merge_ams(_two_units(), {"ams": [{"id": "0", "tray": [blank]}]})
+    tray = merged["ams"][0]["tray"][1]
+
+    assert tray["tray_color"] == ""
+    assert parse_ams({"print": {"ams": merged}})[1]["color_hex"] is None
+
+
+def test_an_omitted_colour_key_keeps_the_stored_colour():
+    merged = merge_ams(_two_units(), {"ams": [{"id": "0", "tray": [{"id": "1"}]}]})
+
+    assert merged["ams"][0]["tray"][1]["tray_color"] == "E8AFCFFF"
+
+
+def test_a_zeroed_tag_does_not_replace_a_real_spool_identity():
+    zeroed = {"id": "1", "tray_uuid": "0" * 32, "tag_uid": "0" * 16}
+    merged = merge_ams(_two_units(), {"ams": [{"id": "0", "tray": [zeroed]}]})
+
+    assert merged["ams"][0]["tray"][1]["tray_uuid"] == "A1".ljust(32, "0")
+
+
+def test_a_cleared_bit_forgets_the_spool_and_a_new_one_reads_in():
+    out = merge_ams(_two_units(), {"tray_exist_bits": "fd", "ams": [{"id": "0", "tray": [{"id": "1"}]}]})
+    tray = out["ams"][0]["tray"][1]
+    assert "tray_color" not in tray and "tray_uuid" not in tray
+
+    back = merge_ams(out, {"tray_exist_bits": "ff", "ams": [{"id": "0", "tray": [_tray(1, "F7D959FF", uuid="D" * 32)]}]})
+    tray = back["ams"][0]["tray"][1]
+    assert tray["tray_color"] == "F7D959FF"
+    assert tray["tray_uuid"] == "D" * 32
+
+
+def test_a_cleared_bit_blanks_a_tray_the_delta_did_not_name():
+    out = merge_ams(_two_units(), {"tray_exist_bits": "7f", "ams": [{"id": "0", "tray": [{"id": "0"}]}]})
+
+    assert "tray_color" not in out["ams"][1]["tray"][3]
+    assert out["ams"][1]["tray"][2]["tray_color"] == "0078BFFF"
+
+
+def test_a_new_tray_color_replaces_a_stale_cols_spelling():
+    stored = {"tray_exist_bits": "1", "ams": [{"id": "0", "tray": [{"id": "0", "cols": ["E8AFCFFF"], "tray_type": "PLA"}]}]}
+    merged = merge_ams(stored, {"ams": [{"id": "0", "tray": [{"id": "0", "tray_color": ""}]}]})
+
+    assert "cols" not in merged["ams"][0]["tray"][0]
+    assert parse_ams({"print": {"ams": merged}})[0]["color_hex"] is None

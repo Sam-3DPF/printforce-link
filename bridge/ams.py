@@ -1,7 +1,7 @@
 """Parse a Bambu MQTT status payload's AMS section into flat slot states.
 
-The bridge reports each slot to 3DPF as {slot_number, color_hex, filament_type}. We
-keep the raw AMS-reported color/type here; color normalization and Material matching
+The bridge reports each slot to 3DPF as {slot_number, color_hex, filament_type,
+...}. We keep the raw AMS-reported color/type here; color normalization and Material matching
 happen server-side.
 
 Bambu status shape (subset):
@@ -24,21 +24,26 @@ its four trays are slots 25–28 and tray 0 uses bit 24, not bit 64.
 
 `remain` is never emptiness. Official dumps send `-1` for unread / third-party
 spools and `0` when remaining is not calibrated. Empty comes from
-`tray_exist_bits` (or a regular AMS state other than loaded), not from remain.
+`tray_exist_bits`, not from remain.
 
 **An empty tray is a slot whose `tray_exist_bits` bit is cleared.** A clear bit
-blanks type, color, and remain even when the tray object still carries them.
-An `{id}`-only tray on a P1 is also how idle loaded trays arrive, so that shape
-alone is not Empty. A regular AMS update of `{id, state}` is empty when state
-is anything other than 11 (loaded). AMS-HT state 9 stays occupied. When the
-bits say the spool is in, we still emit that tray (null hex) so Refresh sends the
-same full list first-connect would. A mixed filled-plus-blank dump with no bits
-is incomplete: `parse_ams` returns None so the cloud does not store Empty.
+blanks the reading and the spool identity even when the tray object still
+carries them. `state` is not presence: shop P1S printers report every loaded
+tray as state 3 and never 11 (Bambuddy documents the same), and Link 0.1.41
+blanked every colour by reading state != 11 as an unload. See `tray_presence`.
+An `{id}`-only tray on a P1 can be a loaded tray the delta did not detail, so
+that shape alone is not Empty. When the bits say the spool is in, we still emit
+that tray (null hex) so Refresh sends the same full list first-connect would. A
+mixed filled-plus-blank dump with no bits is incomplete: `parse_ams` returns
+None so the cloud does not store Empty.
 
-Never infer "empty" from an all-zero color. A loaded black spool whose RFID read
-failed still reports a color, and conflating the two is precisely the failure mode
-the manual slot override exists to fix. A clear exist bit is what blanks that
-tray, including when the object still carries a stale color.
+Never infer "empty" from a colour. A loaded black spool reports `000000FF`.
+`00000000` (alpha 0) is Bambu's "no colour": a reset slot, or a tray the AMS
+briefly blanks, sends it, so it is read as no reading, never as black.
+
+`merge_ams` follows Bambuddy's `_handle_ams_data`: omitted units and trays are
+kept, a reading field the printer names replaces the stored one even when
+blank, and spool identity changes only to a real value.
 
 The external spool (`vt_tray` / `vir_slot`) is deliberately NOT parsed. It sits
 outside the `ams` array at global index 254, and the cloud's slot upsert keys on
@@ -63,9 +68,21 @@ AMS_HT_FIRST_SLOT = 17
 # A2L Lite's physical unit id. Exist bits and reported slots use unit 6.
 A2L_PHYSICAL_UNIT_ID = 16
 A2L_NORMALIZED_UNIT_ID = 6
-# Regular AMS. 11 is loaded. Anything else on an `{id, state}` update is empty.
-REGULAR_AMS_LOADED_STATE = 11
-_LOADED_TRAY_FIELDS = ("tray_color", "cols", "tray_type", "remain")
+# Regular-AMS tray states that mean a spool is loaded. P1S and A1 mini report 3
+# and never 11; other models report 11 (Bambuddy `ams_slot_presence.py`). Only
+# read when `tray_exist_bits` is unknown and the tray arrives as `{id, state}`.
+REGULAR_AMS_LOADED_STATES = frozenset({3, 11})
+# Bambu's "no colour" value: what a reset slot or a blanked tray reports.
+NO_COLOUR = "00000000"
+# What the tray holds. A key the printer sends always wins, even blank
+# (Bambuddy `always_update_fields`); a key it omits keeps the last value.
+_READING_FIELDS = (
+    "tray_color", "cols", "tray_type", "tray_sub_brands", "tray_info_idx",
+    "tray_id_name", "remain",
+)
+# Which spool it is. Only a real (non-zero) value overwrites; the tray has to
+# empty to clear it, so a blanked read does not look like a new spool.
+_IDENTITY_FIELDS = ("tag_uid", "tray_uuid")
 
 _HEX_DIGITS = set("0123456789ABCDEF")
 
@@ -179,10 +196,9 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
             if tray_index is None:
                 continue  # a tray we cannot place has no slot number to report under
             slot_number = ams_slot_number(unit_index, tray_index)
-            present = _bit_present(bits, slot_number)
-            if present is False or _regular_state_unloaded(unit_index, tray):
-                # A clear exist bit, or a regular state other than loaded,
-                # wins over a stale color, type, or remain.
+            present = tray_presence(unit_index, tray, bits)
+            if present is False:
+                # A clear exist bit wins over a stale color, type, or remain.
                 slots.append({
                     "slot_number": slot_number,
                     "color_hex": None,
@@ -201,8 +217,8 @@ def parse_ams(status: dict) -> Optional[List[Dict]]:
                 if remaining is not None:
                     slot["remain_percent"] = remaining
                 slots.append(slot)
-            elif bits is not None:
-                # Bit-present idle trays stay on the first-connect list. Returning
+            elif present:
+                # Bit-present trays with no reading stay on the list. Returning
                 # None here swallowed a sibling RFID hex (0.1.16).
                 slots.append({
                     "slot_number": slot_number,
@@ -220,14 +236,41 @@ def _tray_color(tray: dict):
     """`tray_color`, or the first `cols` entry when the named field is blank.
 
     P1 trays with a set colour but a dark RFID often omit `tray_color` and only
-    send `cols`.
+    send `cols`. `00000000` is Bambu's "no colour", not black: a reset slot and
+    a tray the AMS briefly blanks both send it.
     """
     color = tray.get("tray_color")
-    if color:
+    if color and not _is_no_colour(color):
         return color
     cols = tray.get("cols")
-    if isinstance(cols, list) and cols:
+    if isinstance(cols, list) and cols and not _is_no_colour(cols[0]):
         return cols[0]
+    return None
+
+
+def _is_no_colour(value) -> bool:
+    return isinstance(value, str) and value.strip().upper() == NO_COLOUR
+
+
+def tray_presence(unit_id: int, tray: dict, bits: Optional[str]) -> Optional[bool]:
+    """Is a spool in this tray? True, False, or None when nothing says.
+
+    `tray_exist_bits` decides whenever it is known. `state` is firmware-variant
+    (3 on a loaded P1S tray, 11 elsewhere, 9 on a loaded AMS-HT), so it never
+    blanks a tray the bitmask calls present. Without bits, a colour or type
+    means present. Otherwise follow Bambuddy: an explicit blank `tray_type` is
+    empty, and so is a regular `{id, state}`-only tray whose state is not a
+    loaded one.
+    """
+    tray_id = as_int(tray.get("id"), default=None)
+    if tray_id is not None:
+        bit = _bit_present(bits, ams_slot_number(unit_id, tray_id))
+        if bit is not None:
+            return bit
+    if clean_str(_tray_color(tray)) or clean_str(tray.get("tray_type")):
+        return True
+    if "tray_type" in tray or _id_state_only_unloaded(unit_id, tray):
+        return False
     return None
 
 
@@ -252,12 +295,9 @@ def idle_trays_needing_rfid(status) -> List[tuple]:
             tray_index = as_int(tray.get("id"), default=None)
             if tray_index is None:
                 continue
-            slot_number = ams_slot_number(unit_index, tray_index)
-            if _regular_state_unloaded(unit_index, tray):
+            if tray_presence(unit_index, tray, bits) is not True:
                 continue
             if clean_str(_tray_color(tray)) or clean_str(tray.get("tray_type")):
-                continue
-            if _bit_present(bits, slot_number) is False:
                 continue
             needed.append((unit_index, tray_index))
     return needed
@@ -275,100 +315,119 @@ def ams_needs_pushall(status) -> bool:
 
 
 def merge_ams(previous, incoming):
-    """Keep RFID tray readings across a P1 print delta that only details the active tray.
+    """Merge one `print.ams` delta into the remembered AMS, Bambuddy's way.
 
-    Incremental `print.ams` payloads still carry `tray_exist_bits` and a full tray
-    list, but idle trays arrive as `{id}` only, or as RFID identity without hex.
-    Replacing the AMS object wholesale then blanks hex the printer already sent.
-    Keep the last colour unless the bitmask clears that slot, or a regular AMS
-    tray arrives as `{id, state}` with a state other than loaded (11). A clear
-    bit blanks type, color, and remain on the stored tray even when the object
-    still carries them. AMS-HT state 9 stays occupied. A missing bitmask is not
-    an unload. Persist bits onto the outgoing object so a later delta that
-    omits them does not store null.
+    Units and trays the delta omits are kept. Within a tray, reading fields
+    the delta names replace the stored ones even when blank, so a new spool
+    never inherits the previous spool's colour; spool identity only changes to
+    a real value. A tray the bits (or, without bits, an `{id, state}` unload)
+    call empty loses its reading and identity. A missing bitmask is not an
+    unload; the last bits are kept on the outgoing object.
     """
     if not isinstance(incoming, dict):
         return copy.deepcopy(previous) if isinstance(previous, dict) else None
-    incoming = copy.deepcopy(incoming)
-    if not isinstance(previous, dict):
-        bits = _normalize_tray_exist_bits(incoming.get("tray_exist_bits"))
-        if bits:
-            incoming["tray_exist_bits"] = bits
-        _blank_unloaded_trays(incoming, bits)
-        return incoming
-    incoming_units = incoming.get("ams")
+    previous = previous if isinstance(previous, dict) else {}
     bits = (
         _normalize_tray_exist_bits(incoming.get("tray_exist_bits"))
         or _normalize_tray_exist_bits(previous.get("tray_exist_bits"))
     )
+    merged = copy.deepcopy(previous)
+    for key, value in incoming.items():
+        if key != "ams":
+            merged[key] = copy.deepcopy(value)
+    incoming_units = incoming.get("ams")
     if incoming_units == []:
-        if bits:
-            incoming["tray_exist_bits"] = bits
-        return incoming
-    if not isinstance(incoming_units, list):
-        outgoing = copy.deepcopy(previous)
-        for key, value in incoming.items():
-            if key != "ams":
-                outgoing[key] = copy.deepcopy(value)
-        if bits:
-            outgoing["tray_exist_bits"] = bits
-        return outgoing
-    previous_units = previous.get("ams")
-    if not isinstance(previous_units, list):
-        if bits:
-            incoming["tray_exist_bits"] = bits
-        _blank_unloaded_trays(incoming, bits)
-        return incoming
-    prev_by_id = {}
-    for unit in previous_units:
+        merged["ams"] = []  # the printer says it has no AMS units
+    elif isinstance(incoming_units, list):
+        merged["ams"] = _merge_units(merged.get("ams"), incoming_units, bits)
+    if bits:
+        merged["tray_exist_bits"] = bits
+    _blank_trays_the_bits_call_empty(merged, bits)
+    return merged
+
+
+def _merge_units(previous_units, incoming_units, bits):
+    by_id = {}
+    for unit in previous_units if isinstance(previous_units, list) else []:
         if isinstance(unit, dict):
-            prev_by_id[as_int(unit.get("id"), default=None)] = unit
-    merged_units = []
+            by_id[as_int(unit.get("id"), default=0)] = unit
     for unit in incoming_units:
         if not isinstance(unit, dict):
             continue
         unit_index = as_int(unit.get("id"), default=0)
-        prev_unit = prev_by_id.get(unit_index) or {}
-        prev_trays = {}
-        for tray in prev_unit.get("tray") or []:
+        stored = by_id.get(unit_index) or {}
+        trays = {}
+        for tray in stored.get("tray") or []:
             if isinstance(tray, dict):
-                prev_trays[as_int(tray.get("id"), default=None)] = tray
-        trays = []
+                trays[as_int(tray.get("id"), default=None)] = tray
         for tray in unit.get("tray") or []:
             if not isinstance(tray, dict):
                 continue
             tray_index = as_int(tray.get("id"), default=None)
             if tray_index is None:
                 continue
-            slot_number = ams_slot_number(unit_index, tray_index)
-            prev_tray = prev_trays.get(tray_index)
-            if (
-                _bit_present(bits, slot_number) is False
-                or _regular_state_unloaded(unit_index, tray)
-            ):
-                trays.append(_blank_loaded_fields(tray))
-            elif (
-                not _tray_color(tray)
-                and not _regular_state_unloaded(unit_index, tray)
-                and isinstance(prev_tray, dict)
-                and _tray_color(prev_tray)
-            ):
-                kept = copy.deepcopy(prev_tray)
-                for key, value in tray.items():
-                    if key in ("tray_color", "cols"):
-                        continue
-                    if value not in (None, ""):
-                        kept[key] = copy.deepcopy(value)
-                trays.append(kept)
+            if tray_presence(unit_index, tray, bits) is False:
+                trays[tray_index] = _blank_tray({**trays.get(tray_index, {}), **tray})
             else:
-                trays.append(tray)
-        merged = dict(unit)
-        merged["tray"] = trays
-        merged_units.append(merged)
-    incoming["ams"] = merged_units
-    if bits:
-        incoming["tray_exist_bits"] = bits
-    return incoming
+                trays[tray_index] = _merge_tray(trays.get(tray_index), tray)
+        merged = {**stored, **copy.deepcopy({k: v for k, v in unit.items() if k != "tray"})}
+        merged["tray"] = [trays[k] for k in sorted(trays, key=lambda k: (k is None, k))]
+        by_id[unit_index] = merged
+    return [by_id[k] for k in sorted(by_id)]
+
+
+def _merge_tray(stored, incoming):
+    merged = copy.deepcopy(stored) if isinstance(stored, dict) else {}
+    if "tray_color" in incoming or "cols" in incoming:
+        # One colour, two spellings: a new reading replaces both.
+        merged.pop("tray_color", None)
+        merged.pop("cols", None)
+    for key, value in incoming.items():
+        if key in _READING_FIELDS:
+            merged[key] = copy.deepcopy(value)
+        elif key in _IDENTITY_FIELDS:
+            if _real_identity(value):
+                merged[key] = value
+        elif value not in (None, ""):
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
+def _real_identity(value) -> bool:
+    text = clean_str(value)
+    return bool(text) and set(text) != {"0"}
+
+
+def _blank_tray(tray: dict) -> dict:
+    """An empty tray: drop what it held and which spool it was."""
+    blanked = copy.deepcopy(tray)
+    for key in _READING_FIELDS + _IDENTITY_FIELDS:
+        blanked.pop(key, None)
+    return blanked
+
+
+def _blank_trays_the_bits_call_empty(ams_obj: dict, bits: Optional[str]) -> None:
+    """Every stored tray whose bit is clear, including ones the delta omitted."""
+    if not bits:
+        return
+    units = ams_obj.get("ams")
+    if not isinstance(units, list):
+        return
+    for unit in units:
+        if not isinstance(unit, dict):
+            continue
+        unit_index = as_int(unit.get("id"), default=0)
+        trays = unit.get("tray")
+        if not isinstance(trays, list):
+            continue
+        for i, tray in enumerate(trays):
+            if not isinstance(tray, dict):
+                continue
+            tray_index = as_int(tray.get("id"), default=None)
+            if tray_index is None:
+                continue
+            if _bit_present(bits, ams_slot_number(unit_index, tray_index)) is False:
+                trays[i] = _blank_tray(tray)
 
 
 def ams_has_color(ams) -> bool:
@@ -384,64 +443,16 @@ def ams_has_color(ams) -> bool:
     return False
 
 
-def _regular_state_unloaded(unit_id: int, tray: dict) -> bool:
-    """True when a regular AMS `{id, state}` update is not the loaded state.
+def _id_state_only_unloaded(unit_id: int, tray: dict) -> bool:
+    """A regular-AMS `{id, state}` update whose state is not a loaded one.
 
-    State 11 keeps a remembered color. AMS-HT is excluded: a loaded HT tray
-    reports state 9, and treating that as an unload would blank a present spool.
+    AMS-HT is excluded: a loaded HT tray reports state 9.
     """
     if AMS_HT_ID_MIN <= unit_id <= AMS_HT_ID_MAX:
         return False
-    if "state" not in tray:
+    if "state" not in tray or not set(tray) <= {"id", "state"}:
         return False
-    return as_int(tray.get("state"), default=None) != REGULAR_AMS_LOADED_STATE
-
-
-def _blank_loaded_fields(tray: dict) -> dict:
-    """Drop type, color, and remain. An unload makes those stale."""
-    blanked = copy.deepcopy(tray)
-    for key in _LOADED_TRAY_FIELDS:
-        blanked.pop(key, None)
-    return blanked
-
-
-def _blank_unloaded_trays(ams_obj: dict, bits: Optional[str]) -> None:
-    """Blank unloaded trays on a payload that has no previous unit list."""
-    units = ams_obj.get("ams")
-    if not isinstance(units, list):
-        return
-    for unit in units:
-        if not isinstance(unit, dict):
-            continue
-        unit_index = as_int(unit.get("id"), default=0)
-        trays = []
-        for tray in unit.get("tray") or []:
-            if not isinstance(tray, dict):
-                trays.append(tray)
-                continue
-            tray_index = as_int(tray.get("id"), default=None)
-            if tray_index is None:
-                trays.append(tray)
-                continue
-            slot_number = ams_slot_number(unit_index, tray_index)
-            if (
-                _bit_present(bits, slot_number) is False
-                or _regular_state_unloaded(unit_index, tray)
-            ):
-                trays.append(_blank_loaded_fields(tray))
-            else:
-                trays.append(tray)
-        unit["tray"] = trays
-
-
-def _tray_has_reading(tray: dict) -> bool:
-    if _tray_color(tray):
-        return True
-    if clean_str(tray.get("tray_type")):
-        return True
-    if clean_str(tray.get("tray_info_idx")):
-        return True
-    return False
+    return as_int(tray.get("state"), default=None) not in REGULAR_AMS_LOADED_STATES
 
 
 def _bit_present(bits: Optional[str], slot_number: int) -> Optional[bool]:
