@@ -253,3 +253,51 @@ def test_only_a_live_stuck_report_counts():
     assert not app._snapshot_stuck_job({"v2": {"stuck_job": False, "connection": "live"}})
     assert not app._snapshot_stuck_job({"status": "IDLE"})
     assert not app._snapshot_stuck_job(None)
+
+
+# --- the open print keeps Link's match (shop P1S-8 / P1S-9, 2026-09-28) ------
+
+def test_a_finish_that_drops_the_subtask_id_is_still_links_print(tmp_path):
+    state = _state(EventOutbox(str(tmp_path / "e.json")))
+    state.register_submission("1748657951", batch_id="b-8", plate=1)
+    state.ingest(_doc("IDLE"))
+    state.ingest(_doc("RUNNING", gcode_file="batch-x-1.3mf", subtask_id="1748657951"))
+    # The P1 FINISH frame names no (or another) subtask id.
+    state.ingest(_doc("FINISH", gcode_file="batch-x-1.3mf", subtask_id="0", mc_percent=100))
+    events = state.pending_events()
+    assert [(e["type"], e["origin"], e["batch_id"]) for e in events] == [
+        ("print_started", "link", "b-8"),
+        ("print_finished", "link", "b-8"),
+    ]
+
+
+def test_the_next_external_print_does_not_inherit_the_match(tmp_path):
+    state = _state(EventOutbox(str(tmp_path / "e.json")))
+    state.register_submission("1748657951", batch_id="b-8", plate=1)
+    state.ingest(_doc("IDLE"))
+    state.ingest(_doc("RUNNING", gcode_file="a.3mf", subtask_id="1748657951"))
+    state.ingest(_doc("FINISH", gcode_file="a.3mf", subtask_id="1748657951"))
+    state.ingest(_doc("IDLE"))
+    state.ingest(_doc("RUNNING", gcode_file="sd-card.3mf", subtask_id="999"))
+    state.ingest(_doc("FINISH", gcode_file="sd-card.3mf", subtask_id="0"))
+    last_two = state.pending_events()[-2:]
+    assert [(e["origin"], e["batch_id"]) for e in last_two] == [
+        ("external", None), ("external", None),
+    ]
+
+
+def test_a_cloud_send_tags_its_events_without_print_host():
+    """Link without print-host has no router; the send still tags the batch."""
+    from bridge.app import _tag_submission
+
+    class _Fleet:
+        def __init__(self):
+            self.calls = []
+
+        def register_submission(self, bambu_id, submission_id, batch_id=None, plate=None):
+            self.calls.append((bambu_id, submission_id, batch_id, plate))
+
+    fleet = _Fleet()
+    _tag_submission(fleet, "P1", "1748657951", "b-8", 1)
+    _tag_submission(fleet, "P1", None, "b-8", 1)
+    assert fleet.calls == [("P1", "1748657951", "b-8", 1)]

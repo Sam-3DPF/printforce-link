@@ -1307,6 +1307,7 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             except OSError:
                 pass
             submission_id = _submission_on_printer(fleet, bambu_id)
+            _tag_submission(fleet, bambu_id, submission_id, batch_id, plate_index)
             if router is not None:
                 _record_cloud_assignment(
                     router, str(bambu_id), str(batch_id), plate_index,
@@ -1483,6 +1484,25 @@ def _submission_on_printer(fleet, bambu_id: str):
     return getattr(printer, "last_submission_id", None)
 
 
+def _tag_submission(fleet, bambu_id, submission_id, batch_id, plate_index) -> None:
+    """Tag this start's lifecycle events with the batch and plate.
+
+    The router's registrar does this too, but only when print-host is on.
+    Without it the shop's events had no batch_id and 3DPF could not finish
+    the file (2026-09-28, P1S-8 and P1S-9).
+    """
+    if submission_id is None:
+        return
+    register = getattr(fleet, "register_submission", None)
+    if not callable(register):
+        return
+    try:
+        register(str(bambu_id), submission_id, batch_id=str(batch_id), plate=plate_index)
+    except Exception:
+        logger.warning("could not tag submission %s with batch %s", submission_id, batch_id,
+                       exc_info=True)
+
+
 def _record_cloud_assignment(router, bambu_id, batch_id, plate_index, *,
                              started_at, submission_id) -> None:
     kwargs = {
@@ -1640,6 +1660,7 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
         fresh = _submission_on_printer(fleet, bambu_id)
         if fresh is not None:
             record["submission_id"] = fresh
+            _tag_submission(fleet, bambu_id, fresh, batch_id, plate_index)
         record["uploaded"] = True
         save_attempt(started_path, router, str(bambu_id), record)
         return
@@ -1658,6 +1679,7 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
         fresh = _submission_on_printer(fleet, bambu_id)
         if fresh is not None:
             record["submission_id"] = fresh
+            _tag_submission(fleet, bambu_id, fresh, batch_id, plate_index)
         record["uploaded"] = True
         save_attempt(started_path, router, str(bambu_id), record)
         return
