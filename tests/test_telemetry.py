@@ -1769,3 +1769,78 @@ def test_wifi_signal_text_from_the_printer_is_read_as_dbm():
     assert _dbm("dBm") is None
     assert _dbm(None) is None
     assert parse_telemetry({"print": {"wifi_signal": "-64dBm"}})["wifi_signal"] == -64
+
+
+# --- RFID re-read gate and pushall hygiene (plan 2026-09-28-001 U5) -------------
+
+def _blank_tray_stub(gcode_state, tray_now="255"):
+    return {"print": {
+        "gcode_state": gcode_state,
+        "ams": {"tray_exist_bits": "3", "tray_now": tray_now, "ams": [{"id": "0", "tray": [
+            {"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"},
+            {"id": "1"},
+        ]}]},
+    }}
+
+
+def _rfid_commands(printer):
+    return [item["print"] for item in getattr(printer._session, "published", [])
+            if "print" in item and item["print"].get("command") == "ams_get_rfid"]
+
+
+def test_refresh_mid_print_asks_for_a_dump_but_never_turns_a_spool():
+    """AE5: ams_get_rfid moves the spool; Bambuddy refuses it unless idle."""
+    stub = _blank_tray_stub("RUNNING")
+    printer = _printer([stub], absorb_dumps=[stub, stub, stub])
+    printer.snapshot()
+    printer._session.published = []
+    printer._session.pushall_calls = 0
+
+    assert printer.request_full_status() is True
+    assert printer._session.pushall_calls == 1
+    assert _rfid_commands(printer) == []
+    assert printer.rfid_reread_blocker() == "rfid_skipped_busy"
+
+
+def test_refresh_with_filament_in_the_toolhead_does_not_reread_rfid():
+    stub = _blank_tray_stub("IDLE", tray_now="0")
+    printer = _printer([stub], absorb_dumps=[stub, stub, stub])
+    printer.snapshot()
+    printer._session.published = []
+
+    printer.request_full_status()
+    assert _rfid_commands(printer) == []
+    assert printer.rfid_reread_blocker() == "rfid_skipped_filament_loaded"
+
+
+def test_refresh_on_an_idle_unloaded_printer_rereads_the_blank_tray():
+    stub = _blank_tray_stub("IDLE")
+    printer = _printer([stub], absorb_dumps=[stub, stub, stub])
+    printer.snapshot()
+    printer._session.published = []
+
+    printer.request_full_status()
+    assert [(c["ams_id"], c["slot_id"]) for c in _rfid_commands(printer)] == [(0, 1)]
+    assert printer.rfid_reread_blocker() is None
+
+
+def test_nothing_to_reread_means_no_blocker_even_mid_print():
+    full = {"print": {"gcode_state": "RUNNING", "ams": {"tray_exist_bits": "1", "tray_now": "0",
+            "ams": [{"id": "0", "tray": [{"id": "0", "tray_color": "E8AFCFFF", "tray_type": "PLA"}]}]}}}
+    printer = _printer([full])
+    printer.snapshot()
+
+    assert printer.rfid_reread_blocker() is None
+
+
+def test_request_full_status_does_not_publish_into_a_session_that_is_not_connected():
+    stub = _blank_tray_stub("IDLE")
+    printer = _printer([stub])
+    printer.snapshot()
+    printer._session.connected = False
+    printer._session.published = []
+    printer._session.pushall_calls = 0
+
+    assert printer.request_full_status() is False
+    assert printer._session.pushall_calls == 0
+    assert printer._session.published == []

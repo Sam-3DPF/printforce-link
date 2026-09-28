@@ -749,9 +749,11 @@ class BambuPrinter:
         self._session = session
         self._ip = ip
         logger.info("connected to printer %s (%s) at %s", self.bambu_id, self._cfg.name, ip)
+        # No pushall here: start() returns before the broker answers, so it could
+        # only fail. The session asks for one on CONNACK, and snapshot asks again
+        # while trays are missing.
         self._asked_full_status = False
         self._full_status_attempts = 0
-        self._request_ams_if_needed()
 
     def reconnect(self, new_ip: Optional[str] = None) -> None:
         """Rebuild the MQTT client, optionally at a new IP after the printer's DHCP lease
@@ -1468,10 +1470,31 @@ class BambuPrinter:
         except Exception:
             logger.debug("printer %s: command was not recorded", self.bambu_id)
 
+    def rfid_reread_blocker(self) -> Optional[str]:
+        """Why a present tray with no reading cannot be re-read now, or None.
+
+        `ams_get_rfid` turns the spool, so, like Bambuddy's `ams_refresh_tray`,
+        only an idle printer with nothing in the toolhead (`tray_now` 255) is
+        asked. None also when no tray needs a re-read.
+        """
+        payload = self.state.view()["payload"] or {}
+        if not idle_trays_needing_rfid(payload):
+            return None
+        print_obj = payload.get("print") if isinstance(payload, dict) else None
+        print_obj = print_obj if isinstance(print_obj, dict) else {}
+        gcode_state = clean_str(print_obj.get("gcode_state"))
+        if (gcode_state or "").upper() not in _PRINT_START_EVIDENCE:
+            return "rfid_skipped_busy"
+        ams = print_obj.get("ams") if isinstance(print_obj.get("ams"), dict) else {}
+        tray_now = as_int(ams.get("tray_now"), None)
+        if tray_now is not None and tray_now != 255:
+            return "rfid_skipped_filament_loaded"
+        return None
+
     def _request_idle_rfid(self) -> bool:
         """`ams_get_rfid` is the printer command HA uses to read one P1 tray."""
-        trays = list(idle_trays_needing_rfid(self.state.view()["payload"] or {}))
-        if not trays:
+        trays = idle_trays_needing_rfid(self.state.view()["payload"] or {})
+        if not trays or self.rfid_reread_blocker() is not None:
             return False
         asked = False
         for ams_id, slot_id in trays:
@@ -1548,7 +1571,9 @@ class BambuPrinter:
             {
               "bambu_id": str,
               "status": IDLE | PRINTING | PAUSED | NEEDS_CLEARING | ERROR | OFFLINE,
-              "slots": [{slot_number, color_hex, filament_type}] | None,  # see below
+              "slots": [{slot_number, color_hex, filament_type,     # see below
+                         remain_percent?, filament_name?, filament_id?,
+                         spool_uid?}] | None,                     # see ams.parse_ams
               <the telemetry fields, flat>,                        # see parse_telemetry
               "gcode_state": str | None,                            # bounded firmware state
               "hms_present": bool, "hms_empty": bool,

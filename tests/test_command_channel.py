@@ -170,6 +170,39 @@ def test_unknown_actions_and_printers_are_named(tmp_path):
     assert _run_mailbox_command(fleet, None, other, set(), str(tmp_path), None) == "unknown_printer"
 
 
+
+class _RefreshPrinter(_Printer):
+    def __init__(self, blocker=None):
+        super().__init__()
+        self.blocker = blocker
+
+    def refresh_print(self):
+        self.calls.append("refresh")
+        return True
+
+    def rfid_reread_blocker(self):
+        return self.blocker
+
+
+def test_a_refresh_that_cannot_reread_rfid_says_why(tmp_path):
+    """AE5: the card shows why the RFID step waited."""
+    fleet = _Fleet(_RefreshPrinter("rfid_skipped_busy"))
+    outcome = _run_mailbox_command(fleet, None, _cmd("r1", "refresh"), set(), str(tmp_path), None)
+    assert outcome == ("published", "rfid_skipped_busy")
+
+
+def test_a_refresh_with_nothing_blocked_is_plainly_published(tmp_path):
+    fleet = _Fleet(_RefreshPrinter(None))
+    assert _run_mailbox_command(fleet, None, _cmd("r1", "refresh"), set(), str(tmp_path), None) == "published"
+
+
+def test_a_published_outcome_with_a_reason_acks_with_that_reason():
+    dpf = _Dpf({"commands": [_cmd("r1", "refresh")], "hints": []})
+    channel, _runs = _channel(dpf, [("published", "rfid_skipped_filament_loaded")])
+    assert channel.run_once() == "done"
+    assert dpf.acks == [("r1", "published", "rfid_skipped_filament_loaded")]
+
+
 # --- the cloud client ---------------------------------------------------------
 
 class _Resp:

@@ -26,7 +26,7 @@ import logging
 import queue
 import threading
 import time
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Optional, Tuple, Union
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,8 @@ REJECTED_DEVELOPER_MODE = "rejected_developer_mode_off"
 
 
 class CommandChannel:
-    def __init__(self, dpf, run_command: Callable[[Dict], Optional[str]], *,
+    def __init__(self, dpf,
+                 run_command: Callable[[Dict], Union[Optional[str], Tuple[str, str]]], *,
                  on_hint: Optional[Callable[[list], None]] = None,
                  wait_seconds: float = 25.0, retry_seconds: float = 3.0,
                  error_backoff: float = 5.0, unsupported_backoff: float = 300.0,
@@ -119,8 +120,11 @@ class CommandChannel:
         except Exception:
             logger.exception("command %s (%s) raised", command_id, command.get("action"))
             outcome = None
+        reason = None
+        if isinstance(outcome, tuple):
+            outcome, reason = outcome  # published, with a note for the receipt
         if outcome in (PUBLISHED, ALREADY):
-            self._ack(command_id, ACK_PUBLISHED)
+            self._ack(command_id, ACK_PUBLISHED, reason)
             self._last_try.pop(command_id, None)
             return True
         if outcome == REJECTED_DEVELOPER_MODE:

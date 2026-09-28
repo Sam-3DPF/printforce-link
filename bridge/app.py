@@ -1078,7 +1078,8 @@ def _run_mailbox_command(fleet, dpf, command: dict, applied_controls, spool_dir,
 
     ``on_reply(command_id, state, reason, body)`` is called when the printer
     answers it (U13). A printer refusing every command settles it as
-    rejected: developer_mode_off.
+    rejected: developer_mode_off. A Refresh whose RFID re-read has to wait
+    returns ``(published, reason)`` so the receipt says why.
     """
     action = command.get("action")
     bambu_id = command.get("bambu_id")
@@ -1103,6 +1104,13 @@ def _run_mailbox_command(fleet, dpf, command: dict, applied_controls, spool_dir,
         printer = fleet.by_id(str(bambu_id)) if hasattr(fleet, "by_id") else None
         if getattr(printer, "commands_rejected", None) is True:
             return REJECTED_DEVELOPER_MODE
+        if action == "refresh":
+            # Refresh runs on the printer's worker. Say now, on the receipt, when
+            # its RFID re-read will have to wait (a print, or filament loaded).
+            blocker = getattr(printer, "rfid_reread_blocker", None)
+            reason = blocker() if callable(blocker) else None
+            if reason:
+                return outcome, reason
     return outcome
 
 
