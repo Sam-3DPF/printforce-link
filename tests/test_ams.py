@@ -761,3 +761,15 @@ def test_spool_fact_text_is_bounded():
     assert len(slot["filament_name"]) == 64
     assert len(slot["filament_id"]) == 32
     assert len(slot["spool_uid"]) == 64
+
+
+def test_merge_never_changes_the_callers_objects():
+    import copy as _copy
+    previous = _two_units()
+    incoming = {"tray_exist_bits": "7f", "ams": [{"id": "0", "tray": [_tray(1, "000000FF", uuid="C" * 32)]}]}
+    before = (_copy.deepcopy(previous), _copy.deepcopy(incoming))
+
+    merged = merge_ams(previous, incoming)
+    merged["ams"][0]["tray"][1]["tray_color"] = "changed"
+
+    assert (previous, incoming) == before

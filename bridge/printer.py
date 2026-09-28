@@ -1493,10 +1493,8 @@ class BambuPrinter:
 
     def _request_idle_rfid(self) -> bool:
         """`ams_get_rfid` is the printer command HA uses to read one P1 tray."""
-        if self.rfid_reread_blocker() is not None:
-            return False
-        trays = list(idle_trays_needing_rfid(self.state.view()["payload"] or {}))
-        if not trays:
+        trays = idle_trays_needing_rfid(self.state.view()["payload"] or {})
+        if not trays or self.rfid_reread_blocker() is not None:
             return False
         asked = False
         for ams_id, slot_id in trays:

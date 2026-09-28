@@ -354,15 +354,17 @@ def merge_ams(previous, incoming):
     """
     if not isinstance(incoming, dict):
         return copy.deepcopy(previous) if isinstance(previous, dict) else None
-    previous = previous if isinstance(previous, dict) else {}
+    # Copy both once. The helpers below edit these copies in place, so nothing
+    # the caller holds is aliased or changed.
+    incoming = copy.deepcopy(incoming)
+    merged = copy.deepcopy(previous) if isinstance(previous, dict) else {}
     bits = (
         _normalize_tray_exist_bits(incoming.get("tray_exist_bits"))
-        or _normalize_tray_exist_bits(previous.get("tray_exist_bits"))
+        or _normalize_tray_exist_bits(merged.get("tray_exist_bits"))
     )
-    merged = copy.deepcopy(previous)
     for key, value in incoming.items():
         if key != "ams":
-            merged[key] = copy.deepcopy(value)
+            merged[key] = value
     incoming_units = incoming.get("ams")
     if incoming_units == []:
         merged["ams"] = []  # the printer says it has no AMS units
@@ -398,26 +400,26 @@ def _merge_units(previous_units, incoming_units, bits):
                 trays[tray_index] = _blank_tray({**trays.get(tray_index, {}), **tray})
             else:
                 trays[tray_index] = _merge_tray(trays.get(tray_index), tray)
-        merged = {**stored, **copy.deepcopy({k: v for k, v in unit.items() if k != "tray"})}
+        merged = {**stored, **{k: v for k, v in unit.items() if k != "tray"}}
         merged["tray"] = [trays[k] for k in sorted(trays, key=lambda k: (k is None, k))]
         by_id[unit_index] = merged
     return [by_id[k] for k in sorted(by_id)]
 
 
 def _merge_tray(stored, incoming):
-    merged = copy.deepcopy(stored) if isinstance(stored, dict) else {}
+    merged = stored if isinstance(stored, dict) else {}
     if "tray_color" in incoming or "cols" in incoming:
         # One colour, two spellings: a new reading replaces both.
         merged.pop("tray_color", None)
         merged.pop("cols", None)
     for key, value in incoming.items():
         if key in _READING_FIELDS:
-            merged[key] = copy.deepcopy(value)
+            merged[key] = value
         elif key in _IDENTITY_FIELDS:
             if _real_identity(value):
                 merged[key] = value
         elif value not in (None, ""):
-            merged[key] = copy.deepcopy(value)
+            merged[key] = value
     return merged
 
 
@@ -427,11 +429,10 @@ def _real_identity(value) -> bool:
 
 
 def _blank_tray(tray: dict) -> dict:
-    """An empty tray: drop what it held and which spool it was."""
-    blanked = copy.deepcopy(tray)
+    """An empty tray: drop what it held and which spool it was. Edits `tray`."""
     for key in _READING_FIELDS + _IDENTITY_FIELDS:
-        blanked.pop(key, None)
-    return blanked
+        tray.pop(key, None)
+    return tray
 
 
 def _blank_trays_the_bits_call_empty(ams_obj: dict, bits: Optional[str]) -> None:
