@@ -103,7 +103,30 @@ again. Applying is idempotent on `id`.
 - **Never:** send a Stop Link did not get from an operator; gate Link on a guessed
   status; keep its own copy of Bambu codes.
 
-## 4. Change rules
+## 4. Commands (mailbox and doorbell)
+
+Every operator command (pause, resume, stop, light, temperature, dismiss, …)
+is one row in `printer_commands`. Its id is also sent in the older desired
+state `control` slot, so a Link that reads both runs it once.
+
+- **Wait:** `GET /api/bridge/commands/wait?timeout=25` (bridge token). It returns
+  as soon as the farm has an open command or a hint, else empty lists after
+  `timeout`:
+  `{"commands": [{"id", "bambu_id", "action", "params", "expires_in_ms"}], "hints": ["send"]}`.
+  `send` means a send was authorized: post state now to receive it.
+- **Deadline:** relative (`expires_in_ms`). Link computes its own deadline and
+  never runs a command after it (`failed: expired_on_link`).
+- **Ack:** `POST /api/bridge/commands/{id}/ack` with
+  `{"state": "published" | "applied" | "rejected" | "failed", "reason"?, "reply"?}`.
+  A command stays in the wait until it is acked or expires. A final state
+  is never overwritten; `published` can still become `applied` or `rejected`.
+- **Once:** Link keeps the ids it published on disk. A command id is published
+  at most once, ever.
+- **Cloud rules:** stop supersedes an open pause or resume; a newer temperature
+  supersedes the same heater's older one; everything else runs in order. A
+  published pause / resume / stop is `applied` when Link's state shows it.
+
+## 5. Change rules
 
 - Add fields; never rename or repurpose one. Both repos' contract tests read the
   example payloads in `tests/fixtures/contract/` (Link) and

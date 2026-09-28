@@ -47,6 +47,7 @@ from .send_pipeline import (
     uploaded_already,
 )
 from .store import PrinterStore
+from .command_channel import UNKNOWN_ACTION, CommandChannel
 from .pacer import ReportPacer
 from .updater import SelfUpdater, default_state_path
 
@@ -504,6 +505,16 @@ def main(config_path: str = "config.toml") -> None:
         ("recover dead sessions", fleet.recover_dead_sessions),
     ])
     upkeep.start()
+    # The command doorbell (U12): a click reaches the printer in about a second.
+    # Shares applied_controls with desired-state controls, so an id runs once.
+    commands = CommandChannel(
+        dpf,
+        lambda command: _run_mailbox_command(
+            fleet, dpf, command, applied_controls, spool_dir, router,
+        ),
+        on_hint=lambda hints: pacer.poke() if "send" in hints else None,
+    )
+    commands.start()
     logger.info("Reporting every %ss, and within about 1s of a printer changing; "
                 "heartbeat every %ss; a printer that says nothing new for %ss is "
                 "reported OFFLINE",
@@ -972,8 +983,28 @@ def _queue_diagnose(fleet, printer, dpf, bambu_id: str, control_id, *, trigger) 
     return _diagnostic_posted(result)
 
 
+# The report loop (desired-state ``control``) and the command channel (mailbox)
+# can hold the same id. One of them publishes it.
+_CONTROL_LOCK = threading.Lock()
+
+# What _apply_control returns.
+CONTROL_PUBLISHED = "published"
+CONTROL_ALREADY = "already"
+CONTROL_UNKNOWN_PRINTER = "unknown_printer"
+
+
 def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
-                   spool_dir: Optional[str], router, dpf=None) -> None:
+                   spool_dir: Optional[str], router, dpf=None) -> Optional[str]:
+    """Publish one control id once. Returns published, already, unknown_printer,
+    or None when it was not published and should be retried."""
+    with _CONTROL_LOCK:
+        return _apply_control_locked(
+            fleet, bambu_id, control, applied_controls, spool_dir, router, dpf=dpf,
+        )
+
+
+def _apply_control_locked(fleet, bambu_id: str, control: dict, applied_controls,
+                          spool_dir: Optional[str], router, dpf=None) -> Optional[str]:
     control_id = control["id"]
     marker = (
         os.path.join(spool_dir, f"control-{control_id}.applied")
@@ -981,11 +1012,11 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
     )
     if control_id in applied_controls or (marker and os.path.exists(marker)):
         applied_controls.add(control_id)
-        return
+        return CONTROL_ALREADY
     printer = fleet.by_id(bambu_id) if hasattr(fleet, "by_id") else None
     if printer is None:
         logger.warning("control %s for unknown printer %s", control["action"], bambu_id)
-        return
+        return CONTROL_UNKNOWN_PRINTER
     action = control["action"]
     if action == "collect_log":
         if not _queue_collect_log(fleet, printer, dpf, bambu_id, control_id):
@@ -1036,6 +1067,24 @@ def _apply_control(fleet, bambu_id: str, control: dict, applied_controls,
                 pass
         except OSError:
             pass
+    return CONTROL_PUBLISHED
+
+
+def _run_mailbox_command(fleet, dpf, command: dict, applied_controls, spool_dir, router):
+    """One mailbox command (U12) through the same once-only path as desired state."""
+    action = command.get("action")
+    bambu_id = command.get("bambu_id")
+    if action not in _CONTROL_ACTIONS or not bambu_id:
+        return UNKNOWN_ACTION
+    control = {"id": str(command["id"]), "action": action}
+    params = command.get("params")
+    if isinstance(params, dict):
+        for key, value in params.items():
+            if key not in ("id", "action"):
+                control[key] = value
+    return _apply_control(
+        fleet, str(bambu_id), control, applied_controls, spool_dir, router, dpf=dpf,
+    )
 
 
 def _desired_cloud_send_keys(desired) -> set:
