@@ -1404,7 +1404,8 @@ def test_upload_that_keeps_failing_is_reported_to_3dpf(tmp_path):
     assert dpf.failed == []
 
     _passes(fleet, dpf, tmp_path, [130.0], failures)
-    assert dpf.failed == [("B1", 2, "upload_failed")]
+    # The FTPS kind says whether to look at Wi-Fi or at the SD card.
+    assert dpf.failed == [("B1", 2, "upload_failed; storage")]
     assert fleet.starts == []
 
     # Latched: the next pass does not upload again.
