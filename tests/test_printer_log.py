@@ -370,12 +370,11 @@ def test_printer_log_survives_rebuild_and_reconnect_and_records_commands():
 
     exported = printer.collect_log()
     commands = [event for event in exported["events"] if event["kind"] == "command"]
-    # connect() asks for a full dump before CONNACK, so that publish is refused.
+    # connect() no longer asks for a dump before CONNACK: that publish could only
+    # be refused. The session asks for one when the broker answers.
     assert [(event["name"], event["accepted"]) for event in commands] == [
-        ("pushall", False),
         ("pause", True),
         ("project_file", True),
-        ("pushall", False),
         ("pause", True),
     ]
     assert any(event["kind"] == "reset" for event in exported["events"])

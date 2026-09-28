@@ -119,8 +119,11 @@ class CommandChannel:
         except Exception:
             logger.exception("command %s (%s) raised", command_id, command.get("action"))
             outcome = None
+        reason = None
+        if isinstance(outcome, tuple):
+            outcome, reason = outcome  # published, with a note for the receipt
         if outcome in (PUBLISHED, ALREADY):
-            self._ack(command_id, ACK_PUBLISHED)
+            self._ack(command_id, ACK_PUBLISHED, reason)
             self._last_try.pop(command_id, None)
             return True
         if outcome == REJECTED_DEVELOPER_MODE:
