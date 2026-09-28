@@ -26,7 +26,7 @@ def _v2(print_obj, connection="live", down_reason=None, user_cancelled=False):
 def _events(frames, *, submission=None, link_stop_after=None):
     state = PrinterState(_SERIAL, monotonic=lambda: 0.0, wall_clock=lambda: _AT)
     if submission:
-        state.register_submission(submission, batch_id="11111111-2222-3333-4444-555555555555", plate=1)
+        state.register_submission(submission, batch_id="3f2a9c1e-8b4d-4e6a-9c2f-7d1e5b8a0c4f", plate=1)
     for i, frame in enumerate(frames):
         if link_stop_after is not None and i == link_stop_after:
             state.note_link_stop()
