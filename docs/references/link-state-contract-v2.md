@@ -120,6 +120,11 @@ state `control` slot, so a Link that reads both runs it once.
   `{"state": "published" | "applied" | "rejected" | "failed", "reason"?, "reply"?}`.
   A command stays in the wait until it is acked or expires. A final state
   is never overwritten; `published` can still become `applied` or `rejected`.
+- **Printer replies:** a mailbox command is published with its own
+  `sequence_id`. When the printer answers with `result`, Link acks `applied`
+  or `rejected` (the printer's `reason`) with `reply`. No answer leaves it
+  `published`. A printer refusing all commands (HMS `0500_0500_0001_0007`)
+  settles it as `rejected: developer_mode_off`.
 - **Once:** Link keeps the ids it published on disk. A command id is published
   at most once, ever.
 - **Cloud rules:** stop supersedes an open pause or resume; a newer temperature
