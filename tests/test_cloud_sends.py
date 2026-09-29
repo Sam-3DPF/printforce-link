@@ -1119,6 +1119,15 @@ def test_authoritative_send_still_refuses_an_invalid_cloud_mapping(tmp_path):
     assert fleet.calls == []
 
 
+@pytest.mark.parametrize("flag, tray", [(True, 1), (_NO_FLAG, 0)])
+def test_republished_start_honours_the_authoritative_flag(tmp_path, flag, tray):
+    """The watchdog's republish resolves the mapping the same way as the first start."""
+    fleet = _CorrectedFleet()
+    send = _corrected_desired(flag=flag)[0]["send"]
+    assert _republish_start(send, fleet, "P1", str(tmp_path / "missing.3mf"), 1)
+    assert fleet.starts[0][2] == [tray]
+
+
 def test_authoritative_send_rechecks_the_fresh_cloud_mapping_after_upload(tmp_path):
     """Slots move during upload. Start follows the fresh cloud mapping, not a live remap."""
     class MoveDuringUploadFleet(_CorrectedFleet):

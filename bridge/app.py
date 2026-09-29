@@ -2051,8 +2051,9 @@ def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[lis
 
     `slots is None` is Link's "no AMS unit list this cycle". That is not a tray
     disagreement. Use the already-validated cloud mapping so upload-then-start
-    still fires. A live list that uniquely remaps wins. If that list cannot
-    uniquely bind, use the cloud mapping. A malformed `slots` value and a
+    still fires. A live list that uniquely remaps wins, unless the send is
+    flagged authoritative (below). If that list cannot uniquely bind, use the
+    cloud mapping. A malformed `slots` value and a
     broken snapshot with no `slots` key still fail closed.
 
     `ams_mapping_authoritative: true` means 3DPF built the mapping with an
