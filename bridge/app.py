@@ -2051,9 +2051,15 @@ def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[lis
 
     `slots is None` is Link's "no AMS unit list this cycle". That is not a tray
     disagreement. Use the already-validated cloud mapping so upload-then-start
-    still fires. A live list that uniquely remaps wins. If that list cannot
-    uniquely bind, use the cloud mapping. A malformed `slots` value and a
+    still fires. A live list that uniquely remaps wins, unless the send is
+    flagged authoritative (below). If that list cannot uniquely bind, use the
+    cloud mapping. A malformed `slots` value and a
     broken snapshot with no `slots` key still fail closed.
+
+    `ams_mapping_authoritative: true` means 3DPF built the mapping with an
+    operator's Correct color that differs from a tray's RFID. Link sees only
+    the RFID, so its remap could pick the stale chip's tray. Keep the cloud
+    mapping then. The fail-closed checks above still apply.
     """
     logical_required = _required_filaments(send)
     if logical_required is None:
@@ -2072,6 +2078,14 @@ def _resolve_cloud_ams_mapping(send: dict, fleet, bambu_id: str) -> Optional[lis
     if not isinstance(slots, list):
         return None
     live_mapping = _mapping_from_live_slots(logical_required, live)
+    if send.get("ams_mapping_authoritative") is True:
+        if live_mapping is not None and live_mapping != validated:
+            logger.info(
+                "cloud send %s: kept the cloud AMS mapping %s over live %s "
+                "(3DPF has a Correct color on this printer)",
+                send.get("batch_id"), validated, live_mapping,
+            )
+        return validated
     if live_mapping is not None:
         return live_mapping
     return validated
