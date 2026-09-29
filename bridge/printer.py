@@ -111,6 +111,9 @@ _PRINT_ENDED = frozenset({"FINISH", "FAILED"})
 # unknown prior state is not evidence of an idle machine.
 _PRINT_START_EVIDENCE = frozenset({"IDLE", "FINISH", "FAILED"})
 
+# ams_get_rfid is never published while this is False. See _request_idle_rfid.
+_RFID_REREAD_ENABLED = False
+
 # stg_cur values that need retry_filament_action before resume_print (KTD6).
 # 6 = runout, 17/20 = load, 21 = unload / AMS, 24 = AMS lost, 35 = clog.
 _FILAMENT_RETRY_STAGES = frozenset({6, 17, 20, 21, 24, 35})
@@ -1471,6 +1474,19 @@ class BambuPrinter:
             logger.debug("printer %s: command was not recorded", self.bambu_id)
 
     def rfid_reread_blocker(self) -> Optional[str]:
+        """Why a present tray with no reading is not re-read now, or None.
+
+        Always ``rfid_reread_disabled`` while ``_RFID_REREAD_ENABLED`` is off
+        (shop P1S-7 / P1S-11, 2026-09-29). See ``_request_idle_rfid``.
+        """
+        payload = self.state.view()["payload"] or {}
+        if not idle_trays_needing_rfid(payload):
+            return None
+        if not _RFID_REREAD_ENABLED:
+            return "rfid_reread_disabled"
+        return self._rfid_reread_unsafe()
+
+    def _rfid_reread_unsafe(self) -> Optional[str]:
         """Why a present tray with no reading cannot be re-read now, or None.
 
         `ams_get_rfid` turns the spool, so, like Bambuddy's `ams_refresh_tray`,
@@ -1492,7 +1508,18 @@ class BambuPrinter:
         return None
 
     def _request_idle_rfid(self) -> bool:
-        """`ams_get_rfid` is the printer command HA uses to read one P1 tray."""
+        """`ams_get_rfid` is the printer command HA uses to read one P1 tray.
+
+        Off (``_RFID_REREAD_ENABLED``). Shop 2026-09-29: about 9 s after Link
+        v0.1.43 reconnected, P1S-7 and P1S-11 - idle on finished plates with
+        the filament retracted, the only case the idle check allows - began
+        printing an earlier file on their own, with the last job's AMS mapping,
+        and failed at the first colour change. v0.1.42 was the first version
+        whose automatic pushall actually reached this command on an idle P1.
+        Nothing publishes it until a capture proves it is safe on each model.
+        """
+        if not _RFID_REREAD_ENABLED:
+            return False
         trays = idle_trays_needing_rfid(self.state.view()["payload"] or {})
         if not trays or self.rfid_reread_blocker() is not None:
             return False

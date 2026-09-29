@@ -913,9 +913,11 @@ def test_mqtt_message_keeps_idle_hex_when_dump_is_already_a_stub():
     ]
 
 
-def test_snapshot_asks_rfid_for_p1s9_blank_loaded_trays():
+def test_snapshot_asks_rfid_for_p1s9_blank_loaded_trays(monkeypatch):
     """Live P1S-9 on 0.1.17: bits `ff`, slots 1-2 and 7-8 have hex, 3-6 do not.
     Automatic pushall used read_idle_rfid=False, so those four never got RFID."""
+    # The re-read logic, with the command switched on (it ships off).
+    monkeypatch.setattr("bridge.printer._RFID_REREAD_ENABLED", True)
     stub = {"print": {
         "gcode_state": "FINISH",
         "ams": {"tray_exist_bits": "ff", "ams": [
@@ -942,7 +944,9 @@ def test_snapshot_asks_rfid_for_p1s9_blank_loaded_trays():
     ]
 
 
-def test_refresh_asks_ams_get_rfid_for_loaded_trays_without_hex():
+def test_refresh_asks_ams_get_rfid_for_loaded_trays_without_hex(monkeypatch):
+    # The re-read logic, with the command switched on (it ships off).
+    monkeypatch.setattr("bridge.printer._RFID_REREAD_ENABLED", True)
     stub = {"print": {
         "gcode_state": "FINISH",
         "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
@@ -964,9 +968,11 @@ def test_refresh_asks_ams_get_rfid_for_loaded_trays_without_hex():
     assert [cmd["slot_id"] for cmd in commands] == [1, 2, 3]
 
 
-def test_print_end_asks_for_a_full_ams_dump_again():
+def test_print_end_asks_for_a_full_ams_dump_again(monkeypatch):
     """Refresh during a job may never get idle-tray hex. Ask again when the
     print ends, even if the connect-time pushall budget is spent."""
+    # The re-read logic, with the command switched on (it ships off).
+    monkeypatch.setattr("bridge.printer._RFID_REREAD_ENABLED", True)
     stub = {"print": {
         "gcode_state": "RUNNING",
         "ams": {"tray_exist_bits": "f", "ams": [{"id": "0", "tray": [
@@ -1788,8 +1794,10 @@ def _rfid_commands(printer):
             if "print" in item and item["print"].get("command") == "ams_get_rfid"]
 
 
-def test_refresh_mid_print_asks_for_a_dump_but_never_turns_a_spool():
+def test_refresh_mid_print_asks_for_a_dump_but_never_turns_a_spool(monkeypatch):
     """AE5: ams_get_rfid moves the spool; Bambuddy refuses it unless idle."""
+    # The re-read logic, with the command switched on (it ships off).
+    monkeypatch.setattr("bridge.printer._RFID_REREAD_ENABLED", True)
     stub = _blank_tray_stub("RUNNING")
     printer = _printer([stub], absorb_dumps=[stub, stub, stub])
     printer.snapshot()
@@ -1802,7 +1810,9 @@ def test_refresh_mid_print_asks_for_a_dump_but_never_turns_a_spool():
     assert printer.rfid_reread_blocker() == "rfid_skipped_busy"
 
 
-def test_refresh_with_filament_in_the_toolhead_does_not_reread_rfid():
+def test_refresh_with_filament_in_the_toolhead_does_not_reread_rfid(monkeypatch):
+    # The re-read logic, with the command switched on (it ships off).
+    monkeypatch.setattr("bridge.printer._RFID_REREAD_ENABLED", True)
     stub = _blank_tray_stub("IDLE", tray_now="0")
     printer = _printer([stub], absorb_dumps=[stub, stub, stub])
     printer.snapshot()
@@ -1813,7 +1823,9 @@ def test_refresh_with_filament_in_the_toolhead_does_not_reread_rfid():
     assert printer.rfid_reread_blocker() == "rfid_skipped_filament_loaded"
 
 
-def test_refresh_on_an_idle_unloaded_printer_rereads_the_blank_tray():
+def test_refresh_on_an_idle_unloaded_printer_rereads_the_blank_tray(monkeypatch):
+    # The re-read logic, with the command switched on (it ships off).
+    monkeypatch.setattr("bridge.printer._RFID_REREAD_ENABLED", True)
     stub = _blank_tray_stub("IDLE")
     printer = _printer([stub], absorb_dumps=[stub, stub, stub])
     printer.snapshot()
@@ -1844,3 +1856,19 @@ def test_request_full_status_does_not_publish_into_a_session_that_is_not_connect
     assert printer.request_full_status() is False
     assert printer._session.pushall_calls == 0
     assert printer._session.published == []
+
+
+def test_link_never_asks_a_printer_to_reread_rfid_by_default():
+    """Shop P1S-7 / P1S-11, 2026-09-29: printers idle on finished plates began
+    an earlier file about 9 s after Link reconnected. ams_get_rfid is the only
+    motion command Link sent there on its own; it is off until proven safe."""
+    import bridge.printer as printer_module
+    assert printer_module._RFID_REREAD_ENABLED is False
+    printer = _printer([{"print": {
+        "gcode_state": "FINISH",
+        "ams": {"tray_now": "255", "tray_exist_bits": "3",
+                "ams": [{"id": "0", "tray": [{"id": "0"}, {"id": "1"}]}]},
+    }}])
+    printer.snapshot()
+    printer.request_full_status()
+    assert _rfid_commands(printer) == []
