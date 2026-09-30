@@ -22,7 +22,7 @@ class ImplicitFtpsServer:
                  size_override=None, plaintext=False, stall_seconds=0.0,
                  password="access-code", hold_before_reply=None,
                  dele_existing_reply=None, require_prot_c=False,
-                 retr_reply=None, retr_short=None):
+                 retr_reply=None, retr_short=None, stor_reply_delay_seconds=0.0):
         self._certfile = certfile
         self._keyfile = keyfile
         self.require_session_reuse = require_session_reuse
@@ -39,6 +39,9 @@ class ImplicitFtpsServer:
         self.require_prot_c = require_prot_c
         self.retr_reply = retr_reply
         self.retr_short = retr_short
+        # Seconds between storing the bytes and sending the closing reply, like
+        # a P1 with a slow SD card. Commands sent meanwhile wait behind it.
+        self.stor_reply_delay_seconds = stor_reply_delay_seconds
         self.prot = "P"
         self.stor_blocked = threading.Event()
         self._stop = threading.Event()
@@ -272,6 +275,8 @@ class ImplicitFtpsServer:
                 self.hold_before_reply.wait(0.05)
         if self.stor_final_reply is None:
             return
+        if self.stor_reply_delay_seconds:
+            self._stop.wait(self.stor_reply_delay_seconds)
         self._reply(control, self.stor_final_reply)
 
     def _retr(self, control, pasv, name):
