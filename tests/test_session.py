@@ -694,3 +694,140 @@ def test_the_send_watchdog_reset_then_republish_sends_exactly_one_start():
     assert commands.count("project_file") == 1
     assert len(broker.clients) == 2
     assert broker.clients[0].loop_stop_calls == 1
+
+
+# U2: a start the printer echoes that Link did not publish on this client is
+# recorded as unexpected_start. The printer echoes every project_file it takes
+# on the report topic.
+class _EventLog:
+    def __init__(self):
+        self.events = []
+
+    def record_event(self, kind, **fields):
+        self.events.append((kind, fields))
+
+    def record_message(self, direction, topic, payload, *, accepted=None):
+        pass
+
+
+def _start_with_id(task_id, file="plate.3mf", *, subtask_only=False):
+    body = {"sequence_id": "20000", "command": "project_file",
+            "param": "Metadata/plate_1.gcode", "file": file,
+            "subtask_id": task_id}
+    if not subtask_only:
+        body["task_id"] = task_id
+    return {"print": body}
+
+
+def _echo(start):
+    return {"print": {**start["print"], "result": "success", "reason": "success"}}
+
+
+def _unexpected(log):
+    return [fields for kind, fields in log.events if kind == "unexpected_start"]
+
+
+def _logged_session(clock, broker, log, serial=_SERIAL):
+    return LinkSession(
+        "10.0.0.5", "secret-code", serial, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None, log=log,
+    )
+
+
+def _fire_report(client, serial, doc):
+    client.fire_message(f"device/{serial}/report", json.dumps(doc).encode())
+
+
+def test_an_echo_of_the_start_link_just_published_records_nothing(caplog):
+    clock = Clock(5000.0)
+    broker = _ReplayBroker()
+    log = _EventLog()
+    session = _logged_session(clock, broker, log)
+    session.start()
+    broker.accept(broker.current)
+    start = _start_with_id("5000000001")
+    assert session.publish(start) is True
+
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        _fire_report(broker.current, _SERIAL, _echo(start))
+
+    assert _unexpected(log) == []
+    assert not [r for r in caplog.records if "start" in r.getMessage()]
+
+
+def test_an_echo_of_a_start_from_the_previous_client_is_link_earlier(caplog):
+    clock = Clock(6000.0)
+    broker = _ReplayBroker()
+    log = _EventLog()
+    session = _logged_session(clock, broker, log)
+    session.start()
+    broker.accept(broker.current)
+    start = _start_with_id("5000000002", "batch-old-1.3mf")
+    assert session.publish(start) is True
+
+    broker.drop()
+    clock.now += 5
+    session.tick()
+    broker.accept(broker.current)
+    clock.now += 2
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        _fire_report(broker.current, _SERIAL, _echo(start))
+
+    assert _unexpected(log) == [{
+        "file": "batch-old-1.3mf",
+        "task_id": "5000000002",
+        "seconds_since_connack": 2.0,
+        "origin": "link_earlier",
+    }]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert _SERIAL in warnings[0] and "batch-old-1.3mf" in warnings[0]
+
+
+def test_an_echo_with_an_id_link_never_published_is_other_sender(caplog):
+    clock = Clock(7000.0)
+    broker = _ReplayBroker()
+    log = _EventLog()
+    session = _logged_session(clock, broker, log)
+    session.start()
+    broker.accept(broker.current)
+    clock.now += 1.5
+    # No task_id: the subtask_id is the fallback.
+    stranger = _start_with_id("7000000009", "studio-send.3mf", subtask_only=True)
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        _fire_report(broker.current, _SERIAL, _echo(stranger))
+
+    assert _unexpected(log) == [{
+        "file": "studio-send.3mf",
+        "task_id": "7000000009",
+        "seconds_since_connack": 1.5,
+        "origin": "other_sender",
+    }]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert _SERIAL in warnings[0] and "studio-send.3mf" in warnings[0]
+
+
+def test_connack_and_disconnect_carry_the_attempt_and_the_reason():
+    clock = Clock(8000.0)
+    broker = _ReplayBroker()
+    log = _EventLog()
+    session = _logged_session(clock, broker, log)
+    session.start()
+    # The first client never reaches CONNACK.
+    broker.current.fire_disconnect(_CONN_LOST)
+    clock.now += 5
+    session.tick()
+    broker.accept(broker.current)
+    broker.current.up = False
+    broker.current.fire_disconnect(ReasonCode(PacketTypes.DISCONNECT, identifier=141))
+    clock.now += 5
+    session.tick()
+    broker.accept(broker.current)
+
+    connacks = [f for kind, f in log.events if kind == "connack"]
+    disconnects = [f for kind, f in log.events if kind == "disconnect"]
+    assert [f["attempt"] for f in connacks] == [2, 1]
+    assert [f["attempt"] for f in disconnects] == [1, 2]
+    assert disconnects[1]["reason"] == "Keep alive timeout"
+    assert disconnects[1]["code"] == 141

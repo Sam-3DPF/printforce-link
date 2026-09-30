@@ -524,3 +524,65 @@ def test_printer_log_path_sanitizes_the_serial(tmp_path):
 
     path = _printer_log_path(str(tmp_path), "01P/../weird serial")
     assert path == os.path.join(str(tmp_path), "printer-01P_.._weird_serial.jsonl")
+
+
+_SHOP_REPLAY = os.path.join(
+    os.path.dirname(__file__), "fixtures", "shop_replay_2026_09_30.jsonl",
+)
+
+
+def _epoch(at):
+    import datetime
+    return datetime.datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+
+
+def test_the_shop_replay_records_each_replayed_start_as_link_earlier(caplog):
+    """Shop P1S, 2026-09-30 (serial anonymised). Link started two files at
+    14:29 and 15:00. At 18:06:29, after the 18:00 drop, the printer echoed
+    both starts again. The 18:07:56 start is Link's own on the new client."""
+    import logging
+
+    from bridge.bambu.log import PrinterLog
+
+    with open(_SHOP_REPLAY, encoding="utf-8") as handle:
+        records = [json.loads(line) for line in handle if line.strip()]
+    serial = "01P00TESTSERIAL"
+    assert all(serial in r["topic"] for r in records if r["record"] == "message")
+
+    clock = _Clock(_epoch(records[0]["at"]))
+    broker = _Broker()
+    log = PrinterLog(serial, event_capacity=500, monotonic=clock, wall_clock=clock)
+    session = LinkSession(
+        "10.0.0.5", "secret-code", serial, client_factory=broker.factory,
+        log=log, monotonic=clock, watchdog_interval=None,
+    )
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        session.start()
+        for record in records:
+            clock.now = _epoch(record["at"])
+            if record["record"] == "event":
+                if record["kind"] == "connack":
+                    # U1: the watchdog redials a fresh client after a drop.
+                    session.tick()
+                    broker.current.fire_connack(record["code"])
+                elif record["kind"] == "disconnect":
+                    broker.current.fire_disconnect(record["code"])
+                continue
+            payload = record["payload"]
+            if record["direction"] == "out":
+                # CONNACK publishes pushall and get_version on its own.
+                if payload.get("print", {}).get("command") == "project_file":
+                    assert session.publish(payload) is True
+                continue
+            broker.current.fire_message(record["topic"], json.dumps(payload).encode())
+
+    assert len(broker.clients) == 2
+    unexpected = [e for e in log.export()["events"] if e["kind"] == "unexpected_start"]
+    assert [(e["task_id"], e["file"], e["origin"]) for e in unexpected] == [
+        ("1924711886", "batch-2026-09-28-ke9pacfn-1.3mf", "link_earlier"),
+        ("1926569165", "batch-2026-09-28-zeg32WPs-1.3mf", "link_earlier"),
+    ]
+    assert all(0 < e["seconds_since_connack"] < 1 for e in unexpected)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert all(serial in w for w in warnings)

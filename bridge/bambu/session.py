@@ -23,6 +23,11 @@ A silent session is not reset while the printer is unpacking or preparing a
 file, or while a start is inside the send watchdog's phase A. Resetting then
 makes a P1 raise 0500_4003 (Bambuddy #1150/#1678). A socket that is actually
 down still redials.
+
+The printer echoes every ``project_file`` it takes on the report topic. An
+echo whose task id this client did not publish is an ``unexpected_start``:
+``link_earlier`` when an earlier client of this process published it (a
+replay), else ``other_sender``.
 """
 
 import itertools
@@ -32,6 +37,7 @@ import os
 import ssl
 import threading
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 
 import paho.mqtt.client as mqtt
@@ -63,9 +69,62 @@ _UNREACHABLE_AFTER_SECONDS = 60.0
 _WATCHDOG_INTERVAL_SECONDS = 5.0
 # Enable only after a captured shop P1S get_version reply is pinned in a test.
 COMMAND_PROBE_ENABLED = False
+# Start task ids kept per client, and per printer for the process.
+_START_IDS_KEPT = 200
 
 _client_ids = itertools.count(1)
 _client_id_lock = threading.Lock()
+
+
+class _RecentIds:
+    """The last ``limit`` ids added, oldest dropped first. Thread-safe."""
+
+    def __init__(self, limit=_START_IDS_KEPT):
+        self._limit = limit
+        self._ids = OrderedDict()
+        self._lock = threading.Lock()
+
+    def add(self, value) -> None:
+        with self._lock:
+            self._ids[value] = None
+            self._ids.move_to_end(value)
+            while len(self._ids) > self._limit:
+                self._ids.popitem(last=False)
+
+    def __contains__(self, value) -> bool:
+        with self._lock:
+            return value in self._ids
+
+
+# Every start task id this process published, per printer serial. A new
+# client or a rebuilt session does not clear it.
+_starts_ever = {}
+_starts_ever_lock = threading.Lock()
+
+
+def _starts_ever_for(serial) -> _RecentIds:
+    with _starts_ever_lock:
+        ids = _starts_ever.get(serial)
+        if ids is None:
+            ids = _starts_ever[serial] = _RecentIds()
+        return ids
+
+
+def _start_of(doc):
+    """The ``print`` body of a ``project_file`` message, or None."""
+    body = doc.get("print") if isinstance(doc, dict) else None
+    if isinstance(body, dict) and body.get("command") == "project_file":
+        return body
+    return None
+
+
+def _start_task_id(body):
+    """``task_id``, else ``subtask_id``, as text. None when neither is set."""
+    for key in ("task_id", "subtask_id"):
+        value = body.get(key)
+        if value not in (None, "", "0", 0):
+            return str(value)
+    return None
 
 
 def build_paho_client(client_id: str) -> mqtt.Client:
@@ -110,6 +169,17 @@ def _reason_value(reason):
     try:
         return int(reason)
     except (TypeError, ValueError):
+        return None
+
+
+def _reason_name(reason):
+    """paho's name for a reason code (``Keep alive timeout``), or None for a bare int."""
+    get_name = getattr(reason, "getName", None)
+    if not callable(get_name):
+        return None
+    try:
+        return str(get_name())
+    except Exception:
         return None
 
 
@@ -185,6 +255,12 @@ class LinkSession:
         self._reports_this_client = 0
         self._empty_topic_logged_for = None
         self._developer_mode_logged_for = None
+        # Clients opened since the last successful CONNACK, this one included.
+        self._attempt = 0
+        self._attempt_connacked = False
+        # Start task ids handed to the current client. Replaced with the client.
+        self._starts_this_client = _RecentIds()
+        self._starts_ever = _starts_ever_for(serial)
         self._watchdog = None
         self._watchdog_stop = threading.Event()
         self._report_topic = f"device/{serial}/report"
@@ -439,6 +515,7 @@ class LinkSession:
         with self._lock:
             client = self._client
             connected = self._connected
+            starts = self._starts_this_client
         if not connected or client is None:
             self._record_message("out", self._request_topic, payload, accepted=False)
             return False
@@ -447,6 +524,9 @@ class LinkSession:
         except Exception:
             self._record_message("out", self._request_topic, payload, accepted=False)
             return False
+        # Noted even when paho returns an error code: paho may still hold the
+        # message and send it on this client, so its echo is not unexpected.
+        self._note_start_published(payload, starts)
         accepted = _publish_accepted(info)
         self._record_message("out", self._request_topic, payload, accepted=accepted)
         return accepted
@@ -460,6 +540,11 @@ class LinkSession:
             self._client_id = client_id
             self._connected = False
             self._client_ended = False
+            self._starts_this_client = _RecentIds()
+            if self._attempt_connacked:
+                self._attempt = 0
+                self._attempt_connacked = False
+            self._attempt += 1
             # Cleared only by a CONNACK, so a redial does not restart the
             # unreachable clock.
             if self._socket_down_since is None:
@@ -532,7 +617,8 @@ class LinkSession:
             self._reports_this_client = 0
             self._empty_topic_logged_for = None
             self._developer_mode_logged_for = None
-            self._record_event("connack", result="ok", code=code)
+            self._attempt_connacked = True
+            self._record_event("connack", result="ok", code=code, attempt=self._attempt)
             try:
                 client.subscribe(self._report_topic, qos=_QOS)
             except Exception:
@@ -547,7 +633,7 @@ class LinkSession:
             self._last_connect_error = reason
             self._end_client_locked()
         self._down_reason = self._last_connect_error
-        self._record_event("connack", result=reason, code=code)
+        self._record_event("connack", result=reason, code=code, attempt=self._attempt)
         self._state = "connecting"
         if rejected:
             # An off printer refuses this way too, so the retry stays slow
@@ -582,6 +668,7 @@ class LinkSession:
         self._reports_this_client += 1
         now = self._monotonic()
         self._last_message_at = now
+        self._note_start_echo(doc, now)
         self._note_probe_reply(doc)
         self._mark_live(now)
         callback = self._on_report
@@ -599,13 +686,52 @@ class LinkSession:
         # A clean disconnect right after a report is not the printer leaving.
         # The client is still done; only the offline clock is skipped.
         ignored = code == 0 and self._report_is_recent()
-        self._record_event("disconnect", code=code, ignored=bool(ignored))
+        self._record_event(
+            "disconnect", code=code, ignored=bool(ignored),
+            reason=_reason_name(reason_code), attempt=self._attempt,
+        )
         with self._lock:
             if self._client is client:
                 self._connected = False
                 self._end_client_locked()
                 if not ignored and self._socket_down_since is None:
                     self._socket_down_since = self._monotonic()
+
+    def _note_start_published(self, payload, starts) -> None:
+        body = _start_of(payload)
+        if body is None:
+            return
+        task_id = _start_task_id(body)
+        if task_id is None:
+            return
+        starts.add(task_id)
+        self._starts_ever.add(task_id)
+
+    def _note_start_echo(self, doc, now: float) -> None:
+        """Record a ``project_file`` echo this client did not publish."""
+        body = _start_of(doc)
+        if body is None:
+            return
+        task_id = _start_task_id(body)
+        if task_id is not None and task_id in self._starts_this_client:
+            return
+        origin = (
+            "link_earlier"
+            if task_id is not None and task_id in self._starts_ever
+            else "other_sender"
+        )
+        file_name = body.get("file") or body.get("subtask_name") or body.get("url")
+        connack_at = self._connack_at
+        since = None if connack_at is None else round(now - connack_at, 3)
+        self._record_event(
+            "unexpected_start", file=file_name, task_id=task_id,
+            seconds_since_connack=since, origin=origin,
+        )
+        logger.warning(
+            "printer %s: received a start Link did not send on this connection: "
+            "%s (task %s, %s, %ss after CONNACK)",
+            self.serial, file_name, task_id, origin, since,
+        )
 
     def _start_watchdog(self) -> None:
         if self._watchdog_interval is None or self._user_stopped:
