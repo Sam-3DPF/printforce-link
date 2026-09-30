@@ -513,7 +513,7 @@ def _control_readable(sock, timeout):
     return bool(ready)
 
 
-def _read_size(ftp, remote_path):
+def _read_size(ftp, remote_path, deadline_at, clock):
     """SIZE, skipping a closing reply that came after the closing wait.
 
     Shop P1S-6, 2026-09-29: a slow SD card sent 226 about 3s after the last
@@ -526,9 +526,11 @@ def _read_size(ftp, remote_path):
     except ftplib.error_temp as exc:
         if not str(exc).lstrip().startswith("426"):
             raise
+        _arm(ftp, deadline_at, clock)
         resp = ftp.getresp()
     else:
         if resp.startswith("226"):
+            _arm(ftp, deadline_at, clock)
             resp = ftp.getresp()
     if resp.startswith("213"):
         return int(resp[3:].strip())
@@ -538,7 +540,7 @@ def _read_size(ftp, remote_path):
 def _require_size(ftp, remote_path, expected, deadline_at, clock):
     _arm(ftp, deadline_at, clock)
     try:
-        got = _read_size(ftp, remote_path)
+        got = _read_size(ftp, remote_path, deadline_at, clock)
     except TimeoutError:
         raise FtpsError("timeout", "transfer deadline exceeded") from None
     except ftplib.error_perm as exc:
