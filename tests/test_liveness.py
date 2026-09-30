@@ -426,24 +426,48 @@ def test_auth_rejected_stops_fast_retry_and_redials_after_300s():
     assert session.had_session is True
 
 
-def test_refused_is_not_relabelled_unreachable():
+def test_refused_redials_on_the_backoff_and_is_not_relabelled_unreachable():
     clock = Clock(8000.0)
     broker = Broker()
     session = _session(broker, clock)
     session.start()
     broker.current.fire_connack(4)
-    clock.now += 61
+    assert broker.current.disconnect_calls >= 1
+
+    clock.now = 8004.0
+    session.tick()
+    assert len(broker.clients) == 1
+    clock.now = 8005.0
+    session.tick()
+    assert len(broker.clients) == 2
+    assert session.down_reason == "refused"
+    assert session.last_connect_error == "refused"
+    assert broker.clients[0].loop_stop_calls == 1
+
+    broker.current.fire_connack(4)
+    clock.now = 8014.0
+    session.tick()
+    assert len(broker.clients) == 2
+    clock.now = 8015.0
+    session.tick()
+    assert len(broker.clients) == 3
+
+    broker.current.fire_connack(4)
+    clock.now = 8061.0
     session.tick()
     assert session.down_reason == "refused"
     assert session.state != "offline"
-    assert len(broker.clients) == 1
 
+    broker.current.fire_connack(0)
+    assert session.last_connect_error is None
+    assert session.down_reason is None
 
-def test_socket_down_past_60s_is_unreachable_without_a_reset():
+def test_socket_down_past_60s_is_unreachable_while_redials_continue():
     clock = Clock(9000.0)
     broker = Broker()
     printer = _linked_printer(clock, broker)
     printer.connect()
+    # A first connect that never answers is paho's own retry. No new client.
     clock.now = 9059.0
     printer._session.tick()
     assert printer.connection_state == "connecting"
@@ -456,22 +480,51 @@ def test_socket_down_past_60s_is_unreachable_without_a_reset():
     assert len(broker.clients) == 1
     assert printer._session.had_session is False
 
+    # A printer that was live and then switched off: redial a fresh client,
+    # and still read unreachable once it has been down for 60s.
+    broker.current.fire_connack(0)
+    _report(broker.current, {"print": {"gcode_state": "IDLE"}})
+    assert printer.down_reason is None
+    dropped_at = clock.now
+    broker.current.fire_disconnect(7)
+    while clock.now < dropped_at + 59:
+        clock.now += 5
+        printer._session.tick()
+        if clock.now < dropped_at + 59:
+            assert printer.down_reason != "unreachable"
+    assert len(broker.clients) == 2
+    clock.now = dropped_at + 61
+    printer._session.tick()
+    assert printer.connection_state == "offline"
+    assert printer.down_reason == "unreachable"
+    assert printer._session.had_session is True
 
-def test_a_live_socket_that_drops_is_unreachable_and_not_reset_by_the_stale_timer():
+    broker.current.fire_connack(0)
+    assert printer.down_reason is None
+
+def test_a_live_socket_that_drops_redials_a_fresh_client_and_reads_unreachable():
     clock = Clock(10000.0)
     broker = Broker()
     session = _session(broker, clock)
     _go_live(session, broker)
     assert session.had_session is True
-    broker.current.fire_disconnect(128)
+    first = broker.current
+    first.fire_disconnect(128)
     assert session.connected is False
-    clock.now += 61
+
+    clock.now += 5
+    session.tick()
+    assert len(broker.clients) == 2
+    assert first.loop_stop_calls == 1
+    assert session.state == "connecting"
+
+    clock.now += 56
     session.tick()
     assert session.state == "offline"
     assert session.down_reason == "unreachable"
-    assert len(broker.clients) == 1
-    assert session.silent_for(clock.now) > 300 or session.silent_for(clock.now) >= 61
-
+    # The new client is still in paho's first-connect retry; no stale reset.
+    assert len(broker.clients) == 2
+    assert session.silent_for(clock.now) >= 61
 
 def test_had_session_and_silent_for_follow_the_last_report():
     clock = Clock(11000.0)
@@ -514,3 +567,95 @@ def test_watchdog_ticks_until_disconnect():
     seen.clear()
     assert not seen.wait(0.05)
     assert session.connected is False
+
+
+def _silent_for_90s(clock, printer):
+    """The watchdog ticks every 5s through 90s of silence."""
+    for _ in range(18):
+        clock.now += 5
+        printer._session.tick()
+
+
+def test_a_silent_session_is_not_reset_while_preparing_and_is_while_idle():
+    """AE4. Resetting while a P1 unpacks a file raises 0500_4003."""
+    for state in ("PREPARE", "SLICING"):
+        clock = Clock(13000.0)
+        broker = Broker()
+        printer = _linked_printer(clock, broker)
+        printer.connect()
+        broker.current.fire_connack(0)
+        _report(broker.current, {"print": {"gcode_state": state}})
+        _silent_for_90s(clock, printer)
+        assert len(broker.clients) == 1, state
+        assert printer.connection_state == "stale"
+        held = [e for e in printer.collect_log()["events"] if e["kind"] == "reset_held"]
+        assert len(held) == 1
+        assert held[0]["reason"] == state
+
+    clock = Clock(13000.0)
+    broker = Broker()
+    printer = _linked_printer(clock, broker)
+    printer.connect()
+    broker.current.fire_connack(0)
+    _report(broker.current, {"print": {"gcode_state": "IDLE"}})
+    _silent_for_90s(clock, printer)
+    assert len(broker.clients) == 2
+    assert printer.down_reason == "silent_session"
+
+
+def test_a_silent_session_is_not_reset_inside_the_send_phase_a():
+    from bridge.send_pipeline import PHASE_A_SECONDS
+
+    clock = Clock(14000.0)
+    broker = Broker()
+    printer = _linked_printer(clock, broker)
+    printer.connect()
+    broker.current.fire_connack(0)
+    _report(broker.current, {"print": {"gcode_state": "IDLE"}})
+    assert printer.start_print("benchy.3mf", [0], 1) is True
+    started = clock.now
+
+    while clock.now + 5 < started + PHASE_A_SECONDS:
+        clock.now += 5
+        printer._session.tick()
+    assert len(broker.clients) == 1
+    clock.now = started + PHASE_A_SECONDS
+    printer._session.tick()
+    assert len(broker.clients) == 2
+
+
+def test_a_dropped_socket_redials_even_while_preparing():
+    clock = Clock(15000.0)
+    broker = Broker()
+    printer = _linked_printer(clock, broker)
+    printer.connect()
+    broker.current.fire_connack(0)
+    _report(broker.current, {"print": {"gcode_state": "PREPARE"}})
+    broker.current.fire_disconnect(7)
+    clock.now += 5
+    printer._session.tick()
+    assert len(broker.clients) == 2
+
+
+def test_commands_rejected_after_a_drop_uses_a_fresh_client():
+    clock = Clock(16000.0)
+    broker = Broker()
+    printer = _linked_printer(clock, broker)
+    printer.connect()
+    broker.current.fire_connack(0)
+    _report(broker.current, {"print": {
+        "gcode_state": "IDLE",
+        "hms": [{"attr": 0x05000500, "code": 0x00010007}],
+    }})
+    assert printer.commands_rejected is True
+    first = broker.current
+    first.fire_disconnect(7)
+    clock.now += 5
+    printer._session.tick()
+    assert len(broker.clients) == 2
+    assert first.loop_stop_calls == 1
+    broker.current.fire_connack(0)
+    assert _bodies(broker.current) == [
+        {"pushing": {"sequence_id": "0", "command": "pushall"}},
+        {"info": {"sequence_id": "0", "command": "get_version"}},
+    ]

@@ -225,20 +225,25 @@ def test_collected_log_includes_session_events_in_time_order():
     session.start()
     broker.current.fire_connack(0)
     _report(broker.current, {"print": {"gcode_state": "IDLE"}})
+    # Ignored for the offline clock, but the client is done: a fresh one follows.
     broker.current.fire_disconnect(0)
+    clock.now = 1005.0
+    session.tick()
+    broker.current.fire_connack(0)
+    clock.now = 1040.0
     assert session.probe() == "1"
     _report(broker.current, _version_reply("1"))
     assert session.probe() == "2"
-    clock.now = 1010.0
+    clock.now = 1050.0
     session.tick()
     assert session.probe() == "3"
-    clock.now = 1020.0
+    clock.now = 1060.0
     session.tick()
     broker.current.fire_connack(0)
-    clock.now = 1081.0
+    clock.now = 1121.0
     session.tick()
     broker.current.fire_connack(134)
-    clock.now = 1381.0
+    clock.now = 1421.0
     session.tick()
     broker.current.fire_disconnect(50)
 
@@ -248,6 +253,10 @@ def test_collected_log_includes_session_events_in_time_order():
         "connect",
         "connack",
         "disconnect",
+        "redial",
+        "reset",
+        "connect",
+        "connack",
         "probe_sent",
         "probe_answered",
         "probe_sent",
@@ -271,20 +280,21 @@ def test_collected_log_includes_session_events_in_time_order():
     assert events[1]["code"] == 0
     assert events[2]["ignored"] is True
     assert events[2]["code"] == 0
-    assert events[3]["sequence_id"] == "1"
-    assert events[4]["sequence_id"] == "1"
-    assert events[6]["count"] == 1
-    assert events[8]["count"] == 2
-    assert events[9]["reason"] == "commands_ignored"
-    assert events[12]["kind"] == "stale"
-    assert events[13]["reason"] == "silent_session"
-    assert events[15]["result"] == "auth_rejected"
-    assert events[15]["code"] == 134
-    assert events[17]["reason"] == "auth_rejected"
+    assert events[3]["after"] == 5.0
+    assert events[7]["sequence_id"] == "1"
+    assert events[8]["sequence_id"] == "1"
+    assert events[10]["count"] == 1
+    assert events[12]["count"] == 2
+    assert events[13]["reason"] == "commands_ignored"
+    assert events[16]["kind"] == "stale"
+    assert events[17]["reason"] == "silent_session"
+    assert events[19]["result"] == "auth_rejected"
+    assert events[19]["code"] == 134
+    assert events[21]["reason"] == "auth_rejected"
     assert events[-1]["ignored"] is False
     assert events[-1]["code"] == 50
     assert all(event["kind"] != "connect" or event["host"] == "10.0.0.5" for event in events)
-    assert len({event["client_id"] for event in events if event["kind"] == "connect"}) == 4
+    assert len({event["client_id"] for event in events if event["kind"] == "connect"}) == 5
     inbound = [m for m in log.export()["messages"] if m["direction"] == "in"]
     assert inbound
     assert all("accepted" not in message for message in inbound)

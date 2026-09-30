@@ -11,6 +11,18 @@ racy enough that paho's default inflight cap of 20 wedges the session
 after a handful of commands; the cap is raised, and the caller thread
 must not block on it. ``loop_stop`` joins the network thread with no
 timeout, so teardown runs that join on a daemon helper and gives up.
+
+paho never redials a client that reached CONNACK. An in-place redial re-sends
+every QoS 1 message the broker has not PUBACKed, and Bambu's broker rarely
+PUBACKs, so every reconnect replayed old ``project_file`` starts (shop logs,
+2026-09-30; Bambuddy #1136). After any drop the watchdog stops that client and
+opens a fresh one on a 5-30s backoff. paho still retries a client's first
+connect, since nothing is published before CONNACK.
+
+A silent session is not reset while the printer is unpacking or preparing a
+file, or while a start is inside the send watchdog's phase A. Resetting then
+makes a P1 raise 0500_4003 (Bambuddy #1150/#1678). A socket that is actually
+down still redials.
 """
 
 import itertools
@@ -30,8 +42,12 @@ _PORT = 8883
 _KEEPALIVE_SECONDS = 30
 _QOS = 1
 _MAX_INFLIGHT = 1000
+# paho's own backoff. It only paces a client's first connect now.
 _RECONNECT_MIN_SECONDS = 1
 _RECONNECT_MAX_SECONDS = 30
+# The watchdog's redial after a client ends. Its own 5s tick is the floor.
+_REDIAL_MIN_SECONDS = 5.0
+_REDIAL_MAX_SECONDS = 30.0
 # paho's loop_stop() joins its network thread forever. Callers get a bound.
 _DISCONNECT_TIMEOUT_SECONDS = 1.5
 # A clean broker disconnect in the wake of a report is not the printer leaving.
@@ -53,12 +69,17 @@ _client_id_lock = threading.Lock()
 
 
 def build_paho_client(client_id: str) -> mqtt.Client:
-    """A fresh MQTT 3.1.1 client. Each connect gets its own id and a clean session."""
+    """A fresh MQTT 3.1.1 client. Each connect gets its own id and a clean session.
+
+    paho does not redial it after a drop. A redial would replay its unacked
+    QoS 1 queue; the session opens a new client instead.
+    """
     return mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
         client_id=client_id,
         protocol=mqtt.MQTTv311,
         clean_session=True,
+        reconnect_on_failure=False,
     )
 
 
@@ -133,6 +154,13 @@ class LinkSession:
         self._client = None
         self._client_id = None
         self._connected = False
+        # The current client dropped or was refused. paho will not redial it.
+        self._client_ended = False
+        self._redial_delay = _REDIAL_MIN_SECONDS
+        self._redial_at = None
+        # Returns why a silent session must not be reset now, or None.
+        self._reset_hold = None
+        self._hold_logged = None
         self._last_message_at = None
         self._last_connect_error = None
         self._state = "offline"
@@ -245,6 +273,14 @@ class LinkSession:
         """Attach the printer-owned ring. Reconnect must not start a second one."""
         self._log = log
 
+    def set_reset_hold(self, hold) -> None:
+        """``hold()`` names why a silent session must not be reset now, or returns None.
+
+        The printer owns the merged ``gcode_state`` and its last start. It is
+        called on the watchdog thread.
+        """
+        self._reset_hold = hold
+
     def _record_event(self, kind, **fields) -> None:
         log = self._log
         if log is None:
@@ -286,7 +322,8 @@ class LinkSession:
         try:
             if self._user_stopped:
                 return
-            preserve_auth = keep_reason == "auth_rejected"
+            # A redial keeps the connect error, so its label survives.
+            preserve_error = keep_reason in ("auth_rejected", "refused")
             self._record_event("reset", reason=keep_reason)
             self._stop()
             self._last_reset_at = self._monotonic()
@@ -295,7 +332,7 @@ class LinkSession:
             self._probe_misses = 0
             self._next_probe_at = None
             self._down_reason = keep_reason
-            if not preserve_auth:
+            if not preserve_error:
                 self._last_connect_error = None
             self._open()
         finally:
@@ -331,6 +368,7 @@ class LinkSession:
             return
 
         if not self._connected:
+            self._redial_if_due(now)
             if self._last_connect_error == "refused":
                 self._state = "connecting"
                 self._down_reason = "refused"
@@ -343,8 +381,9 @@ class LinkSession:
 
         self._tick_quiet_client()
         if self._commands_rejected:
-            # A new client does not clear this fault, and it drops the QoS 1
-            # queue. Stay on this client in every gcode_state.
+            # A new client does not clear this fault, so silence is not reset
+            # for it. A drop still redials a fresh client above; the mailbox
+            # and the send watchdog own command retries.
             self._log_developer_mode_once()
             return
 
@@ -363,6 +402,12 @@ class LinkSession:
                 self._record_event("stale")
             self._state = "stale"
             self._down_reason = "silent_session"
+            held = self._reset_held()
+            if held is not None:
+                if self._hold_logged != anchor:
+                    self._hold_logged = anchor
+                    self._record_event("reset_held", reason=held)
+                return
             if self._reset_allowed(now):
                 self.hard_reset(keep_reason="silent_session")
 
@@ -414,7 +459,11 @@ class LinkSession:
             self._client = client
             self._client_id = client_id
             self._connected = False
-            self._socket_down_since = self._monotonic()
+            self._client_ended = False
+            # Cleared only by a CONNACK, so a redial does not restart the
+            # unreachable clock.
+            if self._socket_down_since is None:
+                self._socket_down_since = self._monotonic()
             self._session_started_wall = None
         self._record_event("connect", host=self.host, client_id=client_id)
         try:
@@ -475,6 +524,9 @@ class LinkSession:
                 self._session_started_wall = self._wall_clock()
                 self._socket_down_since = None
                 self._auth_retry_not_before = None
+                self._client_ended = False
+                self._redial_delay = _REDIAL_MIN_SECONDS
+                self._redial_at = None
             self._state = "connecting"
             self._down_reason = None
             self._reports_this_client = 0
@@ -493,14 +545,16 @@ class LinkSession:
         with self._lock:
             self._connected = False
             self._last_connect_error = reason
+            self._end_client_locked()
         self._down_reason = self._last_connect_error
         self._record_event("connack", result=reason, code=code)
         self._state = "connecting"
         if rejected:
-            # paho would redial in 1–30s. An off printer refuses this way too,
-            # so the retry stays slow instead of giving up or hammering.
+            # An off printer refuses this way too, so the retry stays slow
+            # instead of giving up or hammering.
             self._auth_retry_not_before = self._monotonic() + _AUTH_RETRY_SECONDS
-            self._hold_paho_retry(client)
+        # A refused client is done. The watchdog redials a fresh one.
+        self._hold_paho_retry(client)
         if rejected:
             logger.warning(
                 "printer %s: MQTT connection refused (%s, code %s). "
@@ -542,14 +596,15 @@ class LinkSession:
         if client is not self._client:
             return
         code = _reason_value(reason_code)
+        # A clean disconnect right after a report is not the printer leaving.
+        # The client is still done; only the offline clock is skipped.
         ignored = code == 0 and self._report_is_recent()
         self._record_event("disconnect", code=code, ignored=bool(ignored))
-        if ignored:
-            return
         with self._lock:
             if self._client is client:
                 self._connected = False
-                if self._socket_down_since is None:
+                self._end_client_locked()
+                if not ignored and self._socket_down_since is None:
                     self._socket_down_since = self._monotonic()
 
     def _start_watchdog(self) -> None:
@@ -584,6 +639,35 @@ class LinkSession:
                 self.tick()
             except Exception:
                 logger.exception("printer %s: liveness tick failed", self.serial)
+
+    def _end_client_locked(self) -> None:
+        """Mark the current client done and schedule its replacement. Caller holds ``_lock``."""
+        if self._client_ended:
+            return
+        self._client_ended = True
+        self._redial_at = self._monotonic() + self._redial_delay
+
+    def _redial_if_due(self, now: float) -> None:
+        """Replace an ended client with a fresh one once its backoff has passed.
+
+        Runs on the watchdog, never on the paho thread: the reset joins it.
+        """
+        if not self._client_ended or self._redial_at is None or now < self._redial_at:
+            return
+        delay = self._redial_delay
+        self._redial_delay = min(delay * 2, _REDIAL_MAX_SECONDS)
+        self._record_event("redial", after=delay)
+        self.hard_reset(keep_reason=self._down_reason)
+
+    def _reset_held(self):
+        hold = self._reset_hold
+        if hold is None:
+            return None
+        try:
+            return hold()
+        except Exception:
+            logger.debug("printer %s: reset hold raised", self.serial)
+            return None
 
     def _reset_allowed(self, now: float) -> bool:
         last = self._last_reset_at
@@ -620,11 +704,10 @@ class LinkSession:
         )
 
     def _hold_paho_retry(self, client) -> None:
-        """Stop paho's 1–30s backoff without joining the network thread.
+        """End a refused client without joining the network thread.
 
         ``on_connect`` runs on that thread, so ``loop_stop`` would deadlock here.
-        ``disconnect`` moves the client to disconnecting, and paho's loop exits
-        instead of redialing.
+        ``disconnect`` moves the client to disconnecting, and paho's loop exits.
         """
         try:
             client.disconnect()

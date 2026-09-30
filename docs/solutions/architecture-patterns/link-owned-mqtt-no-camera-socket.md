@@ -1,6 +1,7 @@
 ---
 title: Link owns one MQTT session per printer and does not open a camera socket
 date: 2026-09-23
+last_updated: 2026-09-30
 category: architecture-patterns
 module: bridge
 problem_type: architecture_pattern
@@ -12,6 +13,8 @@ applies_when:
   - Replacing the session client or adding a second MQTT client for the same printer
   - Publishing commands on the session
   - Adding a camera feed or any socket to the printer on port 6000
+  - Changing how a dropped or refused client is redialled
+  - Changing when a silent session is reset
 tags:
   - mqtt
   - paho-mqtt
@@ -21,6 +24,8 @@ tags:
   - lan-access-code
   - camera-socket
   - puback
+  - reconnect
+  - 0500_4003
 ---
 
 # Link owns one MQTT session per printer and does not open a camera socket
@@ -41,17 +46,24 @@ Do not wait for a PUBACK. The broker matches those acks unevenly enough that pah
 
 `loop_stop` joins the network thread with no timeout. Teardown runs that join on a daemon helper and gives up after 1.5 seconds.
 
+paho never redials a client that reached CONNACK. `build_paho_client` passes `reconnect_on_failure=False`. An in-place redial re-sends every QoS 1 message the broker has not PUBACKed (`Client._messages_reconnect_reset_out`), and Bambu's broker rarely PUBACKs. On 2026-09-30 every reconnect in the shop logs replayed old `project_file` starts. Bambuddy fixed the same bug with a fresh client (#1136). After any drop or refused CONNACK the session marks the client ended. The watchdog `tick` then runs `hard_reset`, which stops that client on the daemon helper and opens a new one. The redial backoff is 5, 10, 20, then 30 seconds, and a CONNACK resets it. paho still retries a client's first connect, because nothing is published before CONNACK. The new client sends only `pushall` and `get_version`. The send watchdog and the command mailbox own command retries.
+
+The connection labels survive redials. The down-since stamp clears only on CONNACK, so a switched-off printer still reads `unreachable` 60 seconds after the drop. A refused redial keeps `refused`. A clean disconnect within 10 seconds of a report still ends the client. It only skips the offline clock.
+
+A silent session is not reset while the printer is unpacking or preparing a file. The printer gives the session a hold (`set_reset_hold`). The hold names `PREPARE` or `SLICING` from the merged `gcode_state`, or `phase_a` for 90 seconds after an accepted `project_file`. While it holds, the stale branch records `reset_held` once and leaves the client alone. Bambuddy #1150 and #1678 found that resetting a P1 during this window raises `0500_4003`. A socket that is actually down still redials. The send watchdog's own phase A timeout calls `hard_reset` directly and is not held.
+
 `BambuPrinter` states that the session opens no camera socket. `test_connecting_a_printer_does_not_open_port_6000` fails a connect to port 6000 and fails if `session.py` contains `camera`, `6000`, or `bambulabs`. The source does not describe a camera protocol beyond that guard.
 
 ## Why This Matters
 
-Subscribing to `device/{serial}/request` is the drop the session module names for P1S and A1. Waiting on PUBACK, or putting the inflight cap back to paho's default, is the wedge that module names. An unbounded `loop_stop` on the caller thread is why teardown is bounded. Putting `bambulabs-api` back, or opening port 6000, fails the session and telemetry guards. Those guards do not spell out a further camera failure mode.
+Subscribing to `device/{serial}/request` is the drop the session module names for P1S and A1. Waiting on PUBACK, or putting the inflight cap back to paho's default, is the wedge that module names. An unbounded `loop_stop` on the caller thread is why teardown is bounded. Letting paho redial in place replays starts the printer already has. A reset while the printer unpacks is the one known lead for `0500_4003`. Putting `bambulabs-api` back, or opening port 6000, fails the session and telemetry guards. Those guards do not spell out a further camera failure mode.
 
 ## When to Apply
 
 - Changing connect, subscribe, publish, inflight, TLS, or teardown on the session.
 - Adding a printer dependency beside `paho-mqtt==2.1.0`.
 - A change that would subscribe to `device/{serial}/request`, block on PUBACK, call `loop_stop` on the caller thread, or open port 6000.
+- A change that would let paho redial a used client, clear paho's private out-queue, drop to QoS 0, or reset a silent session without asking the reset hold.
 
 ## Examples
 
@@ -59,7 +71,11 @@ From the session module: commands are published to `device/{serial}/request`, an
 
 `tests/test_telemetry.py` imports the pure status logic and asserts `bambulabs_api` is not loaded.
 
+`test_a_reconnect_never_replays_starts_published_before_the_drop` in `tests/test_session.py` models paho's in-place redial from the real `build_paho_client` setting. Two starts are published, the socket drops, and the printer comes back at once. The broker must then receive only `pushall` and `get_version`. `test_a_silent_session_is_not_reset_while_preparing_and_is_while_idle` in `tests/test_liveness.py` holds the reset for 90 seconds of silence in PREPARE and SLICING, and resets while IDLE.
+
 ## Related
 
 - Merged [PR #54](https://github.com/Sam-3DPF/printforce-link/pull/54), tag `v0.1.31`.
-- `bridge/bambu/session.py`, `bridge/printer.py`, `tests/test_session.py`, `requirements.txt`.
+- `bridge/bambu/session.py`, `bridge/printer.py`, `tests/test_session.py`, `tests/test_liveness.py`, `requirements.txt`.
+- The two-phase send watchdog: `docs/solutions/logic-errors/two-phase-send-watchdog.md`.
+- Plan `2026-09-30-001-fix-p1s-start-replay-ams-presence` (3D-PrintForce repo), unit U1.

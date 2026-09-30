@@ -60,6 +60,7 @@ from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.models import ModelProfile, is_known_model, profile_for
 from .state_v2 import build_state_v2
 from .bambu.session import LinkSession
+from .send_pipeline import PHASE_A_SECONDS
 from .bambu.hms import (
     commands_rejected as hms_commands_rejected,
     decode_hms,
@@ -110,6 +111,9 @@ _PRINT_ENDED = frozenset({"FINISH", "FAILED"})
 # printing on the poll before the print began. Assert, never assume — a blank or
 # unknown prior state is not evidence of an idle machine.
 _PRINT_START_EVIDENCE = frozenset({"IDLE", "FINISH", "FAILED"})
+# A P1 unpacking or preparing a file raises 0500_4003 if its MQTT session is
+# reset (Bambuddy #1150/#1678), so a silent session is left alone.
+_UNPACKING_STATES = frozenset({"PREPARE", "SLICING"})
 
 # ams_get_rfid is never published while this is False. See _request_idle_rfid.
 _RFID_REREAD_ENABLED = False
@@ -587,6 +591,9 @@ class BambuPrinter:
         # Last submission id this printer published, so two starts in the
         # same millisecond still differ.
         self._last_submission_id = None
+        # Monotonic time of the last accepted project_file. The send watchdog's
+        # phase A runs from here, and the session is not reset inside it.
+        self._start_published_at = None
         # gcode_line sequence. Separate from the project_file sequence "20000".
         self._line_sequence = 0
         # Mailbox commands waiting for the printer's reply (plan U13).
@@ -740,7 +747,25 @@ class BambuPrinter:
         bind = getattr(session, "set_log", None)
         if callable(bind):
             bind(self._log)
+        hold = getattr(session, "set_reset_hold", None)
+        if callable(hold):
+            hold(self._session_reset_hold)
         return session
+
+    def _session_reset_hold(self):
+        """Why a silent session must not be reset now, or None.
+
+        The merged ``gcode_state`` while PREPARE or SLICING, or ``phase_a``
+        inside the send watchdog's first window after a start. The session
+        asks only while its socket is up.
+        """
+        state = gcode_state_of(self.state.view().get("payload"))
+        if state in _UNPACKING_STATES:
+            return state
+        started = self._start_published_at
+        if started is not None and self._monotonic() - started < PHASE_A_SECONDS:
+            return "phase_a"
+        return None
 
     def _connect(self, ip: str) -> None:
         session = self._make_session(ip)
@@ -901,6 +926,7 @@ class BambuPrinter:
         )
         started = self._publish_command(payload)
         if started:
+            self._start_published_at = self._monotonic()
             self.register_submission(submission_id)
         url = payload["print"]["url"]
         logger.info(

@@ -222,35 +222,63 @@ def test_disconnect_returns_within_two_seconds_when_the_network_thread_is_stuck(
     assert session.connected is False
 
 
-def test_clean_disconnect_within_10s_of_a_report_is_ignored_and_an_error_is_not():
+def test_clean_disconnect_within_10s_of_a_report_ends_the_client_but_not_the_printer():
+    """KTD2: the ignore window only skips the offline clock. The client is done."""
     clock = Clock()
-    fake = FakePaho()
-    session = _session(fake, monotonic=clock)
+    broker = _ReplayBroker()
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None,
+    )
     session.start()
-    fake.fire_connack(0)
-
-    fake.fire_disconnect(0)
-    assert session.connected is False  # no report yet — a clean drop counts
-
-    fake.fire_connack(0)
-    fake.fire_message(f"device/{_SERIAL}/report", b'{"print": {"gcode_state": "IDLE"}}')
+    broker.accept(broker.current)
+    first = broker.current
+    first.fire_message(f"device/{_SERIAL}/report", b'{"print": {"gcode_state": "IDLE"}}')
     assert session.last_message_at == clock.now
-    fake.fire_disconnect(0)
-    assert session.connected is True
-    fake.fire_disconnect(ReasonCode(PacketTypes.DISCONNECT, "Normal disconnection"))
-    assert session.connected is True
 
-    fake.fire_disconnect(128)
+    first.fire_disconnect(ReasonCode(PacketTypes.DISCONNECT, "Normal disconnection"))
     assert session.connected is False
+    assert session.publish({"print": {"command": "pause"}}) is False
+    assert session.state == "live"
+    assert session.down_reason is None
 
-    other = FakePaho()
-    quiet = _session(other, monotonic=clock)
-    quiet.start()
-    other.fire_connack(0)
-    other.fire_message(f"device/{_SERIAL}/report", b'{"print": {"gcode_state": "IDLE"}}')
-    clock.now += 11
-    other.fire_disconnect(0)
-    assert quiet.connected is False
+    clock.now += 5
+    session.tick()
+    assert len(broker.clients) == 2
+    assert first.loop_stop_calls == 1
+    # The unreachable clock starts at the redial, not at the ignored drop.
+    clock.now += 57
+    session.tick()
+    assert session.down_reason is None
+    clock.now += 4
+    session.tick()
+    assert session.down_reason == "unreachable"
+
+
+@pytest.mark.parametrize("reason, report_age", [(0, None), (0, 11), (128, 0)])
+def test_a_drop_outside_the_ignore_window_starts_the_offline_clock(reason, report_age):
+    clock = Clock()
+    broker = _ReplayBroker()
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None,
+    )
+    session.start()
+    broker.accept(broker.current)
+    if report_age is not None:
+        broker.current.fire_message(
+            f"device/{_SERIAL}/report", b'{"print": {"gcode_state": "IDLE"}}',
+        )
+        clock.now += report_age
+    broker.current.fire_disconnect(reason)
+    assert session.connected is False
+    for _ in range(12):
+        clock.now += 5
+        session.tick()
+    clock.now += 1
+    session.tick()
+    assert session.down_reason == "unreachable"
+    assert len(broker.clients) >= 2
 
 
 def test_connecting_a_printer_does_not_open_port_6000(monkeypatch):
@@ -299,6 +327,8 @@ def test_default_client_is_mqtt311_with_a_clean_session():
         assert client._protocol == mqtt.MQTTv311
         assert client._clean_session is True
         assert client._client_id == b"link-abc"
+        # A redial of a used client replays its unacked QoS 1 queue.
+        assert client._reconnect_on_failure is False
     finally:
         client.loop_stop()
 
@@ -458,3 +488,209 @@ def test_the_message_callback_does_not_join_the_network_thread_for_that_fault():
     assert time.monotonic() - started < 2
     assert printer.commands_rejected is True
     assert fake.loop_started == 1
+
+
+# paho 2.1 redials a used client in place and re-sends every QoS 1 message the
+# broker never PUBACKed (Client._messages_reconnect_reset_out). Bambu's broker
+# rarely PUBACKs, so each in-place redial replayed old project_file starts
+# (shop logs 2026-09-30). The model below redials in place exactly when the
+# client build_paho_client makes would.
+def _paho_redials_in_place() -> bool:
+    client = build_paho_client("link-probe")
+    try:
+        return bool(client._reconnect_on_failure)
+    finally:
+        client.loop_stop()
+
+
+_CONN_LOST = 7
+_PUSHALL = {"pushing": {"sequence_id": "0", "command": "pushall"}}
+_GET_VERSION = {"info": {"sequence_id": "0", "command": "get_version"}}
+
+
+class _ReplayPaho(FakePaho):
+    """A client whose QoS 1 publishes are never PUBACKed, like a busy P1S."""
+
+    def __init__(self, broker, client_id):
+        super().__init__()
+        self.broker = broker
+        self.client_id = client_id
+        self.redials_in_place = _paho_redials_in_place()
+        self.unacked = []
+        self.up = False
+        self.loop_stop_calls = 0
+
+    def publish(self, topic, payload=None, qos=0, retain=False):
+        info = super().publish(topic, payload, qos, retain)
+        if qos == 1:
+            self.unacked.append(payload)
+        if self.up:
+            self.broker.wire.append((self.client_id, payload))
+        return info
+
+    def loop_stop(self):
+        self.loop_stop_calls += 1
+
+
+class _ReplayBroker:
+    """The printer's broker. ``wire`` is every command it received, in order."""
+
+    def __init__(self):
+        self.clients = []
+        self.wire = []
+
+    def factory(self, client_id):
+        client = _ReplayPaho(self, client_id)
+        self.clients.append(client)
+        return client
+
+    @property
+    def current(self):
+        return self.clients[-1]
+
+    def accept(self, client):
+        client.up = True
+        client.fire_connack(0)
+
+    def drop(self):
+        client = self.current
+        client.up = False
+        client.fire_disconnect(_CONN_LOST)
+
+    def come_back(self):
+        """The printer answers again. A client paho still runs redials in place."""
+        for client in self.clients:
+            if client.up or not client.redials_in_place or client.loop_stop_calls:
+                continue
+            replay = list(client.unacked)
+            self.accept(client)  # on_connect runs before paho's resend, as in paho
+            for payload in replay:
+                self.wire.append((client.client_id, payload))
+
+
+def _start_body(seq):
+    return {"print": {"sequence_id": seq, "command": "project_file",
+                      "param": "Metadata/plate_1.gcode"}}
+
+
+def test_a_reconnect_never_replays_starts_published_before_the_drop():
+    clock = Clock(1000.0)
+    broker = _ReplayBroker()
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None,
+    )
+    session.start()
+    broker.accept(broker.current)
+    assert session.publish(_start_body("20000")) is True
+    assert session.publish(_start_body("20001")) is True
+
+    broker.drop()
+    since_drop = len(broker.wire)
+    # The printer answers again at once. paho's own redial would win this race.
+    broker.come_back()
+    clock.now += 5
+    session.tick()
+    if not broker.current.up:
+        broker.accept(broker.current)
+
+    after = [json.loads(payload) for _cid, payload in broker.wire[since_drop:]]
+    assert after == [_PUSHALL, _GET_VERSION]
+    assert session.connected is True
+
+
+def test_each_post_connack_drop_gets_a_new_client_and_stops_the_old_one_once():
+    clock = Clock(2000.0)
+    broker = _ReplayBroker()
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None,
+    )
+    session.start()
+    for _ in range(3):
+        broker.accept(broker.current)
+        broker.drop()
+        clock.now += 5
+        session.tick()
+        session.tick()
+    ids = [client.client_id for client in broker.clients]
+    assert len(ids) == 4
+    assert len(set(ids)) == 4
+    assert [client.loop_stop_calls for client in broker.clients[:-1]] == [1, 1, 1]
+    assert broker.current.loop_stop_calls == 0
+    broker.come_back()
+    assert [client.up for client in broker.clients[:-1]] == [False, False, False]
+
+
+def test_a_redial_waits_5_then_10_20_30s_and_a_connack_resets_it():
+    clock = Clock(3000.0)
+    broker = _ReplayBroker()
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None,
+    )
+    session.start()
+    broker.accept(broker.current)
+    dropped_at = clock.now
+    broker.drop()
+
+    opened = []
+    for _ in range(100):
+        clock.now += 1
+        before = len(broker.clients)
+        session.tick()
+        if len(broker.clients) > before:
+            opened.append(clock.now - dropped_at)
+            # The printer takes the socket and closes it before CONNACK.
+            broker.current.fire_disconnect(_CONN_LOST)
+    assert opened == [5, 15, 35, 65, 95]
+
+    clock.now = dropped_at + 125
+    session.tick()
+    assert len(broker.clients) == 7
+    broker.accept(broker.current)
+    broker.drop()
+    clock.now += 4
+    session.tick()
+    before = len(broker.clients)
+    clock.now += 1
+    session.tick()
+    assert len(broker.clients) == before + 1
+
+
+def test_the_send_watchdog_reset_then_republish_sends_exactly_one_start():
+    """Phase A timeout: the app resets the session, then republishes once."""
+    clock = Clock(4000.0)
+    broker = _ReplayBroker()
+    cfg = PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="x", name="P1")
+
+    def factory(ip, access_code, serial, on_report):
+        return LinkSession(
+            ip, access_code, serial, on_report=on_report,
+            client_factory=broker.factory, monotonic=clock, watchdog_interval=None,
+        )
+
+    printer = BambuPrinter(
+        cfg, session_factory=factory, monotonic=clock, sleep=lambda _seconds: None,
+    )
+    printer.connect()
+    broker.accept(broker.current)
+    broker.current.fire_message(
+        f"device/{_SERIAL}/report", b'{"print": {"gcode_state": "IDLE"}}',
+    )
+    assert printer.start_print("benchy.3mf", [0], 1) is True
+
+    clock.now += 90
+    since_reset = len(broker.wire)
+    printer._session.hard_reset()
+    broker.come_back()
+    broker.accept(broker.current)
+    assert printer.start_print("benchy.3mf", [0], 1) is True
+
+    commands = [
+        json.loads(payload).get("print", {}).get("command")
+        for _cid, payload in broker.wire[since_reset:]
+    ]
+    assert commands.count("project_file") == 1
+    assert len(broker.clients) == 2
+    assert broker.clients[0].loop_stop_calls == 1
