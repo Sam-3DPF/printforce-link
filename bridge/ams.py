@@ -267,7 +267,7 @@ def _nozzle_temp(value) -> Optional[int]:
     if isinstance(value, bool):
         return None
     temp = as_int(value, default=None)
-    return temp if temp and temp > 0 else None
+    return temp if temp is not None and temp > 0 else None
 
 
 def _bounded(value, limit: int) -> Optional[str]:

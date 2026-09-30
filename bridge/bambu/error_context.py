@@ -15,8 +15,9 @@ The context itself is only built on the rising edge.
 import threading
 from collections import deque
 
-from ..ams import mapped_tray_presence
+from ..ams import TRAYS_PER_AMS, mapped_tray_presence
 from ..coerce import as_int
+from .commands import gcode_state_of
 
 # How far back the gap and session-event checks look.
 WINDOW_SECONDS = 180.0
@@ -34,9 +35,11 @@ _MAPPING_KEPT = 20
 # Link's report loop calls a printer stale at 45s. A longer silence while the
 # printer unpacks a file is the Bambuddy lead.
 _SUSPECT_GAP_SECONDS = 45.0
-_UNPACKING_STATES = frozenset({"PREPARE", "SLICING"})
+# A P1 unpacking or preparing a file raises 0500_4003 if its MQTT session is
+# reset (Bambuddy #1150/#1678), so the printer leaves a silent session alone.
+UNPACKING_STATES = frozenset({"PREPARE", "SLICING"})
 # ``tray_exist_bits`` covers four regular AMS units, bit N == global tray N.
-_BIT_TRAYS = 16
+_BIT_TRAYS = 4 * TRAYS_PER_AMS
 _UNSEEN = object()
 
 
@@ -95,7 +98,7 @@ class PrintErrorWatch:
         ``code`` is the fault ``print_error`` or None. A clear, a repeat, and
         the first report Link sees are not edges.
         """
-        state = gcode_state.strip().upper() if isinstance(gcode_state, str) else ""
+        state = gcode_state_of({"print": {"gcode_state": gcode_state}})
         with self._lock:
             if state and state != self._state:
                 self._state = state
@@ -182,7 +185,7 @@ def _most_suspicious(events, gaps, trays) -> str:
             return f"{event['kind']} {event['age']:.0f}s before"
     unpacking = [
         gap for gap in gaps
-        if gap[2] in _UNPACKING_STATES and gap[1] > _SUSPECT_GAP_SECONDS
+        if gap[2] in UNPACKING_STATES and gap[1] > _SUSPECT_GAP_SECONDS
     ]
     if unpacking:
         gap = max(unpacking, key=lambda item: item[1])

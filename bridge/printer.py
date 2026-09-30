@@ -57,6 +57,7 @@ from .bambu.hms_actions import (
 )
 from .bambu.error_context import (
     SESSION_EVENT_KINDS,
+    UNPACKING_STATES,
     WINDOW_SECONDS as _ERROR_WINDOW_SECONDS,
     PrintErrorWatch,
 )
@@ -64,7 +65,7 @@ from .bambu.log import PrinterLog
 from .bambu.replies import ReplyBook
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.models import ModelProfile, is_known_model, profile_for
-from .state_v2 import _print_error_hex, build_state_v2
+from .state_v2 import build_state_v2, print_error_label
 from .bambu.session import LinkSession
 from .send_pipeline import PHASE_A_SECONDS
 from .bambu.hms import (
@@ -117,9 +118,6 @@ _PRINT_ENDED = frozenset({"FINISH", "FAILED"})
 # printing on the poll before the print began. Assert, never assume — a blank or
 # unknown prior state is not evidence of an idle machine.
 _PRINT_START_EVIDENCE = frozenset({"IDLE", "FINISH", "FAILED"})
-# A P1 unpacking or preparing a file raises 0500_4003 if its MQTT session is
-# reset (Bambuddy #1150/#1678), so a silent session is left alone.
-_UNPACKING_STATES = frozenset({"PREPARE", "SLICING"})
 
 # ams_get_rfid is never published while this is False. See _request_idle_rfid.
 _RFID_REREAD_ENABLED = False
@@ -771,8 +769,9 @@ class BambuPrinter:
         inside the send watchdog's first window after a start. The session
         asks only while its socket is up.
         """
-        state = gcode_state_of(self.state.view().get("payload"))
-        if state in _UNPACKING_STATES:
+        state, = self.state.print_fields("gcode_state")
+        state = gcode_state_of({"print": {"gcode_state": state}})
+        if state in UNPACKING_STATES:
             return state
         started = self._start_published_at
         if started is not None and self._monotonic() - started < PHASE_A_SECONDS:
@@ -1411,8 +1410,7 @@ class BambuPrinter:
         if not self._error_watch.observe(state, code, now):
             return
         try:
-            hexed = _print_error_hex(code) or code
-            label = f"{hexed[:4]}_{hexed[4:]}" if len(hexed) == 8 else hexed
+            label = print_error_label(code)
             session = self._session
             context = self._error_watch.context(
                 now,

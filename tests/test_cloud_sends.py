@@ -10,6 +10,7 @@ from bridge.app import (
     _LegacyMarkerReadiness,
     _cloud_send_started_path,
     _handle_cloud_sends as _handle_cloud_sends_impl,
+    _live_snapshot,
     _republish_start,
 )
 from bridge.router import ASSIGNMENT_STARTUP_GRACE_SECONDS, Dispatcher, Router
@@ -1125,7 +1126,9 @@ def test_republished_start_honours_the_authoritative_flag(tmp_path, flag, tray):
     fleet = _CorrectedFleet()
     send = _corrected_desired(flag=flag)[0]["send"]
     # None: the start went out (a refusal would name why it did not).
-    assert _republish_start(send, fleet, "P1", str(tmp_path / "missing.3mf"), 1) is None
+    assert _republish_start(
+        send, fleet, "P1", str(tmp_path / "missing.3mf"), 1, _live_snapshot(fleet, "P1"),
+    ) is None
     assert fleet.starts[0][2] == [tray]
 
 
@@ -1634,7 +1637,9 @@ def test_republished_start_keeps_both_choices(tmp_path):
     send = _desired_plate(1)[0]["send"]
     send["bed_leveling"] = False
     send["timelapse"] = True
-    assert _republish_start(send, fleet, "P1", str(tmp_path / "missing.3mf"), 1) is None
+    assert _republish_start(
+        send, fleet, "P1", str(tmp_path / "missing.3mf"), 1, _live_snapshot(fleet, "P1"),
+    ) is None
     assert fleet.choices == [(False, True)]
 
 
@@ -1911,7 +1916,9 @@ def test_a_tray_that_empties_before_the_watchdog_republish_holds_then_reports(tm
 def test_republish_returns_the_slot_refusal_instead_of_starting(tmp_path):
     fleet = _BitsFleet(tray_exist_bits="ecff")
     send = _gogvfw35_desired()[0]["send"]
-    refusal = _republish_start(send, fleet, "P1", str(tmp_path / "missing.3mf"), 1)
+    refusal = _republish_start(
+        send, fleet, "P1", str(tmp_path / "missing.3mf"), 1, _live_snapshot(fleet, "P1"),
+    )
     assert refusal == "slot_empty; 9"
     assert fleet.starts == []
 

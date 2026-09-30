@@ -1339,7 +1339,7 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
             )
             continue
         if _slot_hold(
-            key, _slot_refusal(fleet, bambu_id, ams_mapping), slot_holds, wall_time,
+            key, _slot_refusal(snapshot, ams_mapping), slot_holds, wall_time,
             dpf, spool_dir, started_sends, router,
         ):
             continue
@@ -1421,9 +1421,10 @@ def _handle_cloud_sends(desired: List[Dict], fleet, dpf, spool_dir: str,
                     batch_id,
                 )
                 continue
+            # A fresh read: a tray can empty during the upload.
             if _slot_hold(
-                key, _slot_refusal(fleet, bambu_id, ams_mapping), slot_holds, wall_time,
-                dpf, spool_dir, started_sends, router,
+                key, _slot_refusal(_live_snapshot(fleet, str(bambu_id)), ams_mapping),
+                slot_holds, wall_time, dpf, spool_dir, started_sends, router,
             ):
                 continue
             try:
@@ -1620,17 +1621,20 @@ def _count_setup_failure(key, setup_failures, wall_time, dpf, spool_dir,
         setup_failures.clear(key)
 
 
-def _slot_refusal(fleet, bambu_id: str, ams_mapping):
+def _slot_refusal(snapshot, ams_mapping):
     """``slot_empty; <slot>`` when a mapped tray reads absent, else None.
 
     Presence comes from the raw bitmasks (KTD6). Unknown presence is None.
     """
-    slot = first_absent_slot(_live_snapshot(fleet, str(bambu_id)), ams_mapping)
+    slot = first_absent_slot(snapshot, ams_mapping)
     return None if slot is None else f"{_SLOT_EMPTY}; {slot}"
 
 
-def _is_slot_refusal(refusal) -> bool:
-    return isinstance(refusal, str) and refusal.startswith(_SLOT_EMPTY + ";")
+def _refusal_slot(refusal) -> Optional[str]:
+    """The slot a ``slot_empty; <slot>`` refusal names, else None."""
+    if not (isinstance(refusal, str) and refusal.startswith(_SLOT_EMPTY + ";")):
+        return None
+    return refusal.split(";", 1)[1].strip()
 
 
 def _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
@@ -1643,15 +1647,15 @@ def _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
     the hold with nothing reported.
     """
     batch_id, bambu_id, _plate_index = key
-    if not _is_slot_refusal(refusal):
-        slot = slot_holds.clear(key)
-        if slot is not None:
+    slot = _refusal_slot(refusal)
+    if slot is None:
+        cleared = slot_holds.clear(key)
+        if cleared is not None:
             logger.info(
                 "cloud send %s: printer %s slot %s no longer reads empty; hold cleared",
-                batch_id, bambu_id, slot,
+                batch_id, bambu_id, cleared,
             )
         return False
-    slot = refusal.split(";", 1)[1].strip()
     now = float(wall_time())
     since, is_new = slot_holds.begin(key, now, slot)
     if is_new:
@@ -1785,11 +1789,11 @@ def _cloud_send_session_connected(fleet, bambu_id: str) -> bool:
 
 
 def _republish_start(send, fleet, bambu_id: str, dest: str,
-                     plate_index: int) -> Optional[str]:
+                     plate_index: int, snapshot) -> Optional[str]:
     """Publish the start again. None when it went out, else the refusal.
 
-    ``slot_empty; <slot>`` means a mapped tray reads absent and nothing was
-    published; the caller holds or reports it. Anything else is
+    ``slot_empty; <slot>`` means a mapped tray in ``snapshot`` reads absent and
+    nothing was published; the caller holds or reports it. Anything else is
     ``_REPUBLISH_NOT_SENT``.
     """
     if not hasattr(fleet, "start_print"):
@@ -1797,7 +1801,7 @@ def _republish_start(send, fleet, bambu_id: str, dest: str,
     ams_mapping = _resolve_cloud_ams_mapping(send, fleet, bambu_id)
     if ams_mapping is None:
         return _REPUBLISH_NOT_SENT
-    refusal = _slot_refusal(fleet, bambu_id, ams_mapping)
+    refusal = _slot_refusal(snapshot, ams_mapping)
     if refusal is not None:
         return refusal
     remote_name = _cloud_remote_name(send)
@@ -1870,9 +1874,11 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
         if not _cloud_send_session_connected(fleet, bambu_id):
             return
         dest = _cloud_send_file_path(spool_dir, key)
-        refusal = _republish_start(send, fleet, bambu_id, dest, plate_index)
+        refusal = _republish_start(send, fleet, bambu_id, dest, plate_index, snapshot)
         if _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
-                      started_sends, router) or refusal is not None:
+                      started_sends, router):
+            return
+        if refusal is not None:
             return
         record["pending_republish"] = False
         record["attempts"] = int(record.get("attempts") or 1) + 1
@@ -1888,7 +1894,7 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
     if action == "retry":
         record["last_failure"] = "no_active"
         dest = _cloud_send_file_path(spool_dir, key)
-        refusal = _republish_start(send, fleet, bambu_id, dest, plate_index)
+        refusal = _republish_start(send, fleet, bambu_id, dest, plate_index, snapshot)
         if _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
                       started_sends, router):
             return

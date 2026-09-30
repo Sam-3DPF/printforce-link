@@ -640,7 +640,7 @@ class LinkSession:
             # instead of giving up or hammering.
             self._auth_retry_not_before = self._monotonic() + _AUTH_RETRY_SECONDS
         # A refused client is done. The watchdog redials a fresh one.
-        self._hold_paho_retry(client)
+        self._end_refused_client(client)
         if rejected:
             logger.warning(
                 "printer %s: MQTT connection refused (%s, code %s). "
@@ -829,7 +829,7 @@ class LinkSession:
             self.serial,
         )
 
-    def _hold_paho_retry(self, client) -> None:
+    def _end_refused_client(self, client) -> None:
         """End a refused client without joining the network thread.
 
         ``on_connect`` runs on that thread, so ``loop_stop`` would deadlock here.
