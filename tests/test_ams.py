@@ -892,3 +892,49 @@ def test_first_absent_slot_names_the_first_mapped_empty_tray_1_based():
     assert first_absent_slot(
         {"tray_exist_bits": "ffff", "ams_exist_bits": "b"}, _GOGVFW35_MAPPING,
     ) == 12
+
+
+# --- per-slot nozzle temperatures (plan 2026-09-30-001 U4) -----------------------
+
+def _shop_tray(**overrides):
+    """A tag-read PLA Matte tray as P1S-8 reports it (2026-09-30 shop capture)."""
+    tray = {
+        "id": "0", "state": 3, "cols": ["61C680FF"], "tray_color": "61C680FF",
+        "tray_type": "PLA", "tray_sub_brands": "PLA Matte", "tray_info_idx": "GFA01",
+        "tag_uid": "3EC9C5BD00000100", "tray_uuid": "D6E2F7E7A15640A1B9F7B2A7BDFDA842",
+        "nozzle_temp_min": "190", "nozzle_temp_max": "230", "remain": -1,
+    }
+    tray.update(overrides)
+    return tray
+
+
+def _one_tray(tray, bits="1"):
+    return {"print": {"ams": {"tray_exist_bits": bits, "ams": [{"id": "0", "tray": [tray]}]}}}
+
+
+def test_a_tag_read_tray_reports_its_nozzle_temperatures():
+    slot = parse_ams(_one_tray(_shop_tray()))[0]
+    assert slot["filament_id"] == "GFA01"
+    assert slot["nozzle_temp_min"] == 190
+    assert slot["nozzle_temp_max"] == 230
+
+
+def test_an_absent_tray_reports_no_nozzle_temperatures():
+    slot = parse_ams(_one_tray(_shop_tray(), bits="0"))[0]
+    assert "nozzle_temp_min" not in slot and "nozzle_temp_max" not in slot
+
+
+def test_invalid_nozzle_temperatures_are_left_out():
+    for bad in ("", "abc", None, "0", "-5", True):
+        slot = parse_ams(_one_tray(_shop_tray(nozzle_temp_min=bad, nozzle_temp_max=bad)))[0]
+        assert "nozzle_temp_min" not in slot, bad
+        assert "nozzle_temp_max" not in slot, bad
+    slot = parse_ams(_one_tray({k: v for k, v in _shop_tray().items()
+                                if not k.startswith("nozzle_temp")}))[0]
+    assert "nozzle_temp_min" not in slot and "nozzle_temp_max" not in slot
+
+
+def test_a_tagless_tray_reports_no_nozzle_temperatures():
+    slot = parse_ams(_one_tray(_shop_tray(tag_uid="0" * 16, tray_uuid="0" * 32)))[0]
+    assert slot["spool_uid"] is None
+    assert "nozzle_temp_min" not in slot and "nozzle_temp_max" not in slot

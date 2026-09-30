@@ -1229,6 +1229,7 @@ class BambuPrinter:
             tray_info_idx=params.get("tray_info_idx", ""),
             tray_color=params.get("tray_color", params.get("color", "")),
             tray_type=params.get("tray_type", params.get("type", "")),
+            tray_sub_brands=params.get("tray_sub_brands", ""),
             nozzle_temp_min=params.get("nozzle_temp_min", ""),
             nozzle_temp_max=params.get("nozzle_temp_max", ""),
         ))

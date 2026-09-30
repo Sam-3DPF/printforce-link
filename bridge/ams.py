@@ -238,6 +238,8 @@ def _with_spool_facts(slot: dict, tray: dict) -> dict:
     Each key is sent only when the printer reported the matching field, so a
     Link that reads no RFID data sends none of them. `spool_uid` is null for a
     tagless spool: the cloud reads a null against a stored uid as a new spool.
+    Nozzle temperatures go only with a tag read, so a stale value on a tagless
+    tray never becomes a reference for a slot write.
     """
     if "tray_sub_brands" in tray:
         slot["filament_name"] = _bounded(tray.get("tray_sub_brands"), 64)
@@ -252,7 +254,20 @@ def _with_spool_facts(slot: dict, tray: dict) -> dict:
             ),
             None,
         )
+        if slot["spool_uid"]:
+            for key in ("nozzle_temp_min", "nozzle_temp_max"):
+                temp = _nozzle_temp(tray.get(key))
+                if temp is not None:
+                    slot[key] = temp
     return slot
+
+
+def _nozzle_temp(value) -> Optional[int]:
+    """A positive whole-degree temperature; the printer sends strings like "190"."""
+    if isinstance(value, bool):
+        return None
+    temp = as_int(value, default=None)
+    return temp if temp and temp > 0 else None
 
 
 def _bounded(value, limit: int) -> Optional[str]:
