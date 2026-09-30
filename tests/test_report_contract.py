@@ -454,3 +454,24 @@ def test_the_report_loop_helper_cancels_the_previous_dump_when_it_rearms(monkeyp
         "cancel", ("dump", 30.0, False),
         "cancel", ("dump", 30.0, False),
     ]
+
+
+def test_report_carries_both_raw_ams_bitmasks():
+    """The start gate reads presence from the raw bits (U3), so both reach the
+    report as hex strings; a printer that sends neither reports None."""
+    clock = FakeClock(1000.0)
+    printer = _printer(clock, _Session(connack_at=1000.0))
+    printer._on_mqtt_report({"print": {
+        "gcode_state": "IDLE",
+        "ams": {"ams_exist_bits": "7", "tray_exist_bits": "ecff", "ams": [
+            {"id": "0", "tray": [{"id": "0", "tray_color": "FF6A13FF", "tray_type": "PLA"}]},
+        ]},
+    }})
+    snapshot = printer.snapshot()
+
+    assert snapshot["tray_exist_bits"] == "ecff"
+    assert snapshot["ams_exist_bits"] == "7"
+
+    bare = _printer(FakeClock(1000.0), _Session(connack_at=1000.0))
+    bare._on_mqtt_report({"print": {"gcode_state": "IDLE"}})
+    assert bare.snapshot()["ams_exist_bits"] is None

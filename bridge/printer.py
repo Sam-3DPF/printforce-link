@@ -20,6 +20,7 @@ from .ams import (
     ams_needs_pushall,
     idle_trays_needing_rfid,
     parse_ams,
+    parse_ams_exist_bits,
     parse_tray_exist_bits,
     save_remembered_ams,
 )
@@ -390,6 +391,8 @@ def parse_telemetry(status: dict) -> Dict:
         # says PAUSE. X1 sends -1 and P1 sends 255 for "no stage"; both are None.
         "stage": _valid_stage(print_obj.get("stg_cur")),
         "tray_exist_bits": parse_tray_exist_bits(status),
+        # Bit N == AMS unit N. A cleared unit empties all four of its trays.
+        "ams_exist_bits": parse_ams_exist_bits(status),
         # 0 and a low word below 0x4000 are status, not a fault. Cancel codes
         # stay so an older ingest can still tell 50348044 from a real fail.
         "print_error": _print_error_str(print_obj.get("print_error")),

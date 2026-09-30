@@ -15,6 +15,7 @@ The context itself is only built on the rising edge.
 import threading
 from collections import deque
 
+from ..ams import mapped_tray_presence
 from ..coerce import as_int
 
 # How far back the gap and session-event checks look.
@@ -162,10 +163,6 @@ def _tray_presence(mapping, bits) -> list:
     """
     if not mapping:
         return []
-    try:
-        value = int(bits, 16) if bits else None
-    except (TypeError, ValueError):
-        value = None
     trays = []
     seen = set()
     for item in mapping:
@@ -173,8 +170,7 @@ def _tray_presence(mapping, bits) -> list:
         if tray is None or not 0 <= tray < _BIT_TRAYS or tray in seen:
             continue
         seen.add(tray)
-        present = None if value is None else bool((value >> tray) & 1)
-        trays.append({"tray": tray, "present": present})
+        trays.append({"tray": tray, "present": mapped_tray_presence(tray, bits)})
     return trays
 
 
