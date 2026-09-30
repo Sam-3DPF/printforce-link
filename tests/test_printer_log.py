@@ -586,3 +586,210 @@ def test_the_shop_replay_records_each_replayed_start_as_link_earlier(caplog):
     warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert len(warnings) == 2
     assert all(serial in w for w in warnings)
+
+
+# U7: every print_error edge records the context around it.
+
+class _QuietSession:
+    """Stands in for LinkSession without a watchdog: no stale, no reset."""
+
+    connected = True
+
+    def __init__(self, connack_at=None):
+        self.connack_at = connack_at
+
+    def start(self):
+        return None
+
+    def publish(self, payload):
+        return True
+
+    def disconnect(self):
+        return None
+
+
+def _state_report(state, *, error=0, bits="f"):
+    return {"print": {
+        "gcode_state": state,
+        "print_error": error,
+        "ams": {"tray_exist_bits": bits},
+    }}
+
+
+def _print_error_events(printer):
+    return [e for e in printer.collect_log()["events"] if e["kind"] == "print_error"]
+
+
+def _linked_printer(clock, broker, serial=_SERIAL):
+    def factory(ip, access_code, serial_, on_report):
+        return LinkSession(
+            ip, access_code, serial_, on_report=on_report,
+            client_factory=broker.factory, monotonic=clock, watchdog_interval=None,
+        )
+
+    return BambuPrinter(
+        PrinterConfig(bambu_id=serial, ip="10.0.0.5", access_code="secret-code", name="P1S"),
+        monotonic=clock, sleep=lambda _seconds: None, session_factory=factory,
+    )
+
+
+def test_a_0500_4003_after_a_70s_gap_in_prepare_records_the_gap_and_timeline(
+        tmp_path, monkeypatch, caplog):
+    import logging
+
+    from bridge import printer as printer_module
+
+    clock = _Clock(5000.0)
+    session = _QuietSession(connack_at=4990.0)
+    printer = BambuPrinter(
+        PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="secret-code", name="P1S"),
+        monotonic=clock, sleep=lambda _seconds: None,
+        session_factory=lambda *_args, **_kwargs: session,
+    )
+    printer.connect()
+    printer._on_mqtt_report(_state_report("IDLE"))
+    sliced = tmp_path / "job.3mf"
+    sliced.write_bytes(b"x" * 1234)
+    monkeypatch.setattr(printer_module.ftps, "upload", lambda *args, **kwargs: "job.3mf")
+    printer.upload_file(str(sliced))
+    assert printer.start_print("job.3mf", [0, 1], 1) is True
+    clock.now = 5001.0
+    printer._on_mqtt_report(_state_report("PREPARE"))
+    clock.now = 5071.0
+    with caplog.at_level(logging.WARNING, logger="bridge.printer"):
+        printer._on_mqtt_report(_state_report("PREPARE", error=83902467))
+
+    events = _print_error_events(printer)
+    assert len(events) == 1
+    event = events[0]
+    assert event["code"] == "0500_4003"
+    assert event["print_error"] == 83902467
+    assert event["gcode_state"] == "PREPARE"
+    assert event["states"] == [["IDLE", 1.0], ["PREPARE", 70.0]]
+    assert event["since_start"] == 71.0
+    assert event["longest_gap"] == {"seconds": 70.0, "state": "PREPARE", "ago": 0.0}
+    assert event["since_connack"] == 81.0
+    assert event["session_events"] == []
+    assert event["trays"] == [{"tray": 0, "present": True}, {"tray": 1, "present": True}]
+    assert event["tray_exist_bits"] == "f"
+    assert event["upload"]["bytes"] == 1234
+    assert event["upload"]["result"] == "ok"
+    assert isinstance(event["upload"]["seconds"], float)
+    assert event["origin"] == "70s status gap during PREPARE"
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "bridge.printer" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert _SERIAL in warnings[0]
+    assert "0500_4003" in warnings[0]
+    assert "70s status gap during PREPARE" in warnings[0]
+
+
+def test_a_print_error_shortly_after_a_reset_records_the_reset(caplog):
+    import logging
+
+    clock = _Clock(8000.0)
+    broker = _Broker()
+    printer = _linked_printer(clock, broker)
+    printer.connect()
+    broker.current.fire_connack(0)
+    _report(broker.current, _state_report("IDLE", bits="3"))
+    assert printer.start_print("job.3mf", [0, 2], 1) is True
+    clock.now = 8002.0
+    _report(broker.current, _state_report("PREPARE", bits="3"))
+    clock.now = 8010.0
+    printer.rebuild_session()
+    broker.current.fire_connack(0)
+    clock.now = 8013.0
+    with caplog.at_level(logging.WARNING, logger="bridge.printer"):
+        _report(broker.current, _state_report("PREPARE", error=83902467, bits="3"))
+
+    events = _print_error_events(printer)
+    assert len(events) == 1
+    event = events[0]
+    assert [(e["kind"], e["age"]) for e in event["session_events"]] == [("reset", 3.0)]
+    assert event["since_connack"] == 3.0
+    # Tray 2 is mapped and its bit is clear. The reset still outranks it.
+    assert event["trays"] == [{"tray": 0, "present": True}, {"tray": 2, "present": False}]
+    assert event["origin"] == "reset 3s before"
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "bridge.printer" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "reset 3s before" in warnings[0]
+
+
+def test_clearing_a_print_error_records_nothing():
+    clock = _Clock(100.0)
+    session = _QuietSession()
+    printer = BambuPrinter(
+        PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="secret-code", name="P1S"),
+        monotonic=clock, sleep=lambda _seconds: None,
+        session_factory=lambda *_args, **_kwargs: session,
+    )
+    printer.connect()
+    # A code already standing on Link's first report is not an edge Link saw.
+    printer._on_mqtt_report(_state_report("FAILED", error=83902467))
+    clock.now = 101.0
+    printer._on_mqtt_report(_state_report("IDLE", error=0))
+    assert _print_error_events(printer) == []
+    clock.now = 102.0
+    printer._on_mqtt_report(_state_report("FAILED", error=83902467))
+    clock.now = 103.0
+    printer._on_mqtt_report(_state_report("FAILED", error=83902467))
+    clock.now = 104.0
+    printer._on_mqtt_report(_state_report("IDLE", error=0))
+    clock.now = 105.0
+    printer._on_mqtt_report(_state_report("IDLE"))
+    # User cancel is not a fault.
+    printer._on_mqtt_report(_state_report("FAILED", error=50348044))
+    assert len(_print_error_events(printer)) == 1
+
+
+def test_the_shop_p1s_5_1500_case_records_one_error_with_no_session_event(caplog):
+    """Shop P1S-5, 2026-09-30 (serial anonymised). Link started a file at
+    15:00:47Z. The printer sat in IDLE, went to PREPARE, and raised
+    0500_4003 (83902467) at 15:01:30Z. No reset, no reconnect, no replay,
+    every mapped tray present."""
+    import logging
+
+    serial = "01P00TESTSERIAL"
+    clock = _Clock(_epoch("2026-09-30T15:00:30Z"))
+    broker = _Broker()
+    printer = _linked_printer(clock, broker, serial=serial)
+    printer.connect()
+    broker.current.fire_connack(0)
+
+    def report(doc):
+        broker.current.fire_message(f"device/{serial}/report", json.dumps(doc).encode())
+
+    t0 = _epoch("2026-09-30T15:00:47Z")
+    clock.now = t0 - 1
+    report(_state_report("IDLE", bits="ffff"))
+    clock.now = t0
+    assert printer.start_print("batch-2026-09-28-zeg32WPs-1.3mf", [5, 9], 1) is True
+    for second in range(1, 42):
+        clock.now = t0 + second
+        state = "IDLE" if second < 2 else "PREPARE"
+        report(_state_report(state, bits="ffff"))
+    clock.now = t0 + 43
+    with caplog.at_level(logging.WARNING, logger="bridge.printer"):
+        report(_state_report("PREPARE", error=83902467, bits="ffff"))
+
+    events = _print_error_events(printer)
+    assert len(events) == 1
+    event = events[0]
+    assert event["code"] == "0500_4003"
+    assert event["session_events"] == []
+    assert event["states"] == [["IDLE", 2.0], ["PREPARE", 41.0]]
+    assert event["longest_gap"]["seconds"] == 2.0
+    assert all(tray["present"] for tray in event["trays"])
+    assert event["origin"] == "no preceding session event"
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "bridge.printer" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert serial in warnings[0]

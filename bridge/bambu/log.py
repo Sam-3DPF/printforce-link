@@ -131,6 +131,14 @@ class PrinterLog:
                 self._serial, type(exc).__name__,
             )
 
+    def events_since(self, since, kinds) -> list:
+        """Shallow copies of the ``kinds`` events stamped at or after ``since``."""
+        with self._lock:
+            return [
+                dict(event) for event in self._events
+                if event.get("t", 0) >= since and event.get("kind") in kinds
+            ]
+
     def export(self) -> dict:
         """Deep copy of both rings, oldest first, plus counted findings.
 
