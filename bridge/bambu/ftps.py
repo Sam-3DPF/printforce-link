@@ -8,7 +8,8 @@ connection that does not resume the control connection's TLS session.
 One transfer per printer at a time. The remote file is deleted before STOR
 because an existing name comes back as 553. A trailing 426, or a 226 that
 never arrives, is success only when SIZE equals the local file — a short
-copy must not be reported as uploaded.
+copy must not be reported as uploaded. A 226 or 426 that arrives after SIZE
+was sent is skipped, not read as SIZE's reply.
 
 The deadline is::
 
@@ -512,10 +513,32 @@ def _control_readable(sock, timeout):
     return bool(ready)
 
 
+def _read_size(ftp, remote_path):
+    """SIZE, skipping a closing reply that came after the closing wait.
+
+    Shop P1S-6, 2026-09-29: a slow SD card sent 226 about 3s after the last
+    byte, behind the SIZE already sent. Read as SIZE's reply, it failed every
+    good upload as a size mismatch and the file was deleted.
+    """
+    ftp.putcmd(f"SIZE {remote_path}")
+    try:
+        resp = ftp.getresp()
+    except ftplib.error_temp as exc:
+        if not str(exc).lstrip().startswith("426"):
+            raise
+        resp = ftp.getresp()
+    else:
+        if resp.startswith("226"):
+            resp = ftp.getresp()
+    if resp.startswith("213"):
+        return int(resp[3:].strip())
+    return None
+
+
 def _require_size(ftp, remote_path, expected, deadline_at, clock):
     _arm(ftp, deadline_at, clock)
     try:
-        got = ftp.size(remote_path)
+        got = _read_size(ftp, remote_path)
     except TimeoutError:
         raise FtpsError("timeout", "transfer deadline exceeded") from None
     except ftplib.error_perm as exc:

@@ -205,6 +205,34 @@ def test_missing_226_with_matching_size_succeeds(implicit_server, tmp_path):
     assert server.snapshot()["files"]["job.3mf"] == payload
 
 
+def test_late_226_is_not_read_as_the_size_reply(implicit_server, tmp_path):
+    # Shop P1S-6, 2026-09-29: a slow SD card sent 226 about 3s after the last
+    # byte. SIZE was already out, the 226 was read as its reply, and every
+    # good upload was deleted as "remote size does not match".
+    server = implicit_server(stor_reply_delay_seconds=3.0)
+    path, payload = _file(tmp_path)
+    name = _upload()(
+        "127.0.0.1", SECRET, str(path), "job.3mf",
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    assert name == "job.3mf"
+    assert server.snapshot()["files"]["job.3mf"] == payload
+
+
+def test_late_426_is_not_read_as_the_size_reply(implicit_server, tmp_path):
+    server = implicit_server(
+        stor_final_reply="426 Failure reading network stream.",
+        stor_reply_delay_seconds=3.0,
+    )
+    path, payload = _file(tmp_path)
+    name = _upload()(
+        "127.0.0.1", SECRET, str(path), "job.3mf",
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    assert name == "job.3mf"
+    assert server.snapshot()["files"]["job.3mf"] == payload
+
+
 def test_trailing_426_with_mismatched_size_is_storage(implicit_server, tmp_path):
     from bridge.bambu.ftps import FtpsError
 
