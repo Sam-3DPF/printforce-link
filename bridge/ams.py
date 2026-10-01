@@ -238,6 +238,8 @@ def _with_spool_facts(slot: dict, tray: dict) -> dict:
     Each key is sent only when the printer reported the matching field, so a
     Link that reads no RFID data sends none of them. `spool_uid` is null for a
     tagless spool: the cloud reads a null against a stored uid as a new spool.
+    Nozzle temperatures go only with a tag read, so a stale value on a tagless
+    tray never becomes a reference for a slot write.
     """
     if "tray_sub_brands" in tray:
         slot["filament_name"] = _bounded(tray.get("tray_sub_brands"), 64)
@@ -252,7 +254,20 @@ def _with_spool_facts(slot: dict, tray: dict) -> dict:
             ),
             None,
         )
+        if slot["spool_uid"]:
+            for key in ("nozzle_temp_min", "nozzle_temp_max"):
+                temp = _nozzle_temp(tray.get(key))
+                if temp is not None:
+                    slot[key] = temp
     return slot
+
+
+def _nozzle_temp(value) -> Optional[int]:
+    """A positive whole-degree temperature; the printer sends strings like "190"."""
+    if isinstance(value, bool):
+        return None
+    temp = as_int(value, default=None)
+    return temp if temp is not None and temp > 0 else None
 
 
 def _bounded(value, limit: int) -> Optional[str]:
@@ -575,6 +590,48 @@ def parse_tray_exist_bits(status: dict) -> Optional[str]:
     disabled keep-hex. Normalize both shapes here.
     """
     return _normalize_tray_exist_bits(_ams_container(status).get("tray_exist_bits"))
+
+
+def parse_ams_exist_bits(status: dict) -> Optional[str]:
+    """The AMS's `ams_exist_bits` bitmask as a hex string (bit N == unit N is present).
+
+    Same shapes as `parse_tray_exist_bits`: an int or a hex string.
+    """
+    return _normalize_tray_exist_bits(_ams_container(status).get("ams_exist_bits"))
+
+
+def mapped_tray_presence(tray, tray_exist_bits: Optional[str],
+                         ams_exist_bits: Optional[str] = None) -> Optional[bool]:
+    """Is a spool in this global tray (an `ams_mapping` value)? True, False, or None.
+
+    Only regular AMS trays 0-15 are answered: unit `tray // 4`, tray bit `tray`.
+    A cleared unit bit makes all four of its trays absent. Otherwise the tray
+    bit decides. Missing or unparseable bits are None (unknown). External
+    spools (254/255), AMS-HT (128+), A2L (24-27) and unused (-1) are None:
+    their bit layout is not one Link reads here.
+    """
+    if isinstance(tray, bool) or not isinstance(tray, int):
+        return None
+    if not 0 <= tray < 4 * TRAYS_PER_AMS:
+        return None
+    if _bit_present(ams_exist_bits, tray // TRAYS_PER_AMS + 1) is False:
+        return False
+    return _bit_present(tray_exist_bits, tray + 1)
+
+
+def first_absent_slot(snapshot, mapping) -> Optional[int]:
+    """1-based slot of the first mapped tray the report's raw bits call absent.
+
+    None when every mapped tray is present or unknown. Slot 9 is tray 8.
+    """
+    if not isinstance(snapshot, dict) or not isinstance(mapping, list):
+        return None
+    tray_bits = _normalize_tray_exist_bits(snapshot.get("tray_exist_bits"))
+    unit_bits = _normalize_tray_exist_bits(snapshot.get("ams_exist_bits"))
+    for tray in mapping:
+        if mapped_tray_presence(tray, tray_bits, unit_bits) is False:
+            return tray + 1
+    return None
 
 
 def _normalize_tray_exist_bits(value) -> Optional[str]:

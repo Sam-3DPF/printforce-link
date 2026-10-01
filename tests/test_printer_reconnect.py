@@ -22,10 +22,13 @@ class _RecordingSession:
     def disconnect(self):
         self._record["disconnects"].append(self.ip)
 
+    def set_reset_hold(self, hold):
+        self._record["holds"].append((self.ip, hold))
+
 
 @pytest.fixture
 def sessions():
-    record = {"constructed": [], "connects": [], "disconnects": []}
+    record = {"constructed": [], "connects": [], "disconnects": [], "holds": []}
 
     def factory(ip, access_code, serial, on_report):
         record["constructed"].append(ip)
@@ -134,3 +137,17 @@ def test_proves_serial_at_keeps_the_access_code_inside_the_printer(sessions, mon
     assert seen["args"] == ("192.168.8.10", "S1", "SECRET")
     assert seen["log"] is p.log
     assert not hasattr(p, "access_code")
+
+
+def test_every_session_gets_the_reset_hold_and_it_reads_the_merged_state(sessions):
+    """A rebuilt session must still know not to reset while the printer unpacks."""
+    p = _printer(sessions, "192.168.1.10")
+    p.connect()
+    p.reconnect(new_ip="192.168.1.55")
+    assert [ip for ip, _hold in sessions["holds"]] == ["192.168.1.10", "192.168.1.55"]
+    hold = sessions["holds"][-1][1]
+    assert hold() is None
+    p._on_mqtt_report({"print": {"gcode_state": "PREPARE"}})
+    assert hold() == "PREPARE"
+    p._on_mqtt_report({"print": {"gcode_state": "RUNNING"}})
+    assert hold() is None

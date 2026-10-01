@@ -225,20 +225,25 @@ def test_collected_log_includes_session_events_in_time_order():
     session.start()
     broker.current.fire_connack(0)
     _report(broker.current, {"print": {"gcode_state": "IDLE"}})
+    # Ignored for the offline clock, but the client is done: a fresh one follows.
     broker.current.fire_disconnect(0)
+    clock.now = 1005.0
+    session.tick()
+    broker.current.fire_connack(0)
+    clock.now = 1040.0
     assert session.probe() == "1"
     _report(broker.current, _version_reply("1"))
     assert session.probe() == "2"
-    clock.now = 1010.0
+    clock.now = 1050.0
     session.tick()
     assert session.probe() == "3"
-    clock.now = 1020.0
+    clock.now = 1060.0
     session.tick()
     broker.current.fire_connack(0)
-    clock.now = 1081.0
+    clock.now = 1121.0
     session.tick()
     broker.current.fire_connack(134)
-    clock.now = 1381.0
+    clock.now = 1421.0
     session.tick()
     broker.current.fire_disconnect(50)
 
@@ -248,6 +253,10 @@ def test_collected_log_includes_session_events_in_time_order():
         "connect",
         "connack",
         "disconnect",
+        "redial",
+        "reset",
+        "connect",
+        "connack",
         "probe_sent",
         "probe_answered",
         "probe_sent",
@@ -271,20 +280,21 @@ def test_collected_log_includes_session_events_in_time_order():
     assert events[1]["code"] == 0
     assert events[2]["ignored"] is True
     assert events[2]["code"] == 0
-    assert events[3]["sequence_id"] == "1"
-    assert events[4]["sequence_id"] == "1"
-    assert events[6]["count"] == 1
-    assert events[8]["count"] == 2
-    assert events[9]["reason"] == "commands_ignored"
-    assert events[12]["kind"] == "stale"
-    assert events[13]["reason"] == "silent_session"
-    assert events[15]["result"] == "auth_rejected"
-    assert events[15]["code"] == 134
-    assert events[17]["reason"] == "auth_rejected"
+    assert events[3]["after"] == 5.0
+    assert events[7]["sequence_id"] == "1"
+    assert events[8]["sequence_id"] == "1"
+    assert events[10]["count"] == 1
+    assert events[12]["count"] == 2
+    assert events[13]["reason"] == "commands_ignored"
+    assert events[16]["kind"] == "stale"
+    assert events[17]["reason"] == "silent_session"
+    assert events[19]["result"] == "auth_rejected"
+    assert events[19]["code"] == 134
+    assert events[21]["reason"] == "auth_rejected"
     assert events[-1]["ignored"] is False
     assert events[-1]["code"] == 50
     assert all(event["kind"] != "connect" or event["host"] == "10.0.0.5" for event in events)
-    assert len({event["client_id"] for event in events if event["kind"] == "connect"}) == 4
+    assert len({event["client_id"] for event in events if event["kind"] == "connect"}) == 5
     inbound = [m for m in log.export()["messages"] if m["direction"] == "in"]
     assert inbound
     assert all("accepted" not in message for message in inbound)
@@ -514,3 +524,292 @@ def test_printer_log_path_sanitizes_the_serial(tmp_path):
 
     path = _printer_log_path(str(tmp_path), "01P/../weird serial")
     assert path == os.path.join(str(tmp_path), "printer-01P_.._weird_serial.jsonl")
+
+
+_SHOP_REPLAY = os.path.join(
+    os.path.dirname(__file__), "fixtures", "shop_replay_2026_09_30.jsonl",
+)
+
+
+def _epoch(at):
+    import datetime
+    return datetime.datetime.fromisoformat(at.replace("Z", "+00:00")).timestamp()
+
+
+def test_the_shop_replay_records_each_replayed_start_as_link_earlier(caplog):
+    """Shop P1S, 2026-09-30 (serial anonymised). Link started two files at
+    14:29 and 15:00. At 18:06:29, after the 18:00 drop, the printer echoed
+    both starts again. The 18:07:56 start is Link's own on the new client."""
+    import logging
+
+    from bridge.bambu.log import PrinterLog
+
+    with open(_SHOP_REPLAY, encoding="utf-8") as handle:
+        records = [json.loads(line) for line in handle if line.strip()]
+    serial = "01P00TESTSERIAL"
+    assert all(serial in r["topic"] for r in records if r["record"] == "message")
+
+    clock = _Clock(_epoch(records[0]["at"]))
+    broker = _Broker()
+    log = PrinterLog(serial, event_capacity=500, monotonic=clock, wall_clock=clock)
+    session = LinkSession(
+        "10.0.0.5", "secret-code", serial, client_factory=broker.factory,
+        log=log, monotonic=clock, watchdog_interval=None,
+    )
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        session.start()
+        for record in records:
+            clock.now = _epoch(record["at"])
+            if record["record"] == "event":
+                if record["kind"] == "connack":
+                    # U1: the watchdog redials a fresh client after a drop.
+                    session.tick()
+                    broker.current.fire_connack(record["code"])
+                elif record["kind"] == "disconnect":
+                    broker.current.fire_disconnect(record["code"])
+                continue
+            payload = record["payload"]
+            if record["direction"] == "out":
+                # CONNACK publishes pushall and get_version on its own.
+                if payload.get("print", {}).get("command") == "project_file":
+                    assert session.publish(payload) is True
+                continue
+            broker.current.fire_message(record["topic"], json.dumps(payload).encode())
+
+    assert len(broker.clients) == 2
+    unexpected = [e for e in log.export()["events"] if e["kind"] == "unexpected_start"]
+    assert [(e["task_id"], e["file"], e["origin"]) for e in unexpected] == [
+        ("1924711886", "batch-2026-09-28-ke9pacfn-1.3mf", "link_earlier"),
+        ("1926569165", "batch-2026-09-28-zeg32WPs-1.3mf", "link_earlier"),
+    ]
+    assert all(0 < e["seconds_since_connack"] < 1 for e in unexpected)
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert all(serial in w for w in warnings)
+
+
+# U7: every print_error edge records the context around it.
+
+class _QuietSession:
+    """Stands in for LinkSession without a watchdog: no stale, no reset."""
+
+    connected = True
+
+    def __init__(self, connack_at=None):
+        self.connack_at = connack_at
+
+    def start(self):
+        return None
+
+    def publish(self, payload):
+        return True
+
+    def disconnect(self):
+        return None
+
+
+def _state_report(state, *, error=0, bits="f"):
+    return {"print": {
+        "gcode_state": state,
+        "print_error": error,
+        "ams": {"tray_exist_bits": bits},
+    }}
+
+
+def _print_error_events(printer):
+    return [e for e in printer.collect_log()["events"] if e["kind"] == "print_error"]
+
+
+def _linked_printer(clock, broker, serial=_SERIAL):
+    def factory(ip, access_code, serial_, on_report):
+        return LinkSession(
+            ip, access_code, serial_, on_report=on_report,
+            client_factory=broker.factory, monotonic=clock, watchdog_interval=None,
+        )
+
+    return BambuPrinter(
+        PrinterConfig(bambu_id=serial, ip="10.0.0.5", access_code="secret-code", name="P1S"),
+        monotonic=clock, sleep=lambda _seconds: None, session_factory=factory,
+    )
+
+
+def test_a_0500_4003_after_a_70s_gap_in_prepare_records_the_gap_and_timeline(
+        tmp_path, monkeypatch, caplog):
+    import logging
+
+    from bridge import printer as printer_module
+
+    clock = _Clock(5000.0)
+    session = _QuietSession(connack_at=4990.0)
+    printer = BambuPrinter(
+        PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="secret-code", name="P1S"),
+        monotonic=clock, sleep=lambda _seconds: None,
+        session_factory=lambda *_args, **_kwargs: session,
+    )
+    printer.connect()
+    printer._on_mqtt_report(_state_report("IDLE"))
+    sliced = tmp_path / "job.3mf"
+    sliced.write_bytes(b"x" * 1234)
+    monkeypatch.setattr(printer_module.ftps, "upload", lambda *args, **kwargs: "job.3mf")
+    printer.upload_file(str(sliced))
+    assert printer.start_print("job.3mf", [0, 1], 1) is True
+    clock.now = 5001.0
+    printer._on_mqtt_report(_state_report("PREPARE"))
+    clock.now = 5071.0
+    with caplog.at_level(logging.WARNING, logger="bridge.printer"):
+        printer._on_mqtt_report(_state_report("PREPARE", error=83902467))
+
+    events = _print_error_events(printer)
+    assert len(events) == 1
+    event = events[0]
+    assert event["code"] == "0500_4003"
+    assert event["print_error"] == 83902467
+    assert event["gcode_state"] == "PREPARE"
+    assert event["states"] == [["IDLE", 1.0], ["PREPARE", 70.0]]
+    assert event["since_start"] == 71.0
+    assert event["longest_gap"] == {"seconds": 70.0, "state": "PREPARE", "ago": 0.0}
+    assert event["since_connack"] == 81.0
+    assert event["session_events"] == []
+    assert event["trays"] == [{"tray": 0, "present": True}, {"tray": 1, "present": True}]
+    assert event["tray_exist_bits"] == "f"
+    assert event["upload"]["bytes"] == 1234
+    assert event["upload"]["result"] == "ok"
+    assert isinstance(event["upload"]["seconds"], float)
+    assert event["suspect"] == "70s status gap during PREPARE"
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "bridge.printer" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert _SERIAL in warnings[0]
+    assert "0500_4003" in warnings[0]
+    assert "70s status gap during PREPARE" in warnings[0]
+
+
+def test_a_print_error_shortly_after_a_reset_records_the_reset(caplog):
+    import logging
+
+    clock = _Clock(8000.0)
+    broker = _Broker()
+    printer = _linked_printer(clock, broker)
+    printer.connect()
+    broker.current.fire_connack(0)
+    _report(broker.current, _state_report("IDLE", bits="3"))
+    assert printer.start_print("job.3mf", [0, 2], 1) is True
+    clock.now = 8002.0
+    _report(broker.current, _state_report("PREPARE", bits="3"))
+    clock.now = 8010.0
+    printer.rebuild_session()
+    broker.current.fire_connack(0)
+    clock.now = 8013.0
+    with caplog.at_level(logging.WARNING, logger="bridge.printer"):
+        _report(broker.current, _state_report("PREPARE", error=83902467, bits="3"))
+
+    events = _print_error_events(printer)
+    assert len(events) == 1
+    event = events[0]
+    assert [(e["kind"], e["age"]) for e in event["session_events"]] == [("reset", 3.0)]
+    assert event["since_connack"] == 3.0
+    # Tray 2 is mapped and its bit is clear. The reset still outranks it.
+    assert event["trays"] == [{"tray": 0, "present": True}, {"tray": 2, "present": False}]
+    assert event["suspect"] == "reset 3s before"
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "bridge.printer" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert "reset 3s before" in warnings[0]
+
+
+def test_clearing_a_print_error_records_nothing():
+    clock = _Clock(100.0)
+    session = _QuietSession()
+    printer = BambuPrinter(
+        PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="secret-code", name="P1S"),
+        monotonic=clock, sleep=lambda _seconds: None,
+        session_factory=lambda *_args, **_kwargs: session,
+    )
+    printer.connect()
+    # A code already standing on Link's first report is not an edge Link saw.
+    printer._on_mqtt_report(_state_report("FAILED", error=83902467))
+    clock.now = 101.0
+    printer._on_mqtt_report(_state_report("IDLE", error=0))
+    assert _print_error_events(printer) == []
+    clock.now = 102.0
+    printer._on_mqtt_report(_state_report("FAILED", error=83902467))
+    clock.now = 103.0
+    printer._on_mqtt_report(_state_report("FAILED", error=83902467))
+    clock.now = 104.0
+    printer._on_mqtt_report(_state_report("IDLE", error=0))
+    clock.now = 105.0
+    printer._on_mqtt_report(_state_report("IDLE"))
+    # User cancel is not a fault.
+    printer._on_mqtt_report(_state_report("FAILED", error=50348044))
+    assert len(_print_error_events(printer)) == 1
+
+
+def test_a_standing_code_after_a_first_report_without_print_error_is_not_an_edge():
+    """After a restart the first message can be an info reply or a sparse
+    delta. The pushall that follows carries the standing code; that is not a
+    new fault."""
+    clock = _Clock(200.0)
+    session = _QuietSession()
+    printer = BambuPrinter(
+        PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="secret-code", name="P1S"),
+        monotonic=clock, sleep=lambda _seconds: None,
+        session_factory=lambda *_args, **_kwargs: session,
+    )
+    printer.connect()
+    printer._on_mqtt_report({"info": {"command": "get_version", "sequence_id": "0"}})
+    clock.now = 200.5
+    printer._on_mqtt_report({"print": {"command": "push_status", "gcode_state": "FAILED"}})
+    clock.now = 201.0
+    printer._on_mqtt_report(_state_report("FAILED", error=83902467))
+    assert _print_error_events(printer) == []
+
+
+def test_the_shop_p1s_5_1500_case_records_one_error_with_no_session_event(caplog):
+    """Shop P1S-5, 2026-09-30 (serial anonymised). Link started a file at
+    15:00:47Z. The printer sat in IDLE, went to PREPARE, and raised
+    0500_4003 (83902467) at 15:01:30Z. No reset, no reconnect, no replay,
+    every mapped tray present."""
+    import logging
+
+    serial = "01P00TESTSERIAL"
+    clock = _Clock(_epoch("2026-09-30T15:00:30Z"))
+    broker = _Broker()
+    printer = _linked_printer(clock, broker, serial=serial)
+    printer.connect()
+    broker.current.fire_connack(0)
+
+    def report(doc):
+        broker.current.fire_message(f"device/{serial}/report", json.dumps(doc).encode())
+
+    t0 = _epoch("2026-09-30T15:00:47Z")
+    clock.now = t0 - 1
+    report(_state_report("IDLE", bits="ffff"))
+    clock.now = t0
+    assert printer.start_print("batch-2026-09-28-zeg32WPs-1.3mf", [5, 9], 1) is True
+    for second in range(1, 42):
+        clock.now = t0 + second
+        state = "IDLE" if second < 2 else "PREPARE"
+        report(_state_report(state, bits="ffff"))
+    clock.now = t0 + 43
+    with caplog.at_level(logging.WARNING, logger="bridge.printer"):
+        report(_state_report("PREPARE", error=83902467, bits="ffff"))
+
+    events = _print_error_events(printer)
+    assert len(events) == 1
+    event = events[0]
+    assert event["code"] == "0500_4003"
+    assert event["session_events"] == []
+    assert event["states"] == [["IDLE", 2.0], ["PREPARE", 41.0]]
+    assert event["longest_gap"]["seconds"] == 2.0
+    assert all(tray["present"] for tray in event["trays"])
+    assert event["suspect"] == "no preceding session event"
+    warnings = [
+        r.getMessage() for r in caplog.records
+        if r.name == "bridge.printer" and r.levelno == logging.WARNING
+    ]
+    assert len(warnings) == 1
+    assert serial in warnings[0]

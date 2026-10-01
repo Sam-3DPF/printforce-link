@@ -35,10 +35,14 @@ def gcode_state_of(payload) -> str:
     print_obj = payload.get("print")
     if not isinstance(print_obj, dict):
         return ""
-    state = print_obj.get("gcode_state")
-    if not isinstance(state, str):
+    return normalize_gcode_state(print_obj.get("gcode_state"))
+
+
+def normalize_gcode_state(value) -> str:
+    """A raw ``gcode_state`` value, stripped and upper-cased. "" when not text."""
+    if not isinstance(value, str):
         return ""
-    return state.strip().upper()
+    return value.strip().upper()
 
 
 def project_file_refused(gcode_state: str) -> bool:
@@ -372,41 +376,64 @@ def build_ams_control(param) -> dict:
     }
 
 
-def _upper_hex(color) -> str:
-    text = "" if color is None else str(color).strip()
-    if text.startswith("#"):
-        text = text[1:]
-    return text.upper()
+def _slot_color(color) -> str:
+    """Uppercase ``RRGGBBAA``. P1S firmware reads lowercase hex as zeros."""
+    text = "" if color is None else str(color).strip().lstrip("#").upper()
+    return text + "FF" if len(text) == 6 else text
+
+
+def _slot_temp(value):
+    """An integer temperature, or ``""`` when none was given."""
+    if value is None or isinstance(value, bool):
+        return ""
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return ""
 
 
 def build_filament_setting(*, ams_id, tray_id, tray_info_idx="", tray_color="",
-                           tray_type="", nozzle_temp_min="", nozzle_temp_max="") -> dict:
-    """A slot write. ``tray_color`` is bare hex, forced to uppercase."""
+                           tray_type="", tray_sub_brands="", nozzle_temp_min="",
+                           nozzle_temp_max="") -> dict:
+    """A slot write, shaped like Bambu Studio's (and Bambuddy's).
+
+    ``slot_id`` is the tray within its AMS unit; the external spool's is 0.
+    ``setting_id`` stays out.
+    """
+    ams_id, tray_id = int(ams_id), int(tray_id)
+    return {
+        "print": {
+            "sequence_id": "0",
+            "command": "ams_filament_setting",
+            "ams_id": ams_id,
+            "tray_id": tray_id,
+            "slot_id": 0 if ams_id == 255 else tray_id,
+            "tray_info_idx": "" if tray_info_idx is None else str(tray_info_idx),
+            "tray_type": "" if tray_type is None else str(tray_type),
+            "tray_sub_brands": "" if tray_sub_brands is None else str(tray_sub_brands),
+            "tray_color": _slot_color(tray_color),
+            "nozzle_temp_min": _slot_temp(nozzle_temp_min),
+            "nozzle_temp_max": _slot_temp(nozzle_temp_max),
+        },
+    }
+
+
+def build_filament_reset(*, ams_id, tray_id) -> dict:
+    """Clear a slot. Deliberately not the Studio write shape: the payload
+    every shipped Link has sent, unchanged."""
     return {
         "print": {
             "sequence_id": "0",
             "command": "ams_filament_setting",
             "ams_id": int(ams_id),
             "tray_id": int(tray_id),
-            "tray_info_idx": "" if tray_info_idx is None else str(tray_info_idx),
-            "tray_color": _upper_hex(tray_color),
-            "tray_type": "" if tray_type is None else str(tray_type),
-            "nozzle_temp_min": "" if nozzle_temp_min is None else nozzle_temp_min,
-            "nozzle_temp_max": "" if nozzle_temp_max is None else nozzle_temp_max,
+            "tray_info_idx": "",
+            "tray_color": "00000000",
+            "tray_type": "",
+            "nozzle_temp_min": "",
+            "nozzle_temp_max": "",
         },
     }
-
-
-def build_filament_reset(*, ams_id, tray_id) -> dict:
-    return build_filament_setting(
-        ams_id=ams_id,
-        tray_id=tray_id,
-        tray_info_idx="",
-        tray_color="00000000",
-        tray_type="",
-        nozzle_temp_min="",
-        nozzle_temp_max="",
-    )
 
 
 def build_extrusion_cali_sel(*, tray_id, **fields) -> dict:

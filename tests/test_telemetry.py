@@ -285,6 +285,7 @@ def test_snapshot_is_the_full_flat_wire_contract():
         "unit_versions": None,
         "external_spool": None,
         "tray_exist_bits": "f",
+        "ams_exist_bits": None,
         "hms_severity": None,
         "hms_code": None,
         "hms_count": 0,

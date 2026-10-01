@@ -337,11 +337,12 @@ def _errors(print_obj: Dict) -> List[Dict]:
             "detail": copy.get("detail"),
             "source": "hms",
         })
-    pe = _print_error_hex(fault_print_error(print_obj.get("print_error")))
+    print_error = fault_print_error(print_obj.get("print_error"))
+    pe = _print_error_hex(print_error)
     if pe:
         copy = lookup_bambu_alert(pe) or {}
         out.append({
-            "code": pe[:4] + "_" + pe[4:] if len(pe) == 8 else pe,
+            "code": print_error_label(print_error),
             "severity": "SERIOUS",
             "title": copy.get("title") or _fallback_title(pe),
             "detail": copy.get("detail"),
@@ -364,6 +365,12 @@ def _print_error_hex(code: Optional[str]) -> Optional[str]:
         except ValueError:
             return code
     return code
+
+
+def print_error_label(code: Optional[str]) -> Optional[str]:
+    """``0500_4003`` for a decimal print_error. Other text, or no code, as it is."""
+    hexed = _print_error_hex(code) or code
+    return f"{hexed[:4]}_{hexed[4:]}" if hexed and len(hexed) == 8 else hexed
 
 
 def _commands_rejected(print_obj: Dict) -> bool:

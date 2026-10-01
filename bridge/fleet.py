@@ -425,7 +425,7 @@ class Fleet:
                 "progress_percent", "layer_num", "total_layer_num", "remaining_seconds",
                 "nozzle_temper", "nozzle_target_temper", "bed_temper",
                 "bed_target_temper", "chamber_temper", "gcode_file", "subtask_name",
-                "nozzle_diameter", "stage", "tray_exist_bits",
+                "nozzle_diameter", "stage", "tray_exist_bits", "ams_exist_bits",
                 "hms_severity", "hms_code", "hms_count", "hms_title", "hms_detail",
                 "print_error",
                 # Additive. Legacy hms_* / print_error still carry cancel echoes

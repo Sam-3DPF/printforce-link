@@ -20,6 +20,7 @@ from .ams import (
     ams_needs_pushall,
     idle_trays_needing_rfid,
     parse_ams,
+    parse_ams_exist_bits,
     parse_tray_exist_bits,
     save_remembered_ams,
 )
@@ -43,6 +44,7 @@ from .bambu.commands import (
     filament_load_target,
     fresh_submission_id,
     gcode_state_of,
+    normalize_gcode_state,
     project_file_refused,
     skip_objects_allowed,
 )
@@ -54,12 +56,19 @@ from .bambu.hms_actions import (
     is_calibration_table_reply,
     ui_only_action,
 )
+from .bambu.error_context import (
+    SESSION_EVENT_KINDS,
+    UNPACKING_STATES,
+    WINDOW_SECONDS as _ERROR_WINDOW_SECONDS,
+    PrintErrorWatch,
+)
 from .bambu.log import PrinterLog
 from .bambu.replies import ReplyBook
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.models import ModelProfile, is_known_model, profile_for
-from .state_v2 import build_state_v2
-from .bambu.session import LinkSession
+from .state_v2 import build_state_v2, print_error_label
+from .bambu.session import _RESET_HOLD_MAX_SECONDS, LinkSession
+from .send_pipeline import PHASE_A_SECONDS
 from .bambu.hms import (
     commands_rejected as hms_commands_rejected,
     decode_hms,
@@ -381,6 +390,8 @@ def parse_telemetry(status: dict) -> Dict:
         # says PAUSE. X1 sends -1 and P1 sends 255 for "no stage"; both are None.
         "stage": _valid_stage(print_obj.get("stg_cur")),
         "tray_exist_bits": parse_tray_exist_bits(status),
+        # Bit N == AMS unit N. A cleared unit empties all four of its trays.
+        "ams_exist_bits": parse_ams_exist_bits(status),
         # 0 and a low word below 0x4000 are status, not a fault. Cancel codes
         # stay so an older ingest can still tell 50348044 from a real fail.
         "print_error": _print_error_str(print_obj.get("print_error")),
@@ -576,17 +587,24 @@ class BambuPrinter:
         self._defer = None
         self._deferred_pending = False
         # One ring for the life of this object. rebuild_session and reconnect
-        # replace the client and keep this log.
+        # replace the client and keep this log. It runs on this printer's
+        # clock so a print_error can age the ring's session events (U7).
         self._log = PrinterLog(
             cfg.bambu_id,
             secrets=(cfg.access_code,) if isinstance(cfg.access_code, str) else (),
+            monotonic=monotonic,
             file_path=log_path,
         )
+        # What came before each print_error (U7). Survives reconnects.
+        self._error_watch = PrintErrorWatch()
         # Last commands_rejected answer. None until a payload has been merged.
         self._command_acceptance = None
         # Last submission id this printer published, so two starts in the
         # same millisecond still differ.
         self._last_submission_id = None
+        # Monotonic time of the last accepted project_file. The send watchdog's
+        # phase A runs from here, and the session is not reset inside it.
+        self._start_published_at = None
         # gcode_line sequence. Separate from the project_file sequence "20000".
         self._line_sequence = 0
         # Mailbox commands waiting for the printer's reply (plan U13).
@@ -740,7 +758,37 @@ class BambuPrinter:
         bind = getattr(session, "set_log", None)
         if callable(bind):
             bind(self._log)
+        hold = getattr(session, "set_reset_hold", None)
+        if callable(hold):
+            hold(self._session_reset_hold)
         return session
+
+    def _session_reset_hold(self):
+        """Why a silent session must not be reset now, or None.
+
+        The merged ``gcode_state`` while PREPARE or SLICING, or ``phase_a``
+        inside the send watchdog's first window after a start, and after it
+        while no report has arrived since that start. The session asks only
+        while its socket is up and caps every hold at
+        ``_RESET_HOLD_MAX_SECONDS`` of silence.
+        """
+        state, = self.state.print_fields("gcode_state")
+        state = normalize_gcode_state(state)
+        if state in UNPACKING_STATES:
+            return state
+        started = self._start_published_at
+        if started is None:
+            return None
+        since_start = self._monotonic() - started
+        if since_start < PHASE_A_SECONDS:
+            return "phase_a"
+        # Silence since the start is no evidence it was missed. The send
+        # watchdog skips its own reset on the same test (app._silent_since).
+        last_report = getattr(self._session, "last_message_at", None)
+        silent_since_start = last_report is None or last_report <= started
+        if since_start < _RESET_HOLD_MAX_SECONDS and silent_since_start:
+            return "phase_a"
+        return None
 
     def _connect(self, ip: str) -> None:
         session = self._make_session(ip)
@@ -868,6 +916,11 @@ class BambuPrinter:
         return stored
 
     def _record_upload(self, **fields) -> None:
+        if fields.get("phase") == "result":
+            self._error_watch.note_upload(
+                size=fields.get("bytes"), seconds=fields.get("seconds"),
+                result=fields.get("result"), now=self._monotonic(),
+            )
         record = getattr(self._log, "record_event", None)
         if not callable(record):
             return
@@ -901,6 +954,8 @@ class BambuPrinter:
         )
         started = self._publish_command(payload)
         if started:
+            self._start_published_at = self._monotonic()
+            self._error_watch.note_start(ams_mapping, self._start_published_at)
             self.register_submission(submission_id)
         url = payload["print"]["url"]
         logger.info(
@@ -1185,6 +1240,7 @@ class BambuPrinter:
             tray_info_idx=params.get("tray_info_idx", ""),
             tray_color=params.get("tray_color", params.get("color", "")),
             tray_type=params.get("tray_type", params.get("type", "")),
+            tray_sub_brands=params.get("tray_sub_brands", ""),
             nozzle_temp_min=params.get("nozzle_temp_min", ""),
             nozzle_temp_max=params.get("nozzle_temp_max", ""),
         ))
@@ -1340,16 +1396,62 @@ class BambuPrinter:
         and would replace the fitted one. This callback does not rebuild the
         session. ``hard_reset`` joins the network thread.
         """
+        now = self._monotonic()
+        self._error_watch.note_report(now)
         self._note_session_boundary()
         self._replies.resolve(doc)
         if is_calibration_table_reply(doc):
             self._note_commands_rejected_on_session()
             return
-        self.state.ingest(doc, self._monotonic())
+        self.state.ingest(doc, now)
+        self._note_print_error(now)
         self._observe_stopwatch()
         self._note_command_acceptance()
         self._note_commands_rejected_on_session()
         self._note_change()
+
+    def _note_print_error(self, now) -> None:
+        """Record the context of a print_error that just rose (U7).
+
+        Shop P1S-5/6/8 0500_4003 since 2026-09-28 is still unexplained. One
+        event and one warning per new code. A clear, a repeat, and a user
+        cancel record nothing. Runs on the MQTT thread and never raises.
+        """
+        state, raw, ams = self.state.print_fields("gcode_state", "print_error", "ams")
+        if raw is None:
+            # An info reply or sparse delta ahead of the first pushall. The
+            # baseline is the first report that carries print_error, so a code
+            # already standing then is not an edge.
+            return
+        code = fault_print_error(raw)
+        if not self._error_watch.observe(state, code, now):
+            return
+        try:
+            label = print_error_label(code)
+            session = self._session
+            context = self._error_watch.context(
+                now,
+                session_events=self._log.events_since(
+                    now - _ERROR_WINDOW_SECONDS, SESSION_EVENT_KINDS,
+                ),
+                connack_at=getattr(session, "connack_at", None),
+                tray_exist_bits=parse_tray_exist_bits({"print": {"ams": ams}}),
+            )
+            gcode_state = normalize_gcode_state(state) or None
+            self._log.record_event(
+                "print_error",
+                code=label,
+                print_error=int(code) if code.isdigit() else code,
+                gcode_state=gcode_state,
+                **context,
+            )
+            logger.warning(
+                "printer %s: print_error %s in %s; most suspicious: %s",
+                self.bambu_id, label, gcode_state or "unknown state", context["suspect"],
+            )
+        except Exception:
+            logger.exception("printer %s: print_error context was not recorded",
+                             self.bambu_id)
 
     def set_change_listener(self, listener) -> None:
         """``listener()`` runs on the paho thread when the card-visible state moves.

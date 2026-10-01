@@ -616,6 +616,12 @@ class PrinterState:
                 self._user_cancelled,
             )
 
+    def print_fields(self, *keys) -> tuple:
+        """Merged ``print`` values for ``keys``, without copying the payload."""
+        with self._lock:
+            print_obj = _print_obj(self._payload)
+            return tuple(print_obj.get(key) for key in keys)
+
     def stopwatch_sample(self):
         """Merged ``(gcode_state, gcode_start_time)`` for the print stopwatch.
 

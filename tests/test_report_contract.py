@@ -454,3 +454,47 @@ def test_the_report_loop_helper_cancels_the_previous_dump_when_it_rearms(monkeyp
         "cancel", ("dump", 30.0, False),
         "cancel", ("dump", 30.0, False),
     ]
+
+
+def test_report_carries_both_raw_ams_bitmasks():
+    """The start gate reads presence from the raw bits (U3), so both reach the
+    report as hex strings; a printer that sends neither reports None."""
+    clock = FakeClock(1000.0)
+    printer = _printer(clock, _Session(connack_at=1000.0))
+    printer._on_mqtt_report({"print": {
+        "gcode_state": "IDLE",
+        "ams": {"ams_exist_bits": "7", "tray_exist_bits": "ecff", "ams": [
+            {"id": "0", "tray": [{"id": "0", "tray_color": "FF6A13FF", "tray_type": "PLA"}]},
+        ]},
+    }})
+    snapshot = printer.snapshot()
+
+    assert snapshot["tray_exist_bits"] == "ecff"
+    assert snapshot["ams_exist_bits"] == "7"
+
+    bare = _printer(FakeClock(1000.0), _Session(connack_at=1000.0))
+    bare._on_mqtt_report({"print": {"gcode_state": "IDLE"}})
+    assert bare.snapshot()["ams_exist_bits"] is None
+
+
+def test_report_slots_carry_nozzle_temperatures_for_a_tag_read_spool():
+    """3DPF takes a Correct write's temperatures from a tag-read spool (U4/KTD9):
+    the slot reports `nozzle_temp_min`/`nozzle_temp_max` as ints."""
+    clock = FakeClock(1000.0)
+    printer = _printer(clock, _Session(connack_at=1000.0))
+    printer._on_mqtt_report({"print": {
+        "gcode_state": "IDLE",
+        "ams": {"ams_exist_bits": "1", "tray_exist_bits": "1", "ams": [
+            {"id": "0", "tray": [{
+                "id": "0", "state": 3, "tray_color": "61C680FF", "tray_type": "PLA",
+                "tray_sub_brands": "PLA Matte", "tray_info_idx": "GFA01",
+                "tag_uid": "3EC9C5BD00000100", "tray_uuid": "D6E2F7E7A15640A1B9F7B2A7BDFDA842",
+                "nozzle_temp_min": "190", "nozzle_temp_max": "230",
+            }]},
+        ]},
+    }})
+    slot = printer.snapshot()["slots"][0]
+
+    assert slot["filament_id"] == "GFA01"
+    assert slot["nozzle_temp_min"] == 190
+    assert slot["nozzle_temp_max"] == 230

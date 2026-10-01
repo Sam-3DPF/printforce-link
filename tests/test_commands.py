@@ -475,3 +475,93 @@ def test_camera_record_without_a_boolean_publishes_nothing_and_is_handled(params
     printer = _printer()
     assert printer.handle_control("camera_record", params) is True
     assert printer._session.payloads == []
+
+
+# --- slot-write payload matches Bambu Studio / Bambuddy (plan 2026-09-30-001 U4) ---
+
+from bridge.bambu.commands import build_filament_reset, build_filament_setting  # noqa: E402
+
+
+def test_ae5_slot_write_matches_the_studio_payload():
+    """AE5: Correct slot 9 on P1S-8 to PLA Matte #61c680 from a GFA01 reference."""
+    body = build_filament_setting(
+        ams_id=2, tray_id=0, tray_info_idx="GFA01", tray_type="PLA",
+        tray_sub_brands="PLA Matte", tray_color="#61c680",
+        nozzle_temp_min=190, nozzle_temp_max=230,
+    )["print"]
+    assert body == {
+        "sequence_id": "0",
+        "command": "ams_filament_setting",
+        "ams_id": 2,
+        "tray_id": 0,
+        "slot_id": 0,
+        "tray_info_idx": "GFA01",
+        "tray_type": "PLA",
+        "tray_sub_brands": "PLA Matte",
+        "tray_color": "61C680FF",
+        "nozzle_temp_min": 190,
+        "nozzle_temp_max": 230,
+    }
+    assert "setting_id" not in body
+
+
+def test_slot_write_keeps_and_uppercases_an_eight_digit_colour():
+    body = build_filament_setting(ams_id=0, tray_id=3, tray_color="aabbcc80")["print"]
+    assert body["tray_color"] == "AABBCC80"
+    assert body["slot_id"] == 3
+
+
+def test_slot_write_accepts_numeric_string_temperatures():
+    body = build_filament_setting(
+        ams_id=1, tray_id=2, nozzle_temp_min="190", nozzle_temp_max="230",
+    )["print"]
+    assert body["nozzle_temp_min"] == 190 and body["nozzle_temp_max"] == 230
+
+
+def test_slot_write_leaves_missing_temperatures_blank():
+    body = build_filament_setting(ams_id=0, tray_id=1, tray_color="61C680")["print"]
+    assert body["nozzle_temp_min"] == "" and body["nozzle_temp_max"] == ""
+    assert body["tray_sub_brands"] == ""
+    body = build_filament_setting(
+        ams_id=0, tray_id=1, nozzle_temp_min=None, nozzle_temp_max="nope",
+    )["print"]
+    assert body["nozzle_temp_min"] == "" and body["nozzle_temp_max"] == ""
+
+
+def test_filament_reset_is_unchanged():
+    assert build_filament_reset(ams_id=0, tray_id=1) == {
+        "print": {
+            "sequence_id": "0",
+            "command": "ams_filament_setting",
+            "ams_id": 0,
+            "tray_id": 1,
+            "tray_info_idx": "",
+            "tray_color": "00000000",
+            "tray_type": "",
+            "nozzle_temp_min": "",
+            "nozzle_temp_max": "",
+        },
+    }
+
+
+def test_set_filament_passes_the_sub_brand_and_ids_through():
+    printer = _printer()
+    assert printer.handle_control("filament_setting", {
+        "ams_id": 2, "tray_id": 0, "tray_info_idx": "GFA01", "tray_type": "PLA",
+        "tray_sub_brands": "PLA Matte", "tray_color": "61c680",
+        "nozzle_temp_min": 190, "nozzle_temp_max": 230,
+    }) is True
+    body = _body(printer)
+    assert body["ams_id"] == 2 and body["tray_id"] == 0 and body["slot_id"] == 0
+    assert body["tray_sub_brands"] == "PLA Matte"
+    assert body["tray_info_idx"] == "GFA01" and body["tray_type"] == "PLA"
+    assert body["tray_color"] == "61C680FF"
+    assert body["nozzle_temp_min"] == 190 and body["nozzle_temp_max"] == 230
+
+
+def test_external_spool_write_keeps_255_254_with_slot_zero():
+    printer = _printer()
+    assert printer.handle_control("filament_setting", {"external": True, "color": "ff00ff00"}) is True
+    body = _body(printer)
+    assert body["ams_id"] == 255 and body["tray_id"] == 254 and body["slot_id"] == 0
+    assert body["tray_color"] == "FF00FF00"

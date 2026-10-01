@@ -1,9 +1,12 @@
 from bridge.ams import (
     ams_needs_pushall,
     ams_slot_number,
+    first_absent_slot,
     idle_trays_needing_rfid,
+    mapped_tray_presence,
     merge_ams,
     parse_ams,
+    parse_ams_exist_bits,
     parse_tray_exist_bits,
     normalize_hex,
     remain_percent,
@@ -831,3 +834,107 @@ def test_a_delta_without_ams_exist_bits_still_keeps_omitted_units():
     merged = merge_ams(_two_units(), {"ams": [{"id": "0", "tray": [{"id": "0"}]}]})
 
     assert [u["id"] for u in merged["ams"]] == ["0", "1"]
+
+
+# P1S-8 on 2026-09-30: trays 8, 9 and 12 read empty.
+_P1S_8_TRAY_BITS = "ecff"
+# gOgvfw35: filaments 2, 6, 9 and 11 on global trays 4, 5, 11 and 8.
+_GOGVFW35_MAPPING = [-1, 4, -1, -1, -1, 5, -1, -1, 11, -1, 8]
+
+
+def test_parse_ams_exist_bits_mirrors_the_tray_bits_parser():
+    assert parse_ams_exist_bits({"print": {"ams": {"ams_exist_bits": "1"}}}) == "1"
+    assert parse_ams_exist_bits({"print": {"ams": {"ams_exist_bits": 3}}}) == "3"
+    assert parse_ams_exist_bits({"print": {"ams": {}}}) is None
+    assert parse_ams_exist_bits({"print": {"ams": {"ams_exist_bits": True}}}) is None
+    assert parse_ams_exist_bits({"print": {"ams": {"ams_exist_bits": "zz"}}}) is None
+    assert parse_ams_exist_bits(None) is None
+
+
+def test_mapped_tray_presence_reads_the_shop_bitmask():
+    for tray in (8, 9, 12):
+        assert mapped_tray_presence(tray, _P1S_8_TRAY_BITS) is False
+    for tray in (0, 4, 5, 10, 11, 13, 15):
+        assert mapped_tray_presence(tray, _P1S_8_TRAY_BITS) is True
+
+
+def test_mapped_tray_presence_is_unknown_without_bits():
+    assert mapped_tray_presence(8, None) is None
+    assert mapped_tray_presence(8, "") is None
+    assert mapped_tray_presence(8, "not-hex") is None
+    assert mapped_tray_presence(8, None, None) is None
+
+
+def test_a_cleared_unit_bit_makes_all_four_of_its_trays_absent():
+    # Unit 2 (trays 8-11) is gone even though the tray bits still say ffff.
+    for tray in (8, 9, 10, 11):
+        assert mapped_tray_presence(tray, "ffff", "b") is False
+    assert mapped_tray_presence(4, "ffff", "b") is True
+    # A cleared unit decides even when the tray bits are unknown.
+    assert mapped_tray_presence(9, None, "b") is False
+    # A present unit with unknown tray bits says nothing about the tray.
+    assert mapped_tray_presence(4, None, "b") is None
+
+
+def test_external_ams_ht_and_unused_entries_are_unknown():
+    for tray in (-1, 254, 255, 128, 135, 24, 16, None, True, "8"):
+        assert mapped_tray_presence(tray, "0", "0") is None
+
+
+def test_first_absent_slot_names_the_first_mapped_empty_tray_1_based():
+    snapshot = {"tray_exist_bits": _P1S_8_TRAY_BITS}
+    # Tray 11 reads present; tray 8 (slot 9) is the mapped one that is empty.
+    assert first_absent_slot(snapshot, _GOGVFW35_MAPPING) == 9
+    assert first_absent_slot({"tray_exist_bits": "ffff"}, _GOGVFW35_MAPPING) is None
+    assert first_absent_slot({}, _GOGVFW35_MAPPING) is None
+    assert first_absent_slot(None, _GOGVFW35_MAPPING) is None
+    assert first_absent_slot(snapshot, [254, 255, -1]) is None
+    assert first_absent_slot(
+        {"tray_exist_bits": "ffff", "ams_exist_bits": "b"}, _GOGVFW35_MAPPING,
+    ) == 12
+
+
+# --- per-slot nozzle temperatures (plan 2026-09-30-001 U4) -----------------------
+
+def _shop_tray(**overrides):
+    """A tag-read PLA Matte tray as P1S-8 reports it (2026-09-30 shop capture)."""
+    tray = {
+        "id": "0", "state": 3, "cols": ["61C680FF"], "tray_color": "61C680FF",
+        "tray_type": "PLA", "tray_sub_brands": "PLA Matte", "tray_info_idx": "GFA01",
+        "tag_uid": "3EC9C5BD00000100", "tray_uuid": "D6E2F7E7A15640A1B9F7B2A7BDFDA842",
+        "nozzle_temp_min": "190", "nozzle_temp_max": "230", "remain": -1,
+    }
+    tray.update(overrides)
+    return tray
+
+
+def _one_tray(tray, bits="1"):
+    return {"print": {"ams": {"tray_exist_bits": bits, "ams": [{"id": "0", "tray": [tray]}]}}}
+
+
+def test_a_tag_read_tray_reports_its_nozzle_temperatures():
+    slot = parse_ams(_one_tray(_shop_tray()))[0]
+    assert slot["filament_id"] == "GFA01"
+    assert slot["nozzle_temp_min"] == 190
+    assert slot["nozzle_temp_max"] == 230
+
+
+def test_an_absent_tray_reports_no_nozzle_temperatures():
+    slot = parse_ams(_one_tray(_shop_tray(), bits="0"))[0]
+    assert "nozzle_temp_min" not in slot and "nozzle_temp_max" not in slot
+
+
+def test_invalid_nozzle_temperatures_are_left_out():
+    for bad in ("", "abc", None, "0", "-5", True):
+        slot = parse_ams(_one_tray(_shop_tray(nozzle_temp_min=bad, nozzle_temp_max=bad)))[0]
+        assert "nozzle_temp_min" not in slot, bad
+        assert "nozzle_temp_max" not in slot, bad
+    slot = parse_ams(_one_tray({k: v for k, v in _shop_tray().items()
+                                if not k.startswith("nozzle_temp")}))[0]
+    assert "nozzle_temp_min" not in slot and "nozzle_temp_max" not in slot
+
+
+def test_a_tagless_tray_reports_no_nozzle_temperatures():
+    slot = parse_ams(_one_tray(_shop_tray(tag_uid="0" * 16, tray_uuid="0" * 32)))[0]
+    assert slot["spool_uid"] is None
+    assert "nozzle_temp_min" not in slot and "nozzle_temp_max" not in slot
