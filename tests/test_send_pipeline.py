@@ -250,6 +250,63 @@ def test_phase_a_timeout_resets_once_and_does_not_upload_again(tmp_path):
     assert dpf.failed == []
 
 
+class _SilentSession:
+    """A connected session whose silence the test sets."""
+
+    def __init__(self):
+        self.connected = True
+        self.silent = 0.0
+        self.resets = 0
+
+    def silent_for(self, now=None):
+        return self.silent
+
+    def hard_reset(self):
+        self.resets += 1
+        self.connected = False
+
+
+def _phase_a_expiry(tmp_path, *, age, silent):
+    """One send, then a watchdog pass ``age`` seconds after the start publish."""
+    fleet = _ConfirmFleet()
+    session = _SilentSession()
+    fleet._printer._session = session
+    clock = _Clock()
+    router = Router(str(tmp_path / "queue.json"))
+    dpf = _FakeDpf()
+    started = set()
+    kwargs = {"router": router, "wall_time": lambda: clock.now}
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started, **kwargs)
+    clock.advance(age)
+    session.silent = silent
+    _handle_cloud_sends(_desired(), fleet, dpf, str(tmp_path), started, **kwargs)
+    return session, router.assignments_snapshot()["P1"], fleet, dpf
+
+
+def test_phase_a_does_not_reset_a_session_silent_since_the_start(tmp_path):
+    """No report since the start is no evidence it was missed: a P1 may be
+    unpacking with its stream stalled, and a reset then raises 0500_4003."""
+    session, stored, fleet, dpf = _phase_a_expiry(tmp_path, age=95.0, silent=96.0)
+    assert session.resets == 0
+    assert stored["pending_republish"] is False
+    assert stored["attempts"] == 1
+    assert len(fleet.starts) == 1
+    assert dpf.failed == []
+
+
+def test_phase_a_resets_a_silent_session_after_the_hold_ceiling(tmp_path):
+    session, stored, fleet, _dpf = _phase_a_expiry(tmp_path, age=160.0, silent=161.0)
+    assert session.resets == 1
+    assert stored["pending_republish"] is True
+    assert len(fleet.starts) == 1
+
+
+def test_phase_a_still_resets_when_reports_flow_without_an_echo(tmp_path):
+    session, stored, _fleet, _dpf = _phase_a_expiry(tmp_path, age=95.0, silent=2.0)
+    assert session.resets == 1
+    assert stored["pending_republish"] is True
+
+
 def test_phase_b_timeout_retries_without_resetting(tmp_path):
     class _EchoFleet(_ConfirmFleet):
         def start_print(self, bambu_id, remote_name, mapping, plate_index=1):

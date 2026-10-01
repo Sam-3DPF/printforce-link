@@ -1939,3 +1939,165 @@ def test_an_external_spool_never_holds(tmp_path):
                  holds=_SlotHolds())
     assert [start[2] for start in fleet.starts] == [[254, 255]]
     assert dpf.failed == []
+
+
+def _republish_held_on_slot_9(tmp_path, holds, fleet=None):
+    """A start the printer never took, then tray 8 empties: the watchdog's
+    republish is held on slot 9. Returns what the next passes need."""
+    from bridge.send_pipeline import PHASE_A_SECONDS
+
+    clock = _FakeClock(0.0)
+    fleet = fleet or _BitsFleet(tray_exist_bits="ffff")
+    desired = _gogvfw35_desired()
+    dpf = _FakeDpf(desired=desired)
+    started = set()
+
+    def run(slot_holds=None):
+        _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started,
+                     holds=slot_holds or holds)
+
+    run()
+    fleet.snap["tray_exist_bits"] = "ecff"
+    clock.advance(PHASE_A_SECONDS)
+    run()  # phase A ran out: reset, republish pending
+    run()  # the republish finds tray 8 absent and holds
+    assert len(fleet.starts) == 1
+    return clock, fleet, dpf, run
+
+
+def test_a_slot_hold_on_a_republish_survives_a_link_restart(tmp_path):
+    from bridge.app import _SlotHolds
+    from bridge.send_pipeline import attempt_path
+
+    clock, fleet, dpf, run = _republish_held_on_slot_9(tmp_path, _SlotHolds())
+    held_at = clock.now
+    record_path = attempt_path(_cloud_send_started_path(str(tmp_path), ("B1", "P1", 1)))
+    import json
+    stored = json.loads(open(record_path).read())
+    assert stored["slot_hold_since"] == held_at
+    assert stored["slot_hold_slot"] == "9"
+
+    restarted = _SlotHolds()  # a restart drops the in-memory hold
+    for at in (300, 600):
+        clock.now = held_at + at
+        run(restarted)
+    assert dpf.failed == []
+    assert len(fleet.starts) == 1
+
+    clock.now = held_at + 601
+    run(restarted)
+    assert dpf.failed == [("B1", 1, "slot_empty; 9")]
+    assert len(fleet.starts) == 1
+
+
+def test_a_held_republish_is_not_reset_while_the_session_is_down(tmp_path):
+    from bridge.app import _SlotHolds
+
+    class _DownSession:
+        connected = False
+
+        def __init__(self):
+            self.resets = 0
+
+        def hard_reset(self):
+            self.resets += 1
+
+    session = _DownSession()
+
+    class _SessionPrinter(_BitsPrinter):
+        _session = session
+
+    class _SessionFleet(_BitsFleet):
+        def by_id(self, bambu_id):
+            return _SessionPrinter(self) if bambu_id == "P1" else None
+
+    holds = _SlotHolds()
+    session.connected = True
+    clock, fleet, dpf, run = _republish_held_on_slot_9(
+        tmp_path, holds, fleet=_SessionFleet(tray_exist_bits="ffff"),
+    )
+    resets_before = session.resets
+    session.connected = False
+    clock.advance(200)  # past phase A again, with the redial still under way
+    run()
+    run()
+    assert session.resets == resets_before
+    assert dpf.failed == []
+    assert len(fleet.starts) == 1
+
+
+def test_a_held_send_removed_then_re_added_gets_a_fresh_ten_minute_window(tmp_path):
+    from bridge.app import _SlotHolds
+    clock = _FakeClock(0.0)
+    fleet = _BitsFleet(tray_exist_bits="ecff")
+    desired = _gogvfw35_desired()
+    dpf = _FakeDpf(desired=desired)
+    started, holds = set(), _SlotHolds()
+    # The printer stays in desired state; only its send goes away.
+    removed = [dict(desired[0], send=None)]
+
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    clock.now = 100.0
+    _hold_passes(fleet, dpf, tmp_path, removed, clock=clock, started=started, holds=holds)
+    assert holds.holding(("B1", "P1", 1)) is False
+
+    clock.now = 500.0
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    clock.now = 1100.0  # 1100s after the first hold, 600s after the re-add
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    assert dpf.failed == []
+
+    clock.now = 1101.0
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    assert dpf.failed == [("B1", 1, "slot_empty; 9")]
+
+
+def test_an_unacked_slot_empty_report_is_retried_and_the_hold_kept(tmp_path):
+    from bridge.app import _SlotHolds
+
+    class _FirstReportUnacked(_FakeDpf):
+        def report_failed(self, batch_id, plate_number=None, reason=None):
+            self.failed.append((batch_id, plate_number, reason))
+            return {} if len(self.failed) == 1 else {"batch_id": batch_id}
+
+    clock = _FakeClock(0.0)
+    fleet = _BitsFleet(tray_exist_bits="ecff")
+    desired = _gogvfw35_desired()
+    dpf = _FirstReportUnacked(desired=desired)
+    started, holds = set(), _SlotHolds()
+    key = ("B1", "P1", 1)
+
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    clock.now = 601.0
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    assert dpf.failed == [("B1", 1, "slot_empty; 9")]
+    assert holds.holding(key) is True
+
+    clock.now = 650.0
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    assert dpf.failed == [("B1", 1, "slot_empty; 9")] * 2
+    assert holds.holding(key) is False
+
+    clock.now = 700.0
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    assert len(dpf.failed) == 2
+    assert fleet.uploads == []
+
+
+def test_a_hold_whose_absent_slot_moves_reports_the_slot_absent_at_report_time(tmp_path):
+    from bridge.app import _SlotHolds
+    clock = _FakeClock(0.0)
+    fleet = _BitsFleet(tray_exist_bits="ecff")  # tray 8 (slot 9) absent
+    desired = _gogvfw35_desired()
+    dpf = _FakeDpf(desired=desired)
+    started, holds = set(), _SlotHolds()
+
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    fleet.snap["tray_exist_bits"] = "f7ff"  # slot 9 back, tray 11 (slot 12) absent
+    clock.now = 300.0
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    assert dpf.failed == []
+
+    clock.now = 601.0
+    _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
+    assert dpf.failed == [("B1", 1, "slot_empty; 12")]

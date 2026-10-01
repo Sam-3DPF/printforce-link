@@ -35,10 +35,14 @@ def gcode_state_of(payload) -> str:
     print_obj = payload.get("print")
     if not isinstance(print_obj, dict):
         return ""
-    state = print_obj.get("gcode_state")
-    if not isinstance(state, str):
+    return normalize_gcode_state(print_obj.get("gcode_state"))
+
+
+def normalize_gcode_state(value) -> str:
+    """A raw ``gcode_state`` value, stripped and upper-cased. "" when not text."""
+    if not isinstance(value, str):
         return ""
-    return state.strip().upper()
+    return value.strip().upper()
 
 
 def project_file_refused(gcode_state: str) -> bool:

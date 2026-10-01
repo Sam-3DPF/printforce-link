@@ -17,7 +17,7 @@ from collections import deque
 
 from ..ams import TRAYS_PER_AMS, mapped_tray_presence
 from ..coerce import as_int
-from .commands import gcode_state_of
+from .commands import normalize_gcode_state
 
 # How far back the gap and session-event checks look.
 WINDOW_SECONDS = 180.0
@@ -98,7 +98,7 @@ class PrintErrorWatch:
         ``code`` is the fault ``print_error`` or None. A clear, a repeat, and
         the first report Link sees are not edges.
         """
-        state = gcode_state_of({"print": {"gcode_state": gcode_state}})
+        state = normalize_gcode_state(gcode_state)
         with self._lock:
             if state and state != self._state:
                 self._state = state
@@ -109,7 +109,7 @@ class PrintErrorWatch:
 
     def context(self, now, *, session_events=(), connack_at=None,
                 tray_exist_bits=None) -> dict:
-        """Fields for the ``print_error`` event, ``origin`` included.
+        """Fields for the ``print_error`` event, ``suspect`` included.
 
         ``session_events`` are PrinterLog events from the last
         ``WINDOW_SECONDS``, stamped on the same monotonic clock as ``now``.
@@ -146,7 +146,7 @@ class PrintErrorWatch:
             "trays": trays,
             "tray_exist_bits": tray_exist_bits,
             "upload": upload,
-            "origin": _most_suspicious(recent, gaps, trays),
+            "suspect": _most_suspicious(recent, gaps, trays),
         }
 
 
@@ -177,12 +177,17 @@ def _tray_presence(mapping, bits) -> list:
     return trays
 
 
+_PRIME_SUSPECTS = ("unexpected_start", "reset")
+
+
 def _most_suspicious(events, gaps, trays) -> str:
-    """In order: a reset or an unexpected start in the window, a long silence
+    """In order: the latest unexpected start or reset in the window, the latest
+    other session event (stale, redial, disconnect, reset_held), a long silence
     while unpacking, an absent mapped tray. Else nothing Link can see."""
-    for event in reversed(events):
-        if event["kind"] in ("unexpected_start", "reset"):
-            return f"{event['kind']} {event['age']:.0f}s before"
+    prime = [event for event in events if event["kind"] in _PRIME_SUSPECTS]
+    named = prime[-1] if prime else (events[-1] if events else None)
+    if named is not None:
+        return f"{named['kind']} {named['age']:.0f}s before"
     unpacking = [
         gap for gap in gaps
         if gap[2] in UNPACKING_STATES and gap[1] > _SUSPECT_GAP_SECONDS

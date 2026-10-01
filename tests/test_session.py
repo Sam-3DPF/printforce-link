@@ -831,3 +831,42 @@ def test_connack_and_disconnect_carry_the_attempt_and_the_reason():
     assert [f["attempt"] for f in disconnects] == [1, 2]
     assert disconnects[1]["reason"] == "Keep alive timeout"
     assert disconnects[1]["code"] == 141
+
+
+def test_a_redial_whose_client_fails_to_start_is_redialled_again(caplog):
+    """A failed ``_open`` (loop_start could not start its thread) must not
+    strand the session: the next backoff builds another client."""
+    clock = Clock(4000.0)
+    broker = _ReplayBroker()
+    real_factory = broker.factory
+
+    def factory(client_id):
+        client = real_factory(client_id)
+        if len(broker.clients) == 2:
+            def refuse():
+                raise RuntimeError("can't start new thread")
+            client.loop_start = refuse
+        return client
+
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=factory,
+        monotonic=clock, watchdog_interval=None,
+    )
+    session.start()
+    broker.accept(broker.current)
+    broker.drop()
+
+    escaped = []
+    with caplog.at_level(logging.WARNING, logger="bridge.bambu.session"):
+        for _ in range(30):
+            clock.now += 1
+            try:
+                session.tick()
+            except Exception as exc:  # the watchdog loop would log and go on
+                escaped.append(exc)
+    assert len(broker.clients) == 3
+    assert broker.clients[2].loop_started == 1
+    assert escaped == []
+    assert "redial" in caplog.text
+    broker.accept(broker.current)
+    assert session.connected is True

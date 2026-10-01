@@ -44,6 +44,7 @@ from .bambu.commands import (
     filament_load_target,
     fresh_submission_id,
     gcode_state_of,
+    normalize_gcode_state,
     project_file_refused,
     skip_objects_allowed,
 )
@@ -66,7 +67,7 @@ from .bambu.replies import ReplyBook
 from .bambu.diagnostic import proves_serial, run_connection_diagnostic
 from .bambu.models import ModelProfile, is_known_model, profile_for
 from .state_v2 import build_state_v2, print_error_label
-from .bambu.session import LinkSession
+from .bambu.session import _RESET_HOLD_MAX_SECONDS, LinkSession
 from .send_pipeline import PHASE_A_SECONDS
 from .bambu.hms import (
     commands_rejected as hms_commands_rejected,
@@ -766,15 +767,26 @@ class BambuPrinter:
         """Why a silent session must not be reset now, or None.
 
         The merged ``gcode_state`` while PREPARE or SLICING, or ``phase_a``
-        inside the send watchdog's first window after a start. The session
-        asks only while its socket is up.
+        inside the send watchdog's first window after a start, and after it
+        while no report has arrived since that start. The session asks only
+        while its socket is up and caps every hold at
+        ``_RESET_HOLD_MAX_SECONDS`` of silence.
         """
         state, = self.state.print_fields("gcode_state")
-        state = gcode_state_of({"print": {"gcode_state": state}})
+        state = normalize_gcode_state(state)
         if state in UNPACKING_STATES:
             return state
         started = self._start_published_at
-        if started is not None and self._monotonic() - started < PHASE_A_SECONDS:
+        if started is None:
+            return None
+        since_start = self._monotonic() - started
+        if since_start < PHASE_A_SECONDS:
+            return "phase_a"
+        # Silence since the start is no evidence it was missed. The send
+        # watchdog skips its own reset on the same test (app._silent_since).
+        last_report = getattr(self._session, "last_message_at", None)
+        silent_since_start = last_report is None or last_report <= started
+        if since_start < _RESET_HOLD_MAX_SECONDS and silent_since_start:
             return "phase_a"
         return None
 
@@ -1406,6 +1418,11 @@ class BambuPrinter:
         cancel record nothing. Runs on the MQTT thread and never raises.
         """
         state, raw, ams = self.state.print_fields("gcode_state", "print_error", "ams")
+        if raw is None:
+            # An info reply or sparse delta ahead of the first pushall. The
+            # baseline is the first report that carries print_error, so a code
+            # already standing then is not an edge.
+            return
         code = fault_print_error(raw)
         if not self._error_watch.observe(state, code, now):
             return
@@ -1420,7 +1437,7 @@ class BambuPrinter:
                 connack_at=getattr(session, "connack_at", None),
                 tray_exist_bits=parse_tray_exist_bits({"print": {"ams": ams}}),
             )
-            gcode_state = gcode_state_of({"print": {"gcode_state": state}}) or None
+            gcode_state = normalize_gcode_state(state) or None
             self._log.record_event(
                 "print_error",
                 code=label,
@@ -1430,7 +1447,7 @@ class BambuPrinter:
             )
             logger.warning(
                 "printer %s: print_error %s in %s; most suspicious: %s",
-                self.bambu_id, label, gcode_state or "unknown state", context["origin"],
+                self.bambu_id, label, gcode_state or "unknown state", context["suspect"],
             )
         except Exception:
             logger.exception("printer %s: print_error context was not recorded",

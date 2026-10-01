@@ -603,6 +603,33 @@ def test_a_silent_session_is_not_reset_while_preparing_and_is_while_idle():
     assert printer.down_reason == "silent_session"
 
 
+def test_the_unpacking_hold_ends_after_150s_of_silence():
+    """A stalled report stream freezes the merged PREPARE. The hold has a ceiling."""
+    clock = Clock(13500.0)
+    broker = Broker()
+    printer = _linked_printer(clock, broker)
+    printer.connect()
+    broker.current.fire_connack(0)
+    _report(broker.current, {"print": {"gcode_state": "PREPARE"}})
+    silent_from = clock.now
+
+    _silent_for_90s(clock, printer)
+    assert len(broker.clients) == 1
+
+    while clock.now + 5 < silent_from + 150:
+        clock.now += 5
+        printer._session.tick()
+    assert len(broker.clients) == 1
+
+    clock.now = silent_from + 160
+    printer._session.tick()
+    assert len(broker.clients) == 2
+    assert printer.down_reason == "silent_session"
+    held = [e for e in printer.collect_log()["events"] if e["kind"] == "reset_held"]
+    assert [e.get("expired") for e in held] == [None, True]
+    assert held[1]["reason"] == "PREPARE"
+
+
 def test_a_silent_session_is_not_reset_inside_the_send_phase_a():
     from bridge.send_pipeline import PHASE_A_SECONDS
 
@@ -615,11 +642,39 @@ def test_a_silent_session_is_not_reset_inside_the_send_phase_a():
     assert printer.start_print("benchy.3mf", [0], 1) is True
     started = clock.now
 
+    # A report after the start shows the stream is flowing, so the hold ends
+    # with phase A.
+    clock.now += 1
+    _report(broker.current, {"print": {"gcode_state": "IDLE"}})
     while clock.now + 5 < started + PHASE_A_SECONDS:
         clock.now += 5
         printer._session.tick()
     assert len(broker.clients) == 1
     clock.now = started + PHASE_A_SECONDS
+    printer._session.tick()
+    assert len(broker.clients) == 2
+
+
+def test_a_session_silent_since_the_start_is_held_until_the_ceiling():
+    """The send watchdog skips its reset in the same case (_silent_since)."""
+    from bridge.bambu.session import _RESET_HOLD_MAX_SECONDS
+    from bridge.send_pipeline import PHASE_A_SECONDS
+
+    clock = Clock(14500.0)
+    broker = Broker()
+    printer = _linked_printer(clock, broker)
+    printer.connect()
+    broker.current.fire_connack(0)
+    _report(broker.current, {"print": {"gcode_state": "IDLE"}})
+    assert printer.start_print("benchy.3mf", [0], 1) is True
+    started = clock.now
+
+    while clock.now + 5 < started + _RESET_HOLD_MAX_SECONDS:
+        clock.now += 5
+        printer._session.tick()
+    assert clock.now > started + PHASE_A_SECONDS
+    assert len(broker.clients) == 1
+    clock.now = started + _RESET_HOLD_MAX_SECONDS
     printer._session.tick()
     assert len(broker.clients) == 2
 

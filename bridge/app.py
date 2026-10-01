@@ -20,6 +20,7 @@ from . import __version__
 from .ams import first_absent_slot, normalize_hex
 from .bambu.commands import live_slot_number_allowed, live_slot_to_tray, tray_index_allowed
 from .bambu.ftps import UploadCancelled
+from .bambu.session import _RESET_HOLD_MAX_SECONDS
 from .config import Config, PrinterConfig, load_config
 from .discovery_reporter import DiscoveryReporter
 from .dpf_client import DpfClient
@@ -87,8 +88,10 @@ _REPUBLISH_NOT_SENT = "not_sent"
 class _SlotHolds:
     """When each send's start began waiting on an absent tray.
 
-    Shared by every printer worker, like ``_SendSetupFailures``, and kept in
-    memory: a restart begins the wait again, which only delays the report.
+    Shared by every printer worker, like ``_SendSetupFailures``. A start the
+    watchdog is republishing also keeps its hold on the attempt record, so a
+    restart continues that wait (``adopt``). A hold before the first start is
+    in memory only: a restart begins it again, which only delays the report.
     """
 
     def __init__(self):
@@ -104,6 +107,17 @@ class _SlotHolds:
                 return held[0], False
             self._held[key] = [float(now), slot]
             return float(now), True
+
+    def adopt(self, key, since: float, slot: str) -> None:
+        """Resume a hold read back from the attempt record, unless one is running."""
+        with self._lock:
+            self._held.setdefault(key, [float(since), str(slot)])
+
+    def get(self, key):
+        """``(held_since, slot)``, or None when nothing is held."""
+        with self._lock:
+            held = self._held.get(key)
+            return None if held is None else (held[0], held[1])
 
     def holding(self, key) -> bool:
         with self._lock:
@@ -1675,6 +1689,22 @@ def _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
     return True
 
 
+def _keep_slot_hold(record, key, slot_holds, started_path, router, bambu_id) -> None:
+    """Mirror an in-flight send's slot hold onto its attempt record.
+
+    A restart then resumes the same wait. Writes only on a change, and never
+    over a failure latch.
+    """
+    if failure_latched(started_path):
+        return
+    since, slot = slot_holds.get(key) or (None, None)
+    if record.get("slot_hold_since") == since and record.get("slot_hold_slot") == slot:
+        return
+    record["slot_hold_since"] = since
+    record["slot_hold_slot"] = slot
+    save_attempt(started_path, router, str(bambu_id), record)
+
+
 def _submission_on_printer(fleet, bambu_id: str):
     by_id = getattr(fleet, "by_id", None)
     printer = by_id(bambu_id) if callable(by_id) else None
@@ -1788,6 +1818,24 @@ def _cloud_send_session_connected(fleet, bambu_id: str) -> bool:
     return bool(connected)
 
 
+def _silent_since(fleet, bambu_id: str, seconds: float) -> bool:
+    """True when the session is up and no report arrived in the last ``seconds``.
+
+    A printer or session that cannot say how long it has been quiet is not silent.
+    """
+    by_id = getattr(fleet, "by_id", None)
+    printer = by_id(bambu_id) if callable(by_id) else None
+    session = getattr(printer, "_session", None) if printer is not None else None
+    silent_for = getattr(session, "silent_for", None)
+    if getattr(session, "connected", False) is not True or not callable(silent_for):
+        return False
+    try:
+        silent = silent_for()
+    except Exception:
+        return False
+    return isinstance(silent, (int, float)) and silent >= seconds
+
+
 def _republish_start(send, fleet, bambu_id: str, dest: str,
                      plate_index: int, snapshot) -> Optional[str]:
     """Publish the start again. None when it went out, else the refusal.
@@ -1832,19 +1880,17 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
     now = float(wall_time())
     snapshot = _live_snapshot(fleet, str(bambu_id))
     record = load_attempt(started_path, router, str(bambu_id), now)
+    if record.get("slot_hold_since") is not None:
+        slot_holds.adopt(key, record["slot_hold_since"], record.get("slot_hold_slot"))
     action = decide(record, snapshot, now)
     if action == "confirm":
         slot_holds.clear(key)
         _report_confirmed_dispatch(key, dpf, spool_dir, router)
         return
-    if (
-        action == "reset_retry"
-        and record.get("pending_republish")
-        and slot_holds.holding(key)
-        and _cloud_send_session_connected(fleet, bambu_id)
-    ):
+    if action == "reset_retry" and record.get("pending_republish") and slot_holds.holding(key):
         # The republish is waiting on an absent tray, not on the session.
-        # Keep checking the tray; do not reset or spend an attempt.
+        # Keep checking the tray; do not reset or spend an attempt. A session
+        # that is down redials by itself, so the republish branch just waits.
         action = "republish"
     if action == "enter_b":
         record["phase"] = "B"
@@ -1852,6 +1898,14 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
         record["last_failure"] = None
         save_attempt(started_path, router, str(bambu_id), record)
         return
+    if action == "reset_retry" and not record.get("pending_republish"):
+        began = record.get("phase_started_at")
+        age = now - float(now if began is None else began)
+        if age < _RESET_HOLD_MAX_SECONDS and _silent_since(fleet, bambu_id, age):
+            # No report at all since this start went out. That is no evidence
+            # the start was missed: a P1 may be unpacking with its stream
+            # stalled, and a reset then raises 0500_4003. Check again next pass.
+            return
     if action == "reset_retry":
         if record.get("pending_republish"):
             record["attempts"] = int(record.get("attempts") or 1) + 1
@@ -1875,10 +1929,10 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
             return
         dest = _cloud_send_file_path(spool_dir, key)
         refusal = _republish_start(send, fleet, bambu_id, dest, plate_index, snapshot)
-        if _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
-                      started_sends, router):
-            return
-        if refusal is not None:
+        held = _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
+                          started_sends, router)
+        _keep_slot_hold(record, key, slot_holds, started_path, router, bambu_id)
+        if held or refusal is not None:
             return
         record["pending_republish"] = False
         record["attempts"] = int(record.get("attempts") or 1) + 1
@@ -1895,8 +1949,10 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
         record["last_failure"] = "no_active"
         dest = _cloud_send_file_path(spool_dir, key)
         refusal = _republish_start(send, fleet, bambu_id, dest, plate_index, snapshot)
-        if _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
-                      started_sends, router):
+        held = _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
+                          started_sends, router)
+        _keep_slot_hold(record, key, slot_holds, started_path, router, bambu_id)
+        if held:
             return
         if refusal is not None:
             _fail_cloud_send(

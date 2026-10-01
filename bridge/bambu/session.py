@@ -17,12 +17,16 @@ every QoS 1 message the broker has not PUBACKed, and Bambu's broker rarely
 PUBACKs, so every reconnect replayed old ``project_file`` starts (shop logs,
 2026-09-30; Bambuddy #1136). After any drop the watchdog stops that client and
 opens a fresh one on a 5-30s backoff. paho still retries a client's first
-connect, since nothing is published before CONNACK.
+connect, since nothing is published before CONNACK. A replacement client that
+fails to start (``loop_start`` or ``connect_async`` raises) is ended too, so
+the next backoff tries again.
 
 A silent session is not reset while the printer is unpacking or preparing a
-file, or while a start is inside the send watchdog's phase A. Resetting then
-makes a P1 raise 0500_4003 (Bambuddy #1150/#1678). A socket that is actually
-down still redials.
+file, while a start is inside the send watchdog's phase A, or after it while
+no report has arrived since that start. Resetting then makes a P1 raise
+0500_4003 (Bambuddy #1150/#1678). The hold lasts at most 150s of silence
+(``_RESET_HOLD_MAX_SECONDS``): a P1 unpacks in up to ~135s, and anything
+longer is a stalled stream. A socket that is actually down still redials.
 
 The printer echoes every ``project_file`` it takes on the report topic. An
 echo whose task id this client did not publish is an ``unexpected_start``:
@@ -62,6 +66,10 @@ _AUTH_REJECTED = frozenset({134, 135})
 # Silence on a socket that is still up. The fleet backstop is the longer net.
 _STALE_AFTER_SECONDS = 60.0
 _RESET_COOLDOWN_SECONDS = 30.0
+# The reset hold's ceiling on silence. A P1 unpacks a file in up to ~135s
+# (Bambuddy); a longer silence is a stalled stream, not an unpack. Below the
+# fleet backstop's 300s, so the session resets before the backstop would.
+_RESET_HOLD_MAX_SECONDS = 150.0
 _PROBE_INTERVAL_SECONDS = 300.0
 _PROBE_TIMEOUT_SECONDS = 10.0
 _AUTH_RETRY_SECONDS = 300.0
@@ -231,6 +239,7 @@ class LinkSession:
         # Returns why a silent session must not be reset now, or None.
         self._reset_hold = None
         self._hold_logged = None
+        self._hold_expired_logged = None
         self._last_message_at = None
         self._last_connect_error = None
         self._state = "offline"
@@ -480,10 +489,14 @@ class LinkSession:
             self._down_reason = "silent_session"
             held = self._reset_held()
             if held is not None:
-                if self._hold_logged != anchor:
-                    self._hold_logged = anchor
-                    self._record_event("reset_held", reason=held)
-                return
+                if now - anchor < _RESET_HOLD_MAX_SECONDS:
+                    if self._hold_logged != anchor:
+                        self._hold_logged = anchor
+                        self._record_event("reset_held", reason=held)
+                    return
+                if self._hold_expired_logged != anchor:
+                    self._hold_expired_logged = anchor
+                    self._record_event("reset_held", reason=held, expired=True)
             if self._reset_allowed(now):
                 self.hard_reset(keep_reason="silent_session")
 
@@ -555,9 +568,13 @@ class LinkSession:
             client.connect_async(self.host, _PORT, keepalive=_KEEPALIVE_SECONDS)
             client.loop_start()
         except Exception:
+            # This client never ran. End it so the watchdog redials on the
+            # backoff; a stranded _client_ended=False would never redial.
             with self._lock:
                 if self._client is client:
                     self._client = None
+                    self._connected = False
+                    self._end_client_locked()
             raise
 
     def _configure(self, client) -> None:
@@ -783,7 +800,14 @@ class LinkSession:
         delay = self._redial_delay
         self._redial_delay = min(delay * 2, _REDIAL_MAX_SECONDS)
         self._record_event("redial", after=delay)
-        self.hard_reset(keep_reason=self._down_reason)
+        try:
+            self.hard_reset(keep_reason=self._down_reason)
+        except Exception as exc:
+            # _open ended the client and scheduled the next redial.
+            logger.warning(
+                "printer %s: redial could not start a client (%s); retrying in %.0fs",
+                self.serial, type(exc).__name__, self._redial_delay,
+            )
 
     def _reset_held(self):
         hold = self._reset_hold

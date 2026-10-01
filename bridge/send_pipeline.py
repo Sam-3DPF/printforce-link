@@ -4,7 +4,8 @@ Phase A lasts 90 seconds. An active printer state confirms the send. An echo
 of this send's submission id, with no active state yet, moves to phase B.
 Phase B lasts 180 seconds and only confirms on an active state.
 
-A phase A timeout hard-resets the session and waits until the session is
+A phase A timeout hard-resets the session (not while the printer has been
+silent since the start, up to 150 s: it may be unpacking) and waits until the session is
 connected before publishing again. A phase B timeout publishes again without
 a reset: resetting while the printer is still parsing the file is what
 produces 0500_4003. Three attempts and the send fails with the last reason.
@@ -27,6 +28,8 @@ _BUSY_STATUS = frozenset({"PRINTING", "PAUSED", "OFFLINE"})
 _ATTEMPT_FIELDS = (
     "submission_id", "attempts", "phase", "phase_started_at",
     "last_failure", "uploaded", "pending_republish", "gcode_file",
+    # An in-flight start waiting on an absent tray: when it began and the slot.
+    "slot_hold_since", "slot_hold_slot",
 )
 
 
@@ -215,6 +218,8 @@ def load_attempt(started_path: str, router, bambu_id: str, now: float) -> dict:
     data.setdefault("submission_id", None)
     data.setdefault("pending_republish", False)
     data.setdefault("gcode_file", None)
+    data.setdefault("slot_hold_since", None)
+    data.setdefault("slot_hold_slot", None)
     return data
 
 

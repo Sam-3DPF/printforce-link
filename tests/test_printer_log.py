@@ -675,7 +675,7 @@ def test_a_0500_4003_after_a_70s_gap_in_prepare_records_the_gap_and_timeline(
     assert event["upload"]["bytes"] == 1234
     assert event["upload"]["result"] == "ok"
     assert isinstance(event["upload"]["seconds"], float)
-    assert event["origin"] == "70s status gap during PREPARE"
+    assert event["suspect"] == "70s status gap during PREPARE"
     warnings = [
         r.getMessage() for r in caplog.records
         if r.name == "bridge.printer" and r.levelno == logging.WARNING
@@ -712,7 +712,7 @@ def test_a_print_error_shortly_after_a_reset_records_the_reset(caplog):
     assert event["since_connack"] == 3.0
     # Tray 2 is mapped and its bit is clear. The reset still outranks it.
     assert event["trays"] == [{"tray": 0, "present": True}, {"tray": 2, "present": False}]
-    assert event["origin"] == "reset 3s before"
+    assert event["suspect"] == "reset 3s before"
     warnings = [
         r.getMessage() for r in caplog.records
         if r.name == "bridge.printer" and r.levelno == logging.WARNING
@@ -746,6 +746,26 @@ def test_clearing_a_print_error_records_nothing():
     # User cancel is not a fault.
     printer._on_mqtt_report(_state_report("FAILED", error=50348044))
     assert len(_print_error_events(printer)) == 1
+
+
+def test_a_standing_code_after_a_first_report_without_print_error_is_not_an_edge():
+    """After a restart the first message can be an info reply or a sparse
+    delta. The pushall that follows carries the standing code; that is not a
+    new fault."""
+    clock = _Clock(200.0)
+    session = _QuietSession()
+    printer = BambuPrinter(
+        PrinterConfig(bambu_id=_SERIAL, ip="10.0.0.5", access_code="secret-code", name="P1S"),
+        monotonic=clock, sleep=lambda _seconds: None,
+        session_factory=lambda *_args, **_kwargs: session,
+    )
+    printer.connect()
+    printer._on_mqtt_report({"info": {"command": "get_version", "sequence_id": "0"}})
+    clock.now = 200.5
+    printer._on_mqtt_report({"print": {"command": "push_status", "gcode_state": "FAILED"}})
+    clock.now = 201.0
+    printer._on_mqtt_report(_state_report("FAILED", error=83902467))
+    assert _print_error_events(printer) == []
 
 
 def test_the_shop_p1s_5_1500_case_records_one_error_with_no_session_event(caplog):
@@ -786,7 +806,7 @@ def test_the_shop_p1s_5_1500_case_records_one_error_with_no_session_event(caplog
     assert event["states"] == [["IDLE", 2.0], ["PREPARE", 41.0]]
     assert event["longest_gap"]["seconds"] == 2.0
     assert all(tray["present"] for tray in event["trays"])
-    assert event["origin"] == "no preceding session event"
+    assert event["suspect"] == "no preceding session event"
     warnings = [
         r.getMessage() for r in caplog.records
         if r.name == "bridge.printer" and r.levelno == logging.WARNING

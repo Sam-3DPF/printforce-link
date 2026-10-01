@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 _SEND_ATTEMPT_FIELDS = frozenset({
     "submission_id", "attempts", "phase", "phase_started_at",
     "last_failure", "uploaded", "pending_republish", "gcode_file",
+    "slot_hold_since", "slot_hold_slot",
 })
 
 
