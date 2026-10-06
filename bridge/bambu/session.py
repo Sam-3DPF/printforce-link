@@ -52,12 +52,16 @@ _PORT = 8883
 _KEEPALIVE_SECONDS = 30
 _QOS = 1
 _MAX_INFLIGHT = 1000
-# paho's own backoff. It only paces a client's first connect now.
+# paho's own backoff. Unused in practice: paho never redials these clients.
 _RECONNECT_MIN_SECONDS = 1
 _RECONNECT_MAX_SECONDS = 30
 # The watchdog's redial after a client ends. Its own 5s tick is the floor.
 _REDIAL_MIN_SECONDS = 5.0
 _REDIAL_MAX_SECONDS = 30.0
+# A client that has not been answered this long after it was opened is ended and
+# replaced. paho can stop a first connect without calling back: a failed dial
+# leaves its network thread to exit on a missing socket, with no disconnect.
+_CONNECT_TIMEOUT_SECONDS = 20.0
 # paho's loop_stop() joins its network thread forever. Callers get a bound.
 _DISCONNECT_TIMEOUT_SECONDS = 1.5
 # A clean broker disconnect in the wake of a report is not the printer leaving.
@@ -236,6 +240,7 @@ class LinkSession:
         self._client_ended = False
         self._redial_delay = _REDIAL_MIN_SECONDS
         self._redial_at = None
+        self._opened_at = None
         # Returns why a silent session must not be reset now, or None.
         self._reset_hold = None
         self._hold_logged = None
@@ -453,6 +458,7 @@ class LinkSession:
             return
 
         if not self._connected:
+            self._end_unanswered_client(now)
             self._redial_if_due(now)
             if self._last_connect_error == "refused":
                 self._state = "connecting"
@@ -553,6 +559,7 @@ class LinkSession:
             self._client_id = client_id
             self._connected = False
             self._client_ended = False
+            self._opened_at = self._monotonic()
             self._starts_this_client = _RecentIds()
             if self._attempt_connacked:
                 self._attempt = 0
@@ -581,6 +588,7 @@ class LinkSession:
         client.on_connect = self._on_connect
         client.on_message = self._on_message
         client.on_disconnect = self._on_disconnect
+        client.on_connect_fail = self._on_connect_fail
         client.username_pw_set("bblp", self.access_code)
         client.tls_set_context(_printer_tls_context())
         client.tls_insecure_set(True)
@@ -749,6 +757,34 @@ class LinkSession:
             "%s (task %s, %s, %ss after CONNACK)",
             self.serial, file_name, task_id, origin, since,
         )
+
+    def _on_connect_fail(self, client, userdata):
+        """The first dial raised. paho calls nothing else for it, so end the client here.
+
+        paho leaves this client in a state its own loop cannot dial again from
+        (``reconnect_on_failure`` is off), so the watchdog replaces it.
+        """
+        if client is not self._client:
+            return
+        self._record_event("connect_failed", attempt=self._attempt)
+        with self._lock:
+            if self._client is client:
+                self._connected = False
+                self._end_client_locked()
+
+    def _end_unanswered_client(self, now: float) -> None:
+        """End a client that was opened and never answered, so it is redialled."""
+        with self._lock:
+            opened_at = self._opened_at
+            if (
+                self._client is None
+                or self._client_ended
+                or opened_at is None
+                or now - opened_at < _CONNECT_TIMEOUT_SECONDS
+            ):
+                return
+            self._end_client_locked()
+        self._record_event("connect_timeout", attempt=self._attempt)
 
     def _start_watchdog(self) -> None:
         if self._watchdog_interval is None or self._user_stopped:
