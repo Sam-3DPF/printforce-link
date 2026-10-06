@@ -467,7 +467,8 @@ def test_socket_down_past_60s_is_unreachable_while_redials_continue():
     broker = Broker()
     printer = _linked_printer(clock, broker)
     printer.connect()
-    # A first connect that never answers is paho's own retry. No new client.
+    # A first connect that never answers is ended and redialled on the backoff;
+    # the replacement is not due yet.
     clock.now = 9059.0
     printer._session.tick()
     assert printer.connection_state == "connecting"
@@ -492,7 +493,8 @@ def test_socket_down_past_60s_is_unreachable_while_redials_continue():
         printer._session.tick()
         if clock.now < dropped_at + 59:
             assert printer.down_reason != "unreachable"
-    assert len(broker.clients) == 2
+    # One redial at 5s, and a second after that one went unanswered.
+    assert len(broker.clients) == 3
     clock.now = dropped_at + 61
     printer._session.tick()
     assert printer.connection_state == "offline"
@@ -599,7 +601,8 @@ def test_a_silent_session_is_not_reset_while_preparing_and_is_while_idle():
     broker.current.fire_connack(0)
     _report(broker.current, {"print": {"gcode_state": "IDLE"}})
     _silent_for_90s(clock, printer)
-    assert len(broker.clients) == 2
+    # Reset once for the silence. The unanswered replacement is redialled too.
+    assert len(broker.clients) > 1
     assert printer.down_reason == "silent_session"
 
 

@@ -25,6 +25,7 @@ class FakePaho:
         self.on_connect = None
         self.on_message = None
         self.on_disconnect = None
+        self.on_connect_fail = None
         self.username = None
         self.password = None
         self.tls_context = None
@@ -870,3 +871,66 @@ def test_a_redial_whose_client_fails_to_start_is_redialled_again(caplog):
     assert "redial" in caplog.text
     broker.accept(broker.current)
     assert session.connected is True
+
+
+def test_a_first_dial_that_fails_is_redialled_with_a_fresh_client():
+    """v0.1.46 after an update: every first dial failed and no printer came back."""
+    clock = Clock(7000.0)
+    broker = _ReplayBroker()
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None,
+    )
+    session.start()
+    first = broker.current
+    first.on_connect_fail(first, None)
+
+    clock.now += 4
+    session.tick()
+    assert broker.current is first
+    clock.now += 1
+    session.tick()
+    assert broker.current is not first
+    broker.accept(broker.current)
+    assert session.connected
+
+
+def test_a_client_that_is_never_answered_is_replaced():
+    """paho's network thread can exit with no callback at all."""
+    clock = Clock(8000.0)
+    broker = _ReplayBroker()
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None,
+    )
+    session.start()
+    first = broker.current
+
+    clock.now += 19
+    session.tick()
+    assert broker.current is first
+    # Ended at 20s, redialled one backoff (5s) later.
+    for _ in range(7):
+        clock.now += 1
+        session.tick()
+    assert broker.current is not first
+    broker.accept(broker.current)
+    assert session.connected
+
+
+def test_a_slow_connack_inside_the_timeout_keeps_its_client():
+    clock = Clock(9000.0)
+    broker = _ReplayBroker()
+    session = LinkSession(
+        "10.0.0.5", "secret-code", _SERIAL, client_factory=broker.factory,
+        monotonic=clock, watchdog_interval=None,
+    )
+    session.start()
+    first = broker.current
+    clock.now += 15
+    session.tick()
+    broker.accept(first)
+    clock.now += 30
+    session.tick()
+    assert broker.current is first
+    assert session.connected
