@@ -84,7 +84,7 @@ On the shop printers observed, vsftpd answers in command order: the late `226` c
 
 - **Listing a P1 card.** A stock `ftplib` `retrlines("LIST")` hung during this investigation. The `_read_list` docstring (`bridge/bambu/ftps.py:665`) says a P1 data socket hangs on SSL shutdown. Read the data socket raw and close it without `unwrap`, as `_read_list` does.
 - **Traces of started jobs.** The printer unpacks each started job into `/cache/<name>_plate_1.gcode` and then writes `/cache/1_<name>.bbl`, a small JSON copy of the start command. A gcode with no `.bbl` means the printer unpacked the file and then refused the start. That was the shop's separate `print_error 0500_4003` case, still open at the time of writing.
-- **Link deletes a file only when a size check fails or an upload is cancelled.** It never removes the files of jobs that uploaded successfully, so the shop cards held months of them.
+- **Link used to delete a file only when a size check fails or an upload is cancelled.** It never removed the files of jobs that uploaded successfully, so the shop cards held months of them. Since 2026-10-08 it clears old job files before each upload; see [old-job-files-and-0500-4003.md](old-job-files-and-0500-4003.md).
 
 ## Related Issues
 

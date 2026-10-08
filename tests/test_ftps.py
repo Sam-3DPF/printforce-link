@@ -761,3 +761,140 @@ def test_upload_requires_a_connected_session(tmp_path):
     ))
     with pytest.raises(RuntimeError):
         printer.upload_file(str(path))
+
+
+_OLD_JOB = "batch-2026-10-01-AbCdEfGh-1"
+
+
+def _card_with_old_jobs():
+    return {
+        f"{_OLD_JOB}.3mf": b"old-job",
+        "sq-2026-09-30-4oABjOuT-2.3mf": b"old-queue-job",
+        f"cache/{_OLD_JOB}_plate_1.gcode": b"unpacked",
+        f"cache/1_{_OLD_JOB}.bbl": b"{}",
+        "my-own-model.3mf": b"keep",
+        "cache/other_plate_1.gcode": b"keep",
+    }
+
+
+def test_remove_files_deletes_job_files_from_the_root_and_cache(implicit_server):
+    from bridge.printer import is_job_file
+
+    server = implicit_server(files=_card_with_old_jobs())
+    counts = _client().remove_files(
+        "127.0.0.1", SECRET, is_job_file, port=server.port, connect_timeout=_CONNECT,
+    )
+    assert counts == {"found": 4, "deleted": 4, "failed": 0}
+    assert sorted(server.snapshot()["files"]) == [
+        "cache/other_plate_1.gcode", "my-own-model.3mf",
+    ]
+    commands = server.snapshot()["commands"]
+    assert "LIST /cache" in commands
+    assert f"DELE /cache/1_{_OLD_JOB}.bbl" in commands
+
+
+def test_remove_files_stops_at_the_limit(implicit_server):
+    from bridge.printer import is_job_file
+
+    server = implicit_server(files=_card_with_old_jobs())
+    counts = _client().remove_files(
+        "127.0.0.1", SECRET, is_job_file, limit=1,
+        port=server.port, connect_timeout=_CONNECT,
+    )
+    assert counts == {"found": 4, "deleted": 1, "failed": 0}
+    assert len(server.snapshot()["files"]) == 5
+
+
+def test_remove_files_counts_a_refused_delete(implicit_server):
+    from bridge.printer import is_job_file
+
+    server = implicit_server(
+        files={f"{_OLD_JOB}.3mf": b"old"}, dele_existing_reply="550 Permission denied.",
+    )
+    counts = _client().remove_files(
+        "127.0.0.1", SECRET, is_job_file, port=server.port, connect_timeout=_CONNECT,
+    )
+    assert counts == {"found": 1, "deleted": 0, "failed": 1}
+
+
+def test_job_file_names():
+    from bridge.printer import is_job_file
+
+    assert is_job_file("batch-2026-10-08-A3mNuoEt-1.3mf")
+    assert is_job_file("batch-2026-10-06-0IIDqpto-4.3mf")
+    assert is_job_file("sq-2026-10-04-4oABjOuT-1.3mf")
+    assert is_job_file("batch-2026-10-08-A3mNuoEt-1_plate_1.gcode")
+    assert is_job_file("1_batch-2026-10-08-A3mNuoEt-1.bbl")
+    assert not is_job_file("my-own-model.3mf")
+    assert not is_job_file("batch-of-keychains.3mf")
+    assert not is_job_file("timelapse")
+    assert not is_job_file(None)
+
+
+def _printer_on(server, monkeypatch):
+    import bridge.bambu.ftps as ftps_mod
+
+    for name in ("upload", "remove_files"):
+        real = getattr(ftps_mod, name)
+
+        def wrapped(*args, _real=real, **kwargs):
+            kwargs["port"] = server.port
+            kwargs["connect_timeout"] = _CONNECT
+            return _real(*args, **kwargs)
+
+        monkeypatch.setattr(ftps_mod, name, wrapped)
+    printer = BambuPrinter(PrinterConfig(
+        bambu_id="01P00C000000001", ip="127.0.0.1", access_code=SECRET,
+        name="P1S", model="C12",
+    ))
+    printer._session = object()
+    return printer
+
+
+def test_upload_clears_old_job_files_first(implicit_server, tmp_path, monkeypatch):
+    server = implicit_server(files=_card_with_old_jobs())
+    printer = _printer_on(server, monkeypatch)
+    path, payload = _file(tmp_path, b"new-job")
+    new_name = "batch-2026-10-08-A3mNuoEt-1.3mf"
+
+    assert printer.upload_file(str(path), remote_name=new_name) == new_name
+
+    assert server.snapshot()["files"] == {
+        "my-own-model.3mf": b"keep",
+        "cache/other_plate_1.gcode": b"keep",
+        new_name: payload,
+    }
+    events = printer.log.export()["events"]
+    kinds = [event.get("kind") for event in events]
+    assert kinds.index("sd_cleanup") < kinds.index("upload")
+    cleanup = next(event for event in events if event.get("kind") == "sd_cleanup")
+    assert cleanup["result"] == "ok"
+    assert cleanup["found"] == 4
+    assert cleanup["deleted"] == 4
+
+
+def test_a_failed_cleanup_does_not_block_the_upload(implicit_server, tmp_path, monkeypatch):
+    import bridge.bambu.ftps as ftps_mod
+
+    server = implicit_server(files=_card_with_old_jobs())
+    printer = _printer_on(server, monkeypatch)
+
+    def refuse(*args, **kwargs):
+        raise ftps_mod.FtpsError("timeout", "transfer deadline exceeded")
+
+    monkeypatch.setattr(ftps_mod, "remove_files", refuse)
+    path, payload = _file(tmp_path, b"new-job")
+
+    assert printer.upload_file(str(path), remote_name="batch-2026-10-08-A3mNuoEt-1.3mf")
+
+    assert server.snapshot()["files"]["batch-2026-10-08-A3mNuoEt-1.3mf"] == payload
+    cleanup = next(
+        event for event in printer.log.export()["events"] if event.get("kind") == "sd_cleanup"
+    )
+    assert cleanup["result"] == "timeout"
+
+    # The next upload skips cleanup instead of waiting on the card again.
+    calls = []
+    monkeypatch.setattr(ftps_mod, "remove_files", lambda *a, **k: calls.append(1))
+    assert printer.upload_file(str(path), remote_name="batch-2026-10-08-A3mNuoEt-1.3mf")
+    assert calls == []

@@ -24,10 +24,10 @@ DELE, STOR, and SIZE name the file at the session root (``/job.3mf``).
 short SIZE deletes that remote name. A 550 from the cleanup delete still
 finishes the attempt. A matching SIZE is left in place.
 
-``list_files``, ``download``, and ``delete`` use this client and the same
-per-host lock. An empty directory is an empty list. A refused connection is
-a failure. A short download removes the local partial. A remote 550 is not
-a missing local file.
+``list_files``, ``download``, ``delete``, and ``remove_files`` use this
+client and the same per-host lock. An empty directory is an empty list. A
+refused connection is a failure. A short download removes the local
+partial. A remote 550 is not a missing local file.
 
 ``cleartext=True`` sends PROT C and does not wrap the data socket. The
 default stays PROT P, and session reuse stays on unless the profile says
@@ -195,6 +195,74 @@ def list_files(host, access_code, *, profile=None, port=_FTPS_PORT,
         logger.info(
             "ftps list host=%s seconds=%.3f kind=%s",
             host, time.monotonic() - started, kind,
+        )
+
+
+def remove_files(host, access_code, should_remove, *, directories=("", "cache"),
+                 limit=100, profile=None, port=_FTPS_PORT, connect_timeout=10.0,
+                 monotonic=None, tls_context=None, cleartext=False) -> dict:
+    """Delete every listed name ``should_remove(name)`` picks, in one session.
+
+    ``directories`` are listed in order; ``""`` is the session root. A
+    directory the printer cannot list (550) is skipped. At most ``limit``
+    names are deleted; the rest stay for the next call. A name the printer
+    refuses to delete counts as ``failed``. Returns
+    ``{"found", "deleted", "failed"}``.
+    """
+    clock = monotonic or time.monotonic
+    secret = access_code if isinstance(access_code, str) else ""
+    started = time.monotonic()
+    kind = "network"
+    counts = {"found": 0, "deleted": 0, "failed": 0}
+    try:
+        if not host or not str(host).strip():
+            raise FtpsError("network", "printer address is required")
+
+        def action():
+            nonlocal started
+            started = time.monotonic()
+            with _connected(
+                str(host), secret, profile=profile, port=port,
+                connect_timeout=connect_timeout, clock=clock,
+                tls_context=tls_context, cleartext=cleartext,
+            ) as ftp:
+                for directory in directories:
+                    folder = str(directory or "").strip("/")
+                    try:
+                        names = _read_list(
+                            ftp, clock() + transfer_deadline_seconds(0), clock,
+                            path=f"/{folder}" if folder else None,
+                        )
+                    except FtpsError as exc:
+                        if exc.kind == "storage":
+                            continue
+                        raise
+                    for name in names:
+                        if not should_remove(name):
+                            continue
+                        counts["found"] += 1
+                        if counts["deleted"] + counts["failed"] >= limit:
+                            continue
+                        remote = f"/{folder}/{name}" if folder else f"/{name}"
+                        _arm(ftp, clock() + transfer_deadline_seconds(0), clock)
+                        try:
+                            ftp.voidcmd(f"DELE {remote}")
+                        except ftplib.error_perm:
+                            counts["failed"] += 1
+                            continue
+                        counts["deleted"] += 1
+
+        _guarded(str(host), port, connect_timeout, action)
+        kind = "ok"
+        return dict(counts)
+    except FtpsError as exc:
+        kind = exc.kind
+        raise
+    finally:
+        logger.info(
+            "ftps remove host=%s found=%d deleted=%d failed=%d seconds=%.3f kind=%s",
+            host, counts["found"], counts["deleted"], counts["failed"],
+            time.monotonic() - started, kind,
         )
 
 
@@ -662,12 +730,12 @@ def _connected(host, secret, *, profile, port, connect_timeout, clock, tls_conte
         _quit(ftp)
 
 
-def _read_list(ftp, deadline_at, clock):
+def _read_list(ftp, deadline_at, clock, path=None):
     """LIST without ``unwrap``. A P1 data socket hangs on SSL shutdown."""
     _arm(ftp, deadline_at, clock)
     try:
         ftp.voidcmd("TYPE A")
-        conn, _ignored = ftp.ntransfercmd("LIST")
+        conn, _ignored = ftp.ntransfercmd(f"LIST {path}" if path else "LIST")
     except ftplib.error_perm as exc:
         raise _perm(exc) from None
     names = []

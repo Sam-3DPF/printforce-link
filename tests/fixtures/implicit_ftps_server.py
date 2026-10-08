@@ -22,7 +22,8 @@ class ImplicitFtpsServer:
                  size_override=None, plaintext=False, stall_seconds=0.0,
                  password="access-code", hold_before_reply=None,
                  dele_existing_reply=None, require_prot_c=False,
-                 retr_reply=None, retr_short=None, stor_reply_delay_seconds=0.0):
+                 retr_reply=None, retr_short=None, stor_reply_delay_seconds=0.0,
+                 files=None):
         self._certfile = certfile
         self._keyfile = keyfile
         self.require_session_reuse = require_session_reuse
@@ -48,7 +49,8 @@ class ImplicitFtpsServer:
         self._lock = threading.Lock()
         self._commands = []
         self._replies = []
-        self._files = {}
+        # Keyed by path without the leading slash: ``job.3mf``, ``cache/x.gcode``.
+        self._files = {_file_key(name): bytes(data) for name, data in (files or {}).items()}
         self._accepted_at = []
         self._closed_at = []
         self._reused = []
@@ -179,7 +181,7 @@ class ImplicitFtpsServer:
                     self._retr(control, pasv, arg)
                     pasv = None
                 elif verb == "LIST":
-                    self._list(control, pasv)
+                    self._list(control, pasv, arg)
                     pasv = None
                 elif verb == "SIZE":
                     self._size(control, arg)
@@ -304,15 +306,22 @@ class ImplicitFtpsServer:
             _close(data)
         self._reply(control, "226 Transfer complete.")
 
-    def _list(self, control, pasv):
+    def _list(self, control, pasv, path=""):
+        """LIST names one directory: the root, or ``LIST /cache``."""
         if self._reject_prot(control, pasv):
             return
+        prefix = _file_key(path).strip("/")
+        prefix = f"{prefix}/" if prefix else ""
         data = self._accept_data(control, pasv)
         if data is None:
             return
         try:
             with self._lock:
-                items = list(self._files.items())
+                items = [
+                    (name[len(prefix):], payload)
+                    for name, payload in self._files.items()
+                    if name.startswith(prefix) and "/" not in name[len(prefix):]
+                ]
             lines = [
                 f"-rw-r--r-- 1 owner group {len(payload)} Jan 01 00:00 {name}\r\n"
                 for name, payload in items

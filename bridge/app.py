@@ -47,6 +47,7 @@ from .send_pipeline import (
     snapshot_commands_rejected,
     uploaded_already,
 )
+from .state_v2 import print_error_label
 from .store import PrinterStore
 from .bambu.replies import watch as reply_watch
 from .command_channel import REJECTED_DEVELOPER_MODE, UNKNOWN_ACTION, CommandChannel
@@ -1836,6 +1837,37 @@ def _silent_since(fleet, bambu_id: str, seconds: float) -> bool:
     return isinstance(silent, (int, float)) and silent >= seconds
 
 
+# print_error the printer raises when it cannot read the file on its card.
+_PARSE_FAILURE = "0500_4003"
+
+
+def _fresh_copy_after_parse_failure(send, fleet, bambu_id: str, dest: str, snapshot) -> None:
+    """Upload this send's file again when the printer could not read its copy.
+
+    Shop P1S-7, 2026-10-08 18:19: the start raised 0500_4003, and two
+    restarts of the same copy on the card failed again within 6 seconds.
+    The same files printed after a fresh upload. Any upload failure falls
+    back to restarting the copy already there, as before.
+    """
+    if not isinstance(snapshot, dict):
+        return
+    if print_error_label(snapshot.get("print_error")) != _PARSE_FAILURE:
+        return
+    if not os.path.exists(dest) or not hasattr(fleet, "upload"):
+        return
+    try:
+        fleet.upload(bambu_id, dest, remote_name=_cloud_remote_name(send))
+    except UploadCancelled:
+        raise
+    except Exception as exc:
+        logger.warning(
+            "printer %s: fresh copy after %s failed (%s); restarting the copy on the card",
+            bambu_id, _PARSE_FAILURE, getattr(exc, "kind", None) or type(exc).__name__,
+        )
+        return
+    logger.info("printer %s: uploaded a fresh copy after %s", bambu_id, _PARSE_FAILURE)
+
+
 def _republish_start(send, fleet, bambu_id: str, dest: str,
                      plate_index: int, snapshot) -> Optional[str]:
     """Publish the start again. None when it went out, else the refusal.
@@ -1869,7 +1901,11 @@ def _republish_start(send, fleet, bambu_id: str, dest: str,
 
 def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
                         wall_time, slot_holds=None) -> None:
-    """Move one in-flight send through the watchdog. Does not upload again."""
+    """Move one in-flight send through the watchdog.
+
+    Uploads again only before a restart after 0500_4003 (the printer could
+    not read its copy).
+    """
     if slot_holds is None:
         slot_holds = _SlotHolds()
     batch_id, bambu_id, plate_index = key
@@ -1928,6 +1964,7 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
         if not _cloud_send_session_connected(fleet, bambu_id):
             return
         dest = _cloud_send_file_path(spool_dir, key)
+        _fresh_copy_after_parse_failure(send, fleet, bambu_id, dest, snapshot)
         refusal = _republish_start(send, fleet, bambu_id, dest, plate_index, snapshot)
         held = _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
                           started_sends, router)
@@ -1948,6 +1985,7 @@ def _advance_cloud_send(key, send, fleet, dpf, spool_dir, started_sends, router,
     if action == "retry":
         record["last_failure"] = "no_active"
         dest = _cloud_send_file_path(spool_dir, key)
+        _fresh_copy_after_parse_failure(send, fleet, bambu_id, dest, snapshot)
         refusal = _republish_start(send, fleet, bambu_id, dest, plate_index, snapshot)
         held = _slot_hold(key, refusal, slot_holds, wall_time, dpf, spool_dir,
                           started_sends, router)
