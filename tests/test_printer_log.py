@@ -651,6 +651,10 @@ def test_a_0500_4003_after_a_70s_gap_in_prepare_records_the_gap_and_timeline(
     sliced = tmp_path / "job.3mf"
     sliced.write_bytes(b"x" * 1234)
     monkeypatch.setattr(printer_module.ftps, "upload", lambda *args, **kwargs: "job.3mf")
+    monkeypatch.setattr(
+        printer_module.ftps, "remove_files",
+        lambda *args, **kwargs: {"found": 0, "deleted": 0, "failed": 0},
+    )
     printer.upload_file(str(sliced))
     assert printer.start_print("job.3mf", [0, 1], 1) is True
     clock.now = 5001.0

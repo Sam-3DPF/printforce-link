@@ -120,6 +120,22 @@ _PRINT_ENDED = frozenset({"FINISH", "FAILED"})
 # unknown prior state is not evidence of an idle machine.
 _PRINT_START_EVIDENCE = frozenset({"IDLE", "FINISH", "FAILED"})
 
+# 3D PrintForce names every file it sends ``batch-YYYY-MM-DD-<8 chars>-…`` or
+# ``sq-…``. A started job leaves ``<name>_plate_N.gcode`` and ``N_<name>.bbl``
+# in /cache. A file the operator put on the card by hand keeps its own name.
+_JOB_FILE = re.compile(r"(?:^|_)(?:batch|sq)-\d{4}-\d{2}-\d{2}-[A-Za-z0-9]{8}-")
+# Deletes per cleanup. A card with months of files drains over a few sends
+# instead of holding one start for minutes.
+_SD_CLEANUP_LIMIT = 50
+# After a cleanup fails, that printer skips cleanup for this long.
+_SD_CLEANUP_BACKOFF_SECONDS = 3600.0
+
+
+def is_job_file(name) -> bool:
+    """True for a file 3D PrintForce sent, or the printer's unpacked copy of one."""
+    return isinstance(name, str) and _JOB_FILE.search(name) is not None
+
+
 # ams_get_rfid is never published while this is False. See _request_idle_rfid.
 _RFID_REREAD_ENABLED = False
 
@@ -597,6 +613,8 @@ class BambuPrinter:
         )
         # What came before each print_error (U7). Survives reconnects.
         self._error_watch = PrintErrorWatch()
+        # A card too slow to list must not hold every start for the timeout.
+        self._sd_cleanup_after = 0.0
         # Last commands_rejected answer. None until a payload has been merged.
         self._command_acceptance = None
         # Last submission id this printer published, so two starts in the
@@ -888,6 +906,7 @@ class BambuPrinter:
             size = os.path.getsize(file_path)
         except OSError:
             size = None
+        self.clear_old_job_files()
         started = time.monotonic()
         self._record_upload(phase="start", name=name, bytes=size)
         outcome = "ok"
@@ -914,6 +933,49 @@ class BambuPrinter:
             )
         logger.info("printer %s: uploaded %s", self.bambu_id, stored)
         return stored
+
+    def clear_old_job_files(self) -> Optional[dict]:
+        """Delete earlier 3D PrintForce job files from the card root and /cache.
+
+        Link used to leave every job it uploaded on the card, and the printer
+        keeps an unpacked copy of each started job in /cache. Shop P1S-7,
+        2026-10-06..08: 9 of 29 sends raised 0500_4003 with no session event,
+        a good upload, and every tray present; restarting the same copy on
+        the card failed again within seconds. Runs only before an upload, while
+        the printer is idle. Never blocks the upload: a failure is logged,
+        and that printer skips cleanup for an hour.
+        """
+        now = self._monotonic()
+        if now < self._sd_cleanup_after:
+            return None
+        try:
+            counts = ftps.remove_files(
+                self._ip, self._cfg.access_code, is_job_file,
+                profile=self.profile, limit=_SD_CLEANUP_LIMIT,
+            )
+        except Exception as exc:
+            kind = getattr(exc, "kind", None) or type(exc).__name__
+            logger.warning("printer %s: SD card cleanup skipped (%s)", self.bambu_id, kind)
+            self._record_sd_cleanup(result=kind)
+            self._sd_cleanup_after = now + _SD_CLEANUP_BACKOFF_SECONDS
+            return None
+        if counts.get("found"):
+            logger.info(
+                "printer %s: SD card cleanup deleted %d of %d old job files (%d refused)",
+                self.bambu_id, counts.get("deleted", 0), counts.get("found", 0),
+                counts.get("failed", 0),
+            )
+        self._record_sd_cleanup(result="ok", **counts)
+        return counts
+
+    def _record_sd_cleanup(self, **fields) -> None:
+        record = getattr(self._log, "record_event", None)
+        if not callable(record):
+            return
+        try:
+            record("sd_cleanup", **fields)
+        except Exception:
+            logger.debug("printer %s: sd_cleanup event was not recorded", self.bambu_id)
 
     def _record_upload(self, **fields) -> None:
         if fields.get("phase") == "result":

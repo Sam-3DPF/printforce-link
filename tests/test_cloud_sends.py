@@ -2101,3 +2101,76 @@ def test_a_hold_whose_absent_slot_moves_reports_the_slot_absent_at_report_time(t
     clock.now = 601.0
     _hold_passes(fleet, dpf, tmp_path, desired, clock=clock, started=started, holds=holds)
     assert dpf.failed == [("B1", 1, "slot_empty; 12")]
+
+
+def _retry_after(tmp_path, print_error):
+    """Start once, then let the watchdog restart the send with this print_error showing."""
+    from bridge.send_pipeline import PHASE_A_SECONDS
+
+    clock = _FakeClock()
+    fleet = _ConfirmFleet()
+    dpf = _FakeDpf()
+    router = Router(str(tmp_path / "queue.json"))
+    started = set()
+
+    def tick():
+        _handle_cloud_sends(
+            _desired(), fleet, dpf, str(tmp_path), started, router=router,
+            wall_time=lambda: clock.now,
+        )
+
+    tick()
+    assert len(fleet.starts) == 1
+    assert len(fleet.uploads) == 1
+    fleet._printer._snapshot = _legacy_ready_snapshot(print_error=print_error)
+    clock.advance(PHASE_A_SECONDS)
+    tick()
+    tick()
+    assert len(fleet.starts) == 2
+    return fleet, dpf
+
+
+def test_a_parse_failure_uploads_a_fresh_copy_before_the_restart(tmp_path):
+    """P1S-7, 2026-10-08: restarting the card's copy after 0500_4003 failed again."""
+    fleet, dpf = _retry_after(tmp_path, "83902467")
+    assert len(fleet.uploads) == 2
+    assert fleet.uploads[1][2] == fleet.uploads[0][2]
+    assert fleet.commands[-1] == "start_print"
+    assert dpf.failed == []
+
+
+def test_other_restarts_reuse_the_copy_on_the_card(tmp_path):
+    fleet, _dpf = _retry_after(tmp_path, None)
+    assert len(fleet.uploads) == 1
+
+
+class _FreshCopyFailsFleet(_ConfirmFleet):
+    def upload(self, bambu_id, dest, remote_name=None):
+        if self.uploads:
+            self.uploads.append((bambu_id, dest, remote_name))
+            raise RuntimeError("card busy")
+        return super().upload(bambu_id, dest, remote_name=remote_name)
+
+
+def test_a_failed_fresh_copy_still_restarts_the_card_copy(tmp_path):
+    from bridge.send_pipeline import PHASE_A_SECONDS
+
+    clock = _FakeClock()
+    fleet = _FreshCopyFailsFleet()
+    dpf = _FakeDpf()
+    router = Router(str(tmp_path / "queue.json"))
+    started = set()
+    _handle_cloud_sends(
+        _desired(), fleet, dpf, str(tmp_path), started, router=router,
+        wall_time=lambda: clock.now,
+    )
+    fleet._printer._snapshot = _legacy_ready_snapshot(print_error="83902467")
+    clock.advance(PHASE_A_SECONDS)
+    for _ in range(2):
+        _handle_cloud_sends(
+            _desired(), fleet, dpf, str(tmp_path), started, router=router,
+            wall_time=lambda: clock.now,
+        )
+    assert len(fleet.uploads) == 2
+    assert len(fleet.starts) == 2
+    assert dpf.failed == []
