@@ -6,7 +6,6 @@ interval. Run with: `python -m bridge.app config.toml`.
 """
 
 from collections import OrderedDict
-import faulthandler
 import inspect
 import logging
 import os
@@ -51,14 +50,13 @@ from .state_v2 import print_error_label
 from .store import PrinterStore
 from .bambu.replies import watch as reply_watch
 from .command_channel import REJECTED_DEVELOPER_MODE, UNKNOWN_ACTION, CommandChannel
+from .loop_watchdog import ReportLoopWatchdog
 from .pacer import ReportPacer
 from .updater import SelfUpdater, default_state_path
 
 logger = logging.getLogger(__name__)
 AMS_MAPPING_FORMAT = "filament-id-v1"
 MAX_LOGICAL_FILAMENT_ID = 256
-# Above the report interval. A stuck pass dumps its stacks and the process stays up.
-_REPORT_LOOP_DUMP_SECONDS = 30.0
 _FILAMENT_FAMILIES = ("PETG", "PLA", "ABS", "ASA", "TPU", "PA", "PC", "PVA", "HIPS")
 # A legacy marker was written immediately before a physical start. Do not reinterpret it
 # as stale residue during the same startup uncertainty window used by the assignment
@@ -583,9 +581,13 @@ def main(config_path: str = "config.toml") -> None:
                 "reported OFFLINE",
                 cfg.state_interval_seconds, cfg.heartbeat_interval_seconds,
                 cfg.stale_after_seconds)
+    # A loop that stops turning logs its stacks, then exits so the service
+    # manager restarts Link. See bridge/loop_watchdog.py.
+    loop_watchdog = ReportLoopWatchdog()
+    loop_watchdog.start()
     while True:
         pass_started = time.monotonic()
-        arm_report_loop_dump()
+        loop_watchdog.beat()
         # The updater downloads concurrently, but its final swap/restart must wait until
         # this iteration has finished every irreversible printer action and durable marker.
         update_restart_lock.acquire()
@@ -681,8 +683,7 @@ def main(config_path: str = "config.toml") -> None:
                 updater.tick_async(force=force_update, printers_busy=printers_busy)
                 last_heartbeat = now
         except Exception:
-            # Never let one bad iteration kill the long-running reporter — nothing
-            # supervises/restarts it. Log and keep polling.
+            # One bad iteration must not end the reporter. Log and keep polling.
             logger.exception("bridge loop iteration failed; continuing")
         finally:
             update_restart_lock.release()
@@ -746,16 +747,6 @@ _CONTROL_ACTIONS = frozenset({
     "ignore", "idle_ignore", "clean_print_error",
     "check_assistant", "jump_to_liveview", "cancle",
 })
-
-
-def arm_report_loop_dump(timeout=_REPORT_LOOP_DUMP_SECONDS) -> None:
-    """Re-arm the report-loop stack dump. The previous arm is cancelled first.
-
-    The timeout stays above the report interval. ``exit`` is false: a stall
-    writes stacks and the process keeps running. Tests call this directly.
-    """
-    faulthandler.cancel_dump_traceback_later()
-    faulthandler.dump_traceback_later(timeout, exit=False)
 
 
 def _printers_busy(reports, fleet) -> bool:
