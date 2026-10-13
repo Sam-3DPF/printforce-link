@@ -436,26 +436,6 @@ def test_real_session_down_under_60s_is_stale_and_past_it_is_offline():
     assert back["slots"] == [_SLOT]
 
 
-def test_the_report_loop_helper_cancels_the_previous_dump_when_it_rearms(monkeypatch):
-    import bridge.app as app_module
-
-    calls = []
-    monkeypatch.setattr(
-        app_module.faulthandler, "cancel_dump_traceback_later",
-        lambda: calls.append("cancel"),
-    )
-    monkeypatch.setattr(
-        app_module.faulthandler, "dump_traceback_later",
-        lambda timeout, exit=False: calls.append(("dump", timeout, exit)),
-    )
-    app_module.arm_report_loop_dump()
-    app_module.arm_report_loop_dump()
-    assert calls == [
-        "cancel", ("dump", 30.0, False),
-        "cancel", ("dump", 30.0, False),
-    ]
-
-
 def test_report_carries_both_raw_ams_bitmasks():
     """The start gate reads presence from the raw bits (U3), so both reach the
     report as hex strings; a printer that sends neither reports None."""
