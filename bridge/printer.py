@@ -2332,7 +2332,7 @@ def _report_fields(status, print_obj) -> Dict:
         "drying_unit": drying_unit,
         "firmware_version": firmware_version,
         "unit_versions": unit_versions,
-        "external_spool": _external_spool(ams),
+        "external_spool": _external_spool(print_obj, ams),
     }
 
 
@@ -2457,16 +2457,18 @@ def _module_versions(modules):
     return firmware, units or None
 
 
-def _external_spool(ams):
-    """``vir_slot`` wins over ``vt_tray``. Neither becomes a ``slots`` row."""
-    if not isinstance(ams, dict):
-        return None
-    raw = ams.get("vir_slot")
-    if raw is None:
-        raw = ams.get("vt_tray")
-    if raw is None:
-        return None
-    return copy.deepcopy(raw)
+def _external_spool(print_obj, ams):
+    """The external spool object. Neither one becomes a ``slots`` row.
+
+    ``vir_slot`` wins over ``vt_tray``. P1S firmware sends ``vt_tray`` on the
+    ``print`` object, beside ``ams``, not inside it (P1S-2 push, 2026-11-06),
+    so ``print`` is read first and ``print.ams`` second.
+    """
+    for key in ("vir_slot", "vt_tray"):
+        for container in (print_obj, ams):
+            if isinstance(container, dict) and container.get(key) is not None:
+                return copy.deepcopy(container[key])
+    return None
 
 
 def _control_int(params, *keys):
