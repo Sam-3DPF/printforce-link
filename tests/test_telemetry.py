@@ -1767,6 +1767,29 @@ def test_vir_slot_is_the_external_spool_and_not_a_slot_row():
     assert snapshot["slots"] == []
 
 
+def test_p1s_vt_tray_beside_ams_is_the_external_spool():
+    """A P1S with no AMS sends vt_tray on print, next to an empty unit list."""
+    payload = {"print": {
+        "gcode_state": "IDLE",
+        "ams": {"ams": [], "ams_exist_bits": "0", "tray_exist_bits": "0"},
+        "vt_tray": {"id": "254", "tray_type": "PLA", "tray_color": "FF0000FF"},
+    }}
+    snapshot = _printer([payload]).snapshot()
+    assert snapshot["external_spool"]["tray_type"] == "PLA"
+    assert snapshot["external_spool"]["tray_color"] == "FF0000FF"
+    assert snapshot["slots"] == []
+
+
+def test_vir_slot_on_print_wins_over_vt_tray():
+    payload = {"print": {
+        "gcode_state": "IDLE",
+        "ams": {"ams": []},
+        "vt_tray": {"id": "254", "tray_type": "PLA"},
+        "vir_slot": [{"id": "255", "tray_type": "ABS"}],
+    }}
+    assert _printer([payload]).snapshot()["external_spool"] == [{"id": "255", "tray_type": "ABS"}]
+
+
 def test_wifi_signal_text_from_the_printer_is_read_as_dbm():
     """Bambu sends "-52dBm". It used to be dropped, so no card showed Wi-Fi."""
     from bridge.printer import _dbm
