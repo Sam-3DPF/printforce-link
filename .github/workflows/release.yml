@@ -31,7 +31,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { os: macos-14,      target: macos-arm64,   kind: macos }
+          - { os: macos-15,      target: macos-arm64,   kind: macos }
           - { os: windows-latest, target: windows-x86_64, kind: windows }
     runs-on: ${{ matrix.os }}
     steps:
