@@ -116,6 +116,17 @@ def test_use_ams_is_false_only_when_every_entry_is_external():
     assert _body(mixed)["use_ams"] is True
 
 
+def test_unused_positions_do_not_turn_the_ams_on_for_an_external_start():
+    """A no-AMS P1S printing a plate whose only filament is profile 2."""
+    body = _print_body([-1, 254])
+    assert body["use_ams"] is False
+    assert body["ams_mapping"] == [-1, -1]
+    assert body["ams_mapping2"] == [
+        {"ams_id": 255, "slot_id": 255},
+        {"ams_id": 255, "slot_id": 0},
+    ]
+
+
 def test_start_url_comes_from_the_p1s_profile():
     printer = _printer(model="C12")
     assert printer.profile.start_url_scheme == "file:///sdcard/"

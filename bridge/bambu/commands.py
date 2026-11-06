@@ -14,7 +14,7 @@ Tray integers and the flat ``ams_mapping`` are not the same number for every
 unit. ``-1`` stays unresolved (``ams_mapping2`` ``{255, 255}``). ``254`` and
 ``255`` are the external spool (flat ``-1``, ``{255, 0}``). AMS-HT keeps
 128–135. A2L 24–27 is sent as local slot 0–3 on ``ams_id`` 16. ``use_ams``
-is false only when every entry is external.
+is false only when every used (non ``-1``) entry is external.
 """
 
 import time
@@ -129,8 +129,9 @@ def ams_fields(mapping):
 
     ``-1`` stays ``-1`` in ``ams_mapping`` and is ``{255, 255}`` in
     ``ams_mapping2``. ``254`` and ``255`` become flat ``-1`` and
-    ``{255, 0}``. ``use_ams`` is false only when every entry is external.
-    An empty map is not "all external": the printer keeps AMS on.
+    ``{255, 0}``. ``use_ams`` is false only when every used entry is external
+    (``-1`` positions are unused and ignored). An empty or all ``-1`` map is not
+    "all external": the printer keeps AMS on.
     """
     trays = [_tray(item) for item in list(mapping or [])]
     flat = []
@@ -152,7 +153,10 @@ def ams_fields(mapping):
         else:
             flat.append(tray)
             mapped.append({"ams_id": tray // 4, "slot_id": tray % 4})
-    use_ams = not (trays and all(tray in _EXTERNAL for tray in trays))
+    # Unused profile positions (-1) say nothing about the AMS. A single-colour
+    # plate whose filament is profile 2 arrives as [-1, 254]: still all external.
+    used = [tray for tray in trays if tray >= 0]
+    use_ams = not (used and all(tray in _EXTERNAL for tray in used))
     return flat, mapped, use_ams
 
 
